@@ -1,8 +1,3 @@
-# AGENTS.md
-
-## Purpose
-This file tells AI coding agents how to work effectively in the `collmgm` repo.
-
 ## Project overview
 `collmgm` is a proof-of-concept CLI collection-management tool. It uses CSV files as the primary datastore and is being developed iteratively.
 
@@ -12,9 +7,9 @@ This file tells AI coding agents how to work effectively in the `collmgm` repo.
 - The generator writes directly into `data/*.csv` using a dedicated test data user.
 
 ## Important files
-- `PLAN.md` — main design and schema specification.
+- `schmema.md` — main design and schema specification.
 - `Readme.md` — high-level project description and functional goals.
-- `ITERATION1_PLAN.md` — iteration 1 scope and generator specification (when created).
+- `ITERATION1_PLAN.md` — iteration 1 scope and generator specification.
 
 ## Key schema notes
 - `users.csv`: `name,role`
