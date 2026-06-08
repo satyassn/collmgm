@@ -1,0 +1,11 @@
+COLLECTION REPORT
+Beats: beat2
+Salesmen: saleman1
+Collection date: 2026-06-07
+
+bill_no      balance  payment  beat   salesman
+----------------------------------------------
+20260526033     0.20           beat2  saleman1
+----------------------------------------------
+Total vouchers: 1
+Sum of coll: 0.20

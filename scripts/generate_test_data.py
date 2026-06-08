@@ -119,13 +119,19 @@ def generate_data(start_date, end_date, beats, salesmen):
             installment_date = current_date + timedelta(days=14)
 
             for inst_idx in range(num_installments):
-                # Payment: 30–100% of remaining balance
+                # Payment: 30–100% of remaining balance for intermediate installments
                 payment_pct = Decimal(str(random.randint(30, 100) / 100.0))
                 payment = Decimal(str(round(remaining_balance * payment_pct, 2)))
 
-                # Last installment pays off remainder
+                # For the last installment, usually pay off the remainder but sometimes leave a balance
                 if inst_idx == num_installments - 1:
-                    payment = remaining_balance
+                    # 80% chance to pay off fully, 20% chance to leave a partial balance
+                    if random.random() < 0.8:
+                        payment = remaining_balance
+                    else:
+                        # Leave some outstanding balance (10% - 90% of remaining)
+                        partial_pct = Decimal(str(random.uniform(0.1, 0.9)))
+                        payment = (remaining_balance * partial_pct).quantize(Decimal('0.01'))
 
                 installment = {
                     'bill_no': bill_no,
@@ -174,6 +180,36 @@ def main():
 
     # Generate data
     vouchers, installments = generate_data(start_date, end_date, beats, salesmen)
+
+    # Recompute voucher balances by subtracting installments payments.
+    # This ensures voucher['balance'] reflects actual outstanding after installments.
+    payment_map = {}
+    for inst in installments:
+        bill = inst.get('bill_no')
+        if not bill:
+            continue
+        try:
+            amt = Decimal(str(inst.get('amount', '0')))
+        except Exception:
+            amt = Decimal('0')
+        payment_map[bill] = payment_map.get(bill, Decimal('0')) + amt
+
+    for v in vouchers:
+        try:
+            amount = Decimal(str(v.get('amount', '0')))
+        except Exception:
+            amount = Decimal('0')
+        paid = payment_map.get(v.get('bill_no'), Decimal('0'))
+        bal = amount - paid
+        if bal < 0:
+            bal = Decimal('0')
+        # Normalize to two decimal places for consistency
+        bal = bal.quantize(Decimal('0.01'))
+        # If no fractional part, render as integer-like string to match existing files
+        if bal == bal.to_integral():
+            v['balance'] = str(bal.to_integral())
+        else:
+            v['balance'] = format(bal, 'f')
 
     if preview:
         print('Sample vouchers (first 3):')
