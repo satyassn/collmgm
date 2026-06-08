@@ -23,7 +23,7 @@ def display_menu():
     print("COLLECTION MANAGEMENT MENU")
     print("=" * 50)
     print("1. coll-step1 - Generate collection report")
-    print("2. coll-step2 - Enter payments for staged reports")
+    print("2. coll-step2 - Enter collections for staged reports")
     print("3. Exit")
     print("=" * 50)
 
@@ -336,7 +336,7 @@ def display_report_with_focus(beats, salesmen, vouchers, current_idx):
     print(separator)
     total_balance = sum(Decimal(v["balance"]) for v in vouchers)
     total_payments = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
-    print(f"Total vouchers: {len(vouchers)} | Total due: {total_balance} | Total entered: {total_payments}")
+    print(f"Total vouchers: {len(vouchers)} | Total due: {total_balance} | Total collection: {total_payments}")
     print("=" * 80)
 
 
