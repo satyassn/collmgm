@@ -1,0 +1,16 @@
+COLLECTION REPORT
+Beats: beat2, beat6, beat7
+Salesmen: saleman1, saleman2, saleman4
+Collection date: 2026-06-07
+
+bill_no      balance  payment  beat   salesman
+----------------------------------------------
+20260106006    17.38       10  beat2  saleman4
+20260303017    27.67       10  beat7  saleman2
+20260414025     2.58        2  beat6  saleman4
+20260512030     2.89        2  beat6  saleman4
+20260526033     0.20           beat2  saleman1
+----------------------------------------------
+Total vouchers: 5
+Sum of coll: 50.72
+Total payments entered: 24
