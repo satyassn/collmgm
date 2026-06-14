@@ -2,12 +2,21 @@
 """
 Test data generator for collmgm POC.
 
-Generates vouchers and installments across a configurable date range.
-- Vouchers: 2–3 per beat per 2-week cycle.
-- Installments: 5–8 per voucher, paid down bi-weekly.
+Generates vouchers and installments.
+- Vouchers: For a given saleman generate 40-50 vouchers per beat.
+    Each beat repeats after BEATINTERVAL
+    Each voucher has a random amount between 5000 and 25000. 
+- Installments: 3-4 installments per voucher, paid on BEATINTERVAL
+    - Installment amounts are calculated as 20-30 % of the voucher amount
 
 Usage:
-  python scripts/generate_test_data.py [--start YYYY-MM-DD] [--months N] [--seed S] [--preview]
+  python scripts/generate_test_data.py [--start YYYY-MM-DD] [--months N] [--seed S] [--preview] [-h]
+  All arguments are required for script to run but will have default values if not specified.
+  --start: Start date for the data generation range. Default: 2020-01-01
+  --months: Number of months to generate data for, default 6 months
+  --seed: Random seed for reproducible results. default is 42
+  --preview: Print sample rows without writing to files.
+  --help: Show this help message.
 
 Examples:
   python scripts/generate_test_data.py
@@ -22,18 +31,39 @@ from pathlib import Path
 import random
 from decimal import Decimal
 
+BEATINTERVAL = 14  # days
+
+USAGE = """\
+Usage:
+  python scripts/generate_test_data.py [--start YYYY-MM-DD] [--months N] [--seed S] [--preview] [-h]
+
+Options:
+  --start YYYY-MM-DD  Start date for data generation. Default: 2020-01-01
+  --months N          Number of months to generate. Default: 6
+  --seed S            Random seed for reproducible results. Default: 42
+  --preview           Print sample rows without writing to files.
+  -h, --help          Show this help message.
+
+Examples:
+  python scripts/generate_test_data.py
+  python scripts/generate_test_data.py --start 2025-12-01 --months 6 --seed 42
+  python scripts/generate_test_data.py --preview
+"""
 
 def parse_args():
     """Parse simple CLI arguments."""
-    start_date_str = None
+    start_date_str = '2020-01-01'
     months = 6
-    seed = None
+    seed = 42
     preview = False
 
     args = sys.argv[1:]
     i = 0
     while i < len(args):
-        if args[i] == '--start' and i + 1 < len(args):
+        if args[i] in ('-h', '--help'):
+            print(USAGE)
+            sys.exit(0)
+        elif args[i] == '--start' and i + 1 < len(args):
             start_date_str = args[i + 1]
             i += 2
         elif args[i] == '--months' and i + 1 < len(args):
@@ -46,7 +76,9 @@ def parse_args():
             preview = True
             i += 1
         else:
-            i += 1
+            print(f'Unknown argument: {args[i]}', file=sys.stderr)
+            print(USAGE, file=sys.stderr)
+            sys.exit(1)
 
     return start_date_str, months, seed, preview
 
@@ -98,70 +130,58 @@ def generate_data(start_date, end_date, beats, salesmen):
     installments = []
     bill_counter = 1
 
-    current_date = start_date
-    num_vouchers_this_cycle = random.randint(30, 40)
-
+    # Pre-validate and cache beats per salesman
+    salesman_beats_map = {}
     for salesman in salesmen:
         salesman_beats = get_salesman_beats(salesman)
         if not salesman_beats:
-            print(f'⚠️  Warning: Salesman "{salesman}" does not have an assigned beat in beats.csv') 
+            print(f'⚠️  Warning: Salesman "{salesman}" does not have an assigned beat in beats.csv')
             exit(1)
+        salesman_beats_map[salesman] = salesman_beats
 
-        for salesman_beat in salesman_beats:
-            for _ in range(num_vouchers_this_cycle):
-                voucher_amount = Decimal(str(random.randint(5000, 25000)))
-                bill_no = f'{current_date.strftime("%Y%m%d")}{bill_counter:03d}'
-                bill_counter += 1
+    # Each beat repeats every BEATINTERVAL days across the full date range
+    current_date = start_date
+    while current_date <= end_date:
+        for salesman in salesmen:
+            num_vouchers = random.randint(40, 50)
+            for beat in salesman_beats_map[salesman]:
+                for _ in range(num_vouchers):
+                    voucher_amount = Decimal(str(random.randint(5000, 25000)))
+                    bill_no = f'{current_date.strftime("%Y%m%d")}{bill_counter:03d}'
+                    bill_counter += 1
 
-                voucher = {
-                    'bill_no': bill_no,
-                    'date': current_date.isoformat(),
-                    'amount': str(voucher_amount),
-                    'balance': str(voucher_amount),
-                    'beat': salesman_beat,
-                    'salesman': salesman,
-                    'created_by': created_by,
-                    'created_at': f'{current_date.isoformat()}T09:00:00'
-                }
-                vouchers.append(voucher)
-
-                # Generate 5–8 installments for this voucher
-                num_installments = random.randint(5, 8)
-                remaining_balance = voucher_amount
-                installment_date = current_date + timedelta(days=14)
-
-                for inst_idx in range(num_installments):
-                    # Payment: 30–100% of remaining balance for intermediate installments
-                    payment_pct = Decimal(str(random.randint(30, 100) / 100.0))
-                    payment = Decimal(str(round(remaining_balance * payment_pct, 2)))
-
-                    # For the last installment, usually pay off the remainder but sometimes leave a balance
-                    if inst_idx == num_installments - 1:
-                        # 80% chance to pay off fully, 20% chance to leave a partial balance
-                        if random.random() < 0.8:
-                            payment = remaining_balance
-                        else:
-                            # Leave some outstanding balance (10% - 90% of remaining)
-                            partial_pct = Decimal(str(random.uniform(0.1, 0.9)))
-                            payment = (remaining_balance * partial_pct).quantize(Decimal('0.01'))
-
-                    installment = {
+                    voucher = {
                         'bill_no': bill_no,
-                        'date': installment_date.isoformat(),
-                        'amount': str(payment),
+                        'date': current_date.isoformat(),
+                        'amount': str(voucher_amount),
+                        'balance': str(voucher_amount),
+                        'beat': beat,
                         'salesman': salesman,
                         'created_by': created_by,
-                        'created_at': f'{installment_date.isoformat()}T10:00:00'
+                        'created_at': f'{current_date.isoformat()}T09:00:00'
                     }
-                    installments.append(installment)
+                    vouchers.append(voucher)
 
-                    remaining_balance -= payment
-                    installment_date += timedelta(days=14)
+                    # Generate 3-4 installments at 20-30% of voucher amount each, on BEATINTERVAL schedule
+                    num_installments = random.randint(3, 4)
+                    installment_date = current_date + timedelta(days=BEATINTERVAL)
 
-            # Update voucher balance to what remains after all installments
-            voucher['balance'] = str(max(Decimal('0'), remaining_balance))
+                    for _ in range(num_installments):
+                        pct = Decimal(str(random.randint(20, 30))) / Decimal('100')
+                        payment = (voucher_amount * pct).quantize(Decimal('0.01'))
 
-        current_date += timedelta(days=14)
+                        installment = {
+                            'bill_no': bill_no,
+                            'date': installment_date.isoformat(),
+                            'amount': str(payment),
+                            'salesman': salesman,
+                            'created_by': created_by,
+                            'created_at': f'{installment_date.isoformat()}T10:00:00'
+                        }
+                        installments.append(installment)
+                        installment_date += timedelta(days=BEATINTERVAL)
+
+        current_date += timedelta(days=BEATINTERVAL)
 
     return vouchers, installments
 
@@ -169,27 +189,15 @@ def generate_data(start_date, end_date, beats, salesmen):
 def main():
     start_date_str, months, seed, preview = parse_args()
 
-    # Set random seed for reproducibility
-    if seed is not None:
-        random.seed(seed)
-
-    # Determine start date
-    if start_date_str:
-        start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
-    else:
-        # Default: 6 months before today
-        today = datetime.now().date()
-        start_date = today - timedelta(days=int(30 * months))
-
+    random.seed(seed)
+    start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
     end_date = start_date + timedelta(days=int(30 * months))
 
     # Read beats and salesmen
     beats = read_beats()
     salesmen = read_salesmen()
 
-    #if preview:
-    #    print('Loaded salesmen:', salesmen)
-
+    
     # Generate data
     vouchers, installments = generate_data(start_date, end_date, beats, salesmen)
 
@@ -255,15 +263,6 @@ def main():
     # Print summary
     print(f'✓ Generated {len(vouchers)} vouchers and {len(installments)} installments')
     print(f'  Date range: {start_date} to {end_date}')
-
-    # beat_counts = {}
-    # for v in vouchers:
-    #     beat = v['beat']
-    #     beat_counts[beat] = beat_counts.get(beat, 0) + 1
-
-    # print('\nVouchers per beat:')
-    # for beat in sorted(beat_counts.keys()):
-    #     print(f'  {beat}: {beat_counts[beat]}')
 
     print(f'\n→ Wrote to data/vouchers.csv and data/installments.csv')
 
