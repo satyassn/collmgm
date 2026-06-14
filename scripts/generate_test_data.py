@@ -53,11 +53,21 @@ def parse_args():
 
 def read_beats(beats_file='data/beats.csv'):
     """Read beat names from beats.csv."""
+    beats = {}
+    with open(beats_file) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            beats[row['name']] = row.get('salesman', '')
+    return beats
+
+def get_salesman_beats(salesman, beats_file='data/beats.csv'):
+    """Get beats for a given salesman from beats.csv."""
     beats = []
     with open(beats_file) as f:
         reader = csv.DictReader(f)
         for row in reader:
-            beats.append(row['name'])
+            if row.get('salesman', '') == salesman:
+                beats.append(row['name'])
     return beats
 
 
@@ -89,62 +99,64 @@ def generate_data(start_date, end_date, beats, salesmen):
     bill_counter = 1
 
     current_date = start_date
+    num_vouchers_this_cycle = random.randint(30, 40)
 
-    while current_date < end_date:
-        # 2–3 vouchers per beat per 2-week cycle
-        num_vouchers_this_cycle = random.randint(2, 3)
+    for salesman in salesmen:
+        salesman_beats = get_salesman_beats(salesman)
+        if not salesman_beats:
+            print(f'⚠️  Warning: Salesman "{salesman}" does not have an assigned beat in beats.csv') 
+            exit(1)
 
-        for _ in range(num_vouchers_this_cycle):
-            beat = random.choice(beats)
-            salesman = random.choice(salesmen)
-            voucher_amount = Decimal(str(random.randint(5000, 25000)))
-            bill_no = f'{current_date.strftime("%Y%m%d")}{bill_counter:03d}'
-            bill_counter += 1
+        for salesman_beat in salesman_beats:
+            for _ in range(num_vouchers_this_cycle):
+                voucher_amount = Decimal(str(random.randint(5000, 25000)))
+                bill_no = f'{current_date.strftime("%Y%m%d")}{bill_counter:03d}'
+                bill_counter += 1
 
-            voucher = {
-                'bill_no': bill_no,
-                'date': current_date.isoformat(),
-                'amount': str(voucher_amount),
-                'balance': str(voucher_amount),
-                'beat': beat,
-                'salesman': salesman,
-                'created_by': created_by,
-                'created_at': f'{current_date.isoformat()}T09:00:00'
-            }
-            vouchers.append(voucher)
-
-            # Generate 5–8 installments for this voucher
-            num_installments = random.randint(5, 8)
-            remaining_balance = voucher_amount
-            installment_date = current_date + timedelta(days=14)
-
-            for inst_idx in range(num_installments):
-                # Payment: 30–100% of remaining balance for intermediate installments
-                payment_pct = Decimal(str(random.randint(30, 100) / 100.0))
-                payment = Decimal(str(round(remaining_balance * payment_pct, 2)))
-
-                # For the last installment, usually pay off the remainder but sometimes leave a balance
-                if inst_idx == num_installments - 1:
-                    # 80% chance to pay off fully, 20% chance to leave a partial balance
-                    if random.random() < 0.8:
-                        payment = remaining_balance
-                    else:
-                        # Leave some outstanding balance (10% - 90% of remaining)
-                        partial_pct = Decimal(str(random.uniform(0.1, 0.9)))
-                        payment = (remaining_balance * partial_pct).quantize(Decimal('0.01'))
-
-                installment = {
+                voucher = {
                     'bill_no': bill_no,
-                    'date': installment_date.isoformat(),
-                    'amount': str(payment),
+                    'date': current_date.isoformat(),
+                    'amount': str(voucher_amount),
+                    'balance': str(voucher_amount),
+                    'beat': salesman_beat,
                     'salesman': salesman,
                     'created_by': created_by,
-                    'created_at': f'{installment_date.isoformat()}T10:00:00'
+                    'created_at': f'{current_date.isoformat()}T09:00:00'
                 }
-                installments.append(installment)
+                vouchers.append(voucher)
 
-                remaining_balance -= payment
-                installment_date += timedelta(days=14)
+                # Generate 5–8 installments for this voucher
+                num_installments = random.randint(5, 8)
+                remaining_balance = voucher_amount
+                installment_date = current_date + timedelta(days=14)
+
+                for inst_idx in range(num_installments):
+                    # Payment: 30–100% of remaining balance for intermediate installments
+                    payment_pct = Decimal(str(random.randint(30, 100) / 100.0))
+                    payment = Decimal(str(round(remaining_balance * payment_pct, 2)))
+
+                    # For the last installment, usually pay off the remainder but sometimes leave a balance
+                    if inst_idx == num_installments - 1:
+                        # 80% chance to pay off fully, 20% chance to leave a partial balance
+                        if random.random() < 0.8:
+                            payment = remaining_balance
+                        else:
+                            # Leave some outstanding balance (10% - 90% of remaining)
+                            partial_pct = Decimal(str(random.uniform(0.1, 0.9)))
+                            payment = (remaining_balance * partial_pct).quantize(Decimal('0.01'))
+
+                    installment = {
+                        'bill_no': bill_no,
+                        'date': installment_date.isoformat(),
+                        'amount': str(payment),
+                        'salesman': salesman,
+                        'created_by': created_by,
+                        'created_at': f'{installment_date.isoformat()}T10:00:00'
+                    }
+                    installments.append(installment)
+
+                    remaining_balance -= payment
+                    installment_date += timedelta(days=14)
 
             # Update voucher balance to what remains after all installments
             voucher['balance'] = str(max(Decimal('0'), remaining_balance))
@@ -175,8 +187,8 @@ def main():
     beats = read_beats()
     salesmen = read_salesmen()
 
-    if preview:
-        print('Loaded salesmen:', salesmen)
+    #if preview:
+    #    print('Loaded salesmen:', salesmen)
 
     # Generate data
     vouchers, installments = generate_data(start_date, end_date, beats, salesmen)
@@ -244,14 +256,14 @@ def main():
     print(f'✓ Generated {len(vouchers)} vouchers and {len(installments)} installments')
     print(f'  Date range: {start_date} to {end_date}')
 
-    beat_counts = {}
-    for v in vouchers:
-        beat = v['beat']
-        beat_counts[beat] = beat_counts.get(beat, 0) + 1
+    # beat_counts = {}
+    # for v in vouchers:
+    #     beat = v['beat']
+    #     beat_counts[beat] = beat_counts.get(beat, 0) + 1
 
-    print('\nVouchers per beat:')
-    for beat in sorted(beat_counts.keys()):
-        print(f'  {beat}: {beat_counts[beat]}')
+    # print('\nVouchers per beat:')
+    # for beat in sorted(beat_counts.keys()):
+    #     print(f'  {beat}: {beat_counts[beat]}')
 
     print(f'\n→ Wrote to data/vouchers.csv and data/installments.csv')
 
