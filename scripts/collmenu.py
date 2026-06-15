@@ -5,8 +5,8 @@ Collection Menu - Main menu-driven program for collection operations.
 COLLECTION MANAGEMENT MENU
 ==================================================
 1. coll-start - Generate list of voucher to start collection
-2. coll-step2 - Enter collections for staged reports
-3. coll-step3 - Review and submit reports
+2. coll-submit - Submit today collections
+3. coll-finlize - Review and submit reports
 4. Reports
     4.1 - Salesman - pending collections
     4.2 - Beat - pending collections
@@ -28,6 +28,7 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
 STAGING_DIR = ROOT_DIR / "staging"
+ARCHIVE_DIR = ROOT_DIR / "archive"
 
 NUMOF_TOP_AGED_VOUCHERS = 10
 NUMOF_TOP_AMOUNT_VOUCHERS = 10
@@ -39,8 +40,8 @@ def display_menu():
     print("COLLECTION MANAGEMENT MENU")
     print("=" * 50)
     print("1. coll-start  - Generate collection report")
-    print("2. coll-step2  - Enter collections for staged reports")
-    print("3. coll-step3  - Review and submit reports")
+    print("2. coll-submit - Submit today collections")
+    print("3. coll-finalize  - Review and submit reports")
     print("4. Reports")
     print("   4.1 - Salesman - pending collections")
     print("   4.2 - Beat - pending collections")
@@ -223,6 +224,7 @@ def _load_vouchers_by_criterion(selection_type, selection_values):
             if balance > 0:
                 vouchers.append({
                     "bill_no": row.get("bill_no", "").strip(),
+                    "voucher_date": row.get("date", "").strip(),
                     "date": today,
                     "balance": str(balance),
                     "payment": "",
@@ -252,33 +254,39 @@ def load_collection_json(path):
     return data.get("vouchers", [])
 
 
-def write_collection_text(path, beats, salesmen, vouchers):
+def write_collection_text(path, beats, salesmen, vouchers, stage=None, status=None):
     """Write the text collection report from the JSON data.
 
-    The report shows collection date (today) at the top and omits the per-row
-    voucher date column from the details.
+    The report shows collection date (today) at the top. Each row includes the
+    original voucher_date alongside bill details.
     """
     if not vouchers:
         raise ValueError("No vouchers available to write to text report.")
 
     date_str = datetime.now().strftime("%Y-%m-%d")
     bill_width = max(len("bill_no"), max(len(v["bill_no"]) for v in vouchers))
+    vdate_width = max(len("voucher_date"), max(len(v.get("voucher_date", "")) for v in vouchers))
     balance_width = max(len("balance"), max(len(v["balance"]) for v in vouchers))
-    payment_width = max(len("payment"), max(len(v.get("payment", "")) for v in vouchers))
+    payment_width = max(len("collection"), max(len(v.get("payment", "")) for v in vouchers))
     beat_width = max(len("beat"), max(len(v["beat"]) for v in vouchers))
     salesman_width = max(len("salesman"), max(len(v["salesman"]) for v in vouchers))
 
     header = (
         f"{ 'bill_no':<{bill_width}}  "
+        f"{ 'voucher_date':<{vdate_width}}  "
         f"{ 'balance':>{balance_width}}  "
-        f"{ 'payment':>{payment_width}}  "
+        f"{ 'collection':>{payment_width}}  "
         f"{ 'beat':<{beat_width}}  "
         f"{ 'salesman':<{salesman_width}}"
     )
     separator = "-" * len(header)
 
-    lines = [
-        "COLLECTION REPORT",
+    lines = ["COLLECTION REPORT"]
+    if stage is not None:
+        lines.append(f"Stage : {stage}")
+    if status is not None:
+        lines.append(f"Status: {status}")
+    lines += [
         f"Beats: {', '.join(beats)}",
         f"Salesmen: {', '.join(salesmen)}",
         f"Collection date: {date_str}",
@@ -290,6 +298,7 @@ def write_collection_text(path, beats, salesmen, vouchers):
     for voucher in vouchers:
         lines.append(
             f"{voucher['bill_no']:<{bill_width}}  "
+            f"{voucher.get('voucher_date', ''):<{vdate_width}}  "
             f"{voucher['balance']:>{balance_width}}  "
             f"{voucher.get('payment', ''):>{payment_width}}  "
             f"{voucher['beat']:<{beat_width}}  "
@@ -322,13 +331,152 @@ def _find_confirmed_start_report(selection_type, selection_values):
             continue
         if not isinstance(data, dict):
             continue
-        if data.get("start_status") != "confirmed":
+        stages = data.get("stages", {})
+        start_confirmed = (
+            stages.get("start") == "confirmed"
+            or (data.get("stage") == "start" and data.get("status") == "confirmed")
+        )
+        if not start_confirmed or stages.get("submit") == "confirmed":
             continue
         if data.get("selection_type") != selection_type:
             continue
         if set(data.get("selection", [])) == selection_set:
             return path, data
     return None
+
+
+def _load_confirmed_start_reports():
+    """Return list of (path, data) for all stage:start status:confirmed reports in staging."""
+    if not STAGING_DIR.exists():
+        return []
+    result = []
+    for path in sorted(STAGING_DIR.glob("coll*.json")):
+        try:
+            with path.open(encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        stages = data.get("stages", {})
+        start_confirmed = (
+            stages.get("start") == "confirmed"
+            or (data.get("stage") == "start" and data.get("status") == "confirmed")
+        )
+        if start_confirmed and stages.get("submit") != "confirmed":
+            result.append((path, data))
+    return result
+
+
+def _load_submit_confirmed_reports():
+    """Return (path, data) pairs where submit is confirmed and finalize not yet done."""
+    if not STAGING_DIR.exists():
+        return []
+    result = []
+    for path in sorted(STAGING_DIR.glob("coll*.json")):
+        try:
+            with path.open(encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        stages = data.get("stages", {})
+        submit_confirmed = (
+            stages.get("submit") == "confirmed"
+            or (data.get("stage") == "submit" and data.get("status") == "confirmed")
+        )
+        if submit_confirmed and stages.get("finalize") != "confirmed":
+            result.append((path, data))
+    return result
+
+
+def _append_installments_csv(vouchers):
+    """Append payment rows to data/installments.csv, creating it with a header if needed."""
+    inst_file = DATA_DIR / "installments.csv"
+    collection_date = datetime.now().strftime("%Y-%m-%d")
+    write_header = not inst_file.exists()
+    with inst_file.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["bill_no", "voucher_date", "collection_date", "payment", "beat", "salesman"])
+        if write_header:
+            writer.writeheader()
+        for v in vouchers:
+            if v.get("payment"):
+                writer.writerow({
+                    "bill_no": v["bill_no"],
+                    "voucher_date": v.get("voucher_date", ""),
+                    "collection_date": collection_date,
+                    "payment": v["payment"],
+                    "beat": v["beat"],
+                    "salesman": v["salesman"],
+                })
+
+
+def _update_vouchers_balance(vouchers):
+    """Reduce balance in data/vouchers.csv by payment amount for each matching bill_no."""
+    vouchers_file = DATA_DIR / "vouchers.csv"
+    if not vouchers_file.exists():
+        raise FileNotFoundError(f"Missing vouchers file: {vouchers_file}")
+
+    payment_map = {
+        v["bill_no"]: Decimal(v["payment"])
+        for v in vouchers
+        if v.get("payment")
+    }
+    if not payment_map:
+        return
+
+    rows = []
+    fieldnames = None
+    with vouchers_file.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        fieldnames = reader.fieldnames
+        for row in reader:
+            bill_no = row.get("bill_no", "").strip()
+            if bill_no in payment_map:
+                try:
+                    old_balance = Decimal(row["balance"].strip())
+                    new_balance = max(Decimal("0"), old_balance - payment_map[bill_no])
+                    row["balance"] = str(new_balance.quantize(Decimal("0.01")))
+                except Exception:
+                    pass
+            rows.append(row)
+
+    with vouchers_file.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _installments_path(report_path):
+    """Return the installments file path for a given report."""
+    return report_path.parent / f"{report_path.stem}-installments.json"
+
+
+def _save_installments(report_path, vouchers, bookmark_bill_no=None, inst_status=None):
+    """Save non-empty payment amounts and optional bookmark/status as bill_no → amount map."""
+    data = {v["bill_no"]: v["payment"] for v in vouchers if v.get("payment")}
+    if bookmark_bill_no:
+        data["__bookmark__"] = bookmark_bill_no
+    if inst_status:
+        data["__status__"] = inst_status
+    with _installments_path(report_path).open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def _load_installments(report_path):
+    """Return (amounts dict, bookmark bill_no or None, status or None) from installments file."""
+    path = _installments_path(report_path)
+    if not path.exists():
+        return {}, None, None
+    try:
+        with path.open(encoding="utf-8") as f:
+            data = json.load(f)
+        bookmark = data.pop("__bookmark__", None)
+        status = data.pop("__status__", None)
+        return data, bookmark, status
+    except Exception:
+        return {}, None, None
 
 
 def list_staging_reports():
@@ -374,27 +522,30 @@ def display_report_with_focus(beats, salesmen, vouchers, current_idx):
         return
     
     bill_width = max(len("bill_no"), max(len(v["bill_no"]) for v in vouchers))
+    vdate_width = max(len("voucher_date"), max(len(v.get("voucher_date", "")) for v in vouchers))
     balance_width = max(len("balance"), max(len(v["balance"]) for v in vouchers))
-    payment_width = max(len("payment"), max(len(v.get("payment", "")) for v in vouchers) if vouchers else 1)
+    payment_width = max(len("collection"), max(len(v.get("payment", "")) for v in vouchers))
     beat_width = max(len("beat"), max(len(v["beat"]) for v in vouchers))
     salesman_width = max(len("salesman"), max(len(v["salesman"]) for v in vouchers))
-    
+
     header = (
         f"   {'bill_no':<{bill_width}}  "
+        f"{'voucher_date':<{vdate_width}}  "
         f"{'balance':>{balance_width}}  "
-        f"{'payment':>{payment_width}}  "
+        f"{'collection':>{payment_width}}  "
         f"{'beat':<{beat_width}}  "
         f"{'salesman':<{salesman_width}}"
     )
     separator = "-" * len(header)
-    
+
     print(header)
     print(separator)
-    
+
     for idx, voucher in enumerate(vouchers):
         marker = ">>>" if idx == current_idx else "   "
         line = (
             f"{marker} {voucher['bill_no']:<{bill_width}}  "
+            f"{voucher.get('voucher_date', ''):<{vdate_width}}  "
             f"{voucher['balance']:>{balance_width}}  "
             f"{voucher.get('payment', ''):>{payment_width}}  "
             f"{voucher['beat']:<{beat_width}}  "
@@ -423,8 +574,13 @@ def get_payment_input(voucher, current_idx, total_records, total_payments_so_far
     print("Controls: Enter amount, or press:")
     print("  [n] = next record  [p] = previous record  [s] = skip  [q] = quit")
     
+    prompt = (
+        f"Payment amount (or command) [{current_payment}]: "
+        if current_payment
+        else "Payment amount (or command): "
+    )
     while True:
-        value = input("Payment amount (or command): ").strip().lower()
+        value = input(prompt).strip().lower()
         
         if value == "n":
             return current_payment, "next"
@@ -451,20 +607,22 @@ def get_payment_input(voucher, current_idx, total_records, total_payments_so_far
                 print(f"Invalid input. Enter a numeric amount or a command (n/p/s/q).")
 
 
-def interactive_payment_editor(vouchers, beats, salesmen):
+def interactive_payment_editor(vouchers, beats, salesmen, start_idx=0):
     """Interactive payment editor with report display and navigation.
-    
-    Returns: updated vouchers list with payment amounts, or None if aborted
+
+    Returns: (vouchers, True, None)           — all records visited
+             (vouchers, False, current_idx)   — quit with save; caller saves installments + bookmark
+             (None, False, None)              — quit without saving
     """
-    current_idx = 0
-    
+    current_idx = start_idx
+
     while current_idx < len(vouchers):
         total_payments = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
         display_report_with_focus(beats, salesmen, vouchers, current_idx)
-        
+
         payment, action = get_payment_input(vouchers[current_idx], current_idx, len(vouchers), total_payments)
         vouchers[current_idx]["payment"] = payment
-        
+
         if action == "next":
             current_idx += 1
         elif action == "prev":
@@ -472,61 +630,141 @@ def interactive_payment_editor(vouchers, beats, salesmen):
         elif action == "skip":
             current_idx += 1
         elif action == "quit":
-            confirm = input("\nQuit without finishing? (y/n): ").strip().lower()
+            confirm = input("\nDo you want to save changes? (y/n): ").strip().lower()
             if confirm == "y":
-                return None  # Signal abort
-            # else continue editing
-    
-    return vouchers
+                return vouchers, False, current_idx
+            elif confirm == "n":
+                return None, False, None
+
+    return vouchers, True, None
 
 
-def run_coll_step2():
-    """Execute coll-step2 by editing payments for staged reports."""
-    reports = list_staging_reports()
-    if not reports:
-        print("\nNo staged reports found in staging/ to edit.")
+def run_coll_submit():
+    """Execute coll-submit by editing payments for staged reports.
+    - check staging/*.json files and load only reports that are stage:start and status:confirmed else print no start confirm reports found
+    - Here we will navigate thru each record and enter days collection. this is already implemented
+    - In the report ask for submission y/n, if y, add submit stage and submit status to json.
+
+    changelist1
+    - Add collection column to vouchers list, this represents amount collected today
+    - When user quits payment entry, ask "Do you want to quit without saving(y/n)"
+    - If y, create installments json for the loaded start json.  
+    - Modify run_coll_submit to read installments json if any and consider this will loading json from start stage.
+
+    changelist2
+    - After or before creation of installment json. updated report json stage to submit and status to inprogress
+    - "Submit this report? (y/n):"
+    - If y, save all the collection updates to installment json and status in installment json as complete.
+    - After last collection update, ask "Save these collections? (y/n)" if y - create installment json and ask "submit this reprot" else quit
+    """
+    print("\n" + "-" * 50)
+    print("Executing: coll-submit - Enter and submit collections")
+    print("-" * 50)
+
+    confirmed_reports = _load_confirmed_start_reports()
+    if not confirmed_reports:
+        print("\nNo confirmed start reports found in staging/.")
         prompt_continue()
         return
 
-    selected_reports = prompt_report_selection(reports)
-    for report_path in selected_reports:
-        print(f"\nEditing staged report: {report_path.name}")
-        try:
-            vouchers = load_collection_json(report_path)
-        except Exception as error:
-            print(f"Failed to read report {report_path.name}: {error}")
-            continue
-        if not vouchers:
-            print(f"Report {report_path.name} contains no vouchers.")
+    confirmed_map = {p: d for p, d in confirmed_reports}
+    selected_paths = prompt_report_selection(list(confirmed_map.keys()))
+
+    for report_path in selected_paths:
+        report_data = confirmed_map[report_path]
+        vouchers = report_data["vouchers"]
+        selection_type = report_data.get("selection_type", "beat")
+        selection = report_data.get("selection", [])
+
+        if selection_type == "beat":
+            beats = selection
+            salesmen = sorted({v["salesman"] for v in vouchers})
+        else:
+            beats = sorted({v["beat"] for v in vouchers})
+            salesmen = selection
+
+        # Pre-populate payments and resolve bookmark from prior installments if any
+        installments, bookmark_bill_no, _ = _load_installments(report_path)
+        start_idx = 0
+        if installments:
+            for v in vouchers:
+                if v["bill_no"] in installments:
+                    v["payment"] = installments[v["bill_no"]]
+            print(f"  Loaded {len(installments)} installment(s) from prior session.")
+        if bookmark_bill_no:
+            bill_nos = [v["bill_no"] for v in vouchers]
+            if bookmark_bill_no in bill_nos:
+                start_idx = bill_nos.index(bookmark_bill_no)
+                print(f"  Resuming from bookmarked record: {bookmark_bill_no}")
+
+        print(f"\nEditing report: {report_path.name}")
+        vouchers, completed, quit_idx = interactive_payment_editor(vouchers, beats, salesmen, start_idx=start_idx)
+
+        if not completed:
+            if vouchers is not None:
+                try:
+                    bookmark = vouchers[quit_idx]["bill_no"] if quit_idx is not None else None
+                    _save_installments(report_path, vouchers, bookmark_bill_no=bookmark, inst_status="inprogress")
+                    report_data.setdefault("stages", {})["start"] = "confirmed"
+                    report_data.setdefault("stages", {})["submit"] = "inprogress"
+                    report_data["stage"] = "submit"
+                    report_data["status"] = "inprogress"
+                    report_data["vouchers"] = vouchers
+                    with report_path.open("w", encoding="utf-8") as f:
+                        json.dump(report_data, f, indent=2)
+                    print(f"Progress saved as installments for {report_path.name}.")
+                    if bookmark:
+                        print(f"Bookmarked at: {bookmark}")
+                except Exception as error:
+                    print(f"Failed to save installments for {report_path.name}: {error}")
+            else:
+                print(f"Quit without saving for {report_path.name}.")
             continue
 
-        beats = sorted({v['beat'] for v in vouchers})
-        salesmen = sorted({v['salesman'] for v in vouchers})
-        
-        vouchers = interactive_payment_editor(vouchers, beats, salesmen)
-        if vouchers is None:
-            print(f"Payment entry cancelled for {report_path.name}.")
-            continue
-        
         total_vouchers = len(vouchers)
-        total_collections = sum(Decimal(v.get('payment', '0') or '0') for v in vouchers)
+        total_collections = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
         print("\nSummary:")
         print(f"  Total vouchers: {total_vouchers}")
         print(f"  Total collections: {total_collections}")
 
-        confirm = input("Save changes to this report? (y/n): ").strip().lower()
-        if confirm not in ['y', 'yes']:
-            print(f"Discarded changes for {report_path.name}.")
+        save_confirm = input("\nSave these collections? (y/n): ").strip().lower()
+        if save_confirm not in ["y", "yes"]:
+            print(f"Collections discarded for {report_path.name}.")
             continue
 
         try:
-            save_collection_json(report_path, vouchers)
-            txt_path = report_path.with_suffix('.txt')
-            write_collection_text(txt_path, beats, salesmen, vouchers)
-            print(f"Saved JSON: {report_path}")
-            print(f"Updated TXT: {txt_path}")
+            _save_installments(report_path, vouchers, inst_status="complete")
+            report_data.setdefault("stages", {})["start"] = "confirmed"
+            report_data.setdefault("stages", {})["submit"] = "inprogress"
+            report_data["stage"] = "submit"
+            report_data["status"] = "inprogress"
+            report_data["vouchers"] = vouchers
+            with report_path.open("w", encoding="utf-8") as f:
+                json.dump(report_data, f, indent=2)
         except Exception as error:
-            print(f"Failed to save updated report {report_path.name}: {error}")
+            print(f"Failed to save collections for {report_path.name}: {error}")
+            continue
+
+        submit_confirm = input("Submit this report? (y/n): ").strip().lower()
+        if submit_confirm not in ["y", "yes"]:
+            print(f"Collections saved. Submission deferred for {report_path.name}.")
+            continue
+
+        try:
+            report_data.setdefault("stages", {})["submit"] = "confirmed"
+            report_data["stage"] = "submit"
+            report_data["status"] = "confirmed"
+            with report_path.open("w", encoding="utf-8") as f:
+                json.dump(report_data, f, indent=2)
+            txt_path = report_path.with_suffix(".txt")
+            write_collection_text(txt_path, beats, salesmen, vouchers,
+                                  stage="submit", status="confirmed")
+            _save_installments(report_path, vouchers, inst_status="complete")
+            print(f"Submitted: {report_path.name}")
+        except Exception as error:
+            print(f"Failed to submit report {report_path.name}: {error}")
+
+    prompt_continue()
 
 
 def prompt_continue():
@@ -541,6 +779,15 @@ def run_coll_start():
     - Data should be maintained in json, status should be maintained in the json file. It is either verified or not. lets call this start_status. mark the initial status as new
     - Before generation of list, if a varified list exists for selected beat or saleman, prompt the user to use it or discard that before new list generation
     - At the end of report display prompt the use to verify the report. If use doesn't want to verify discard the report. If user confirms, mark start_start as confimed
+
+    changelist1
+    - in the json, we maintain 2 properties stage and status, 
+        - stage is various phases of voucher collections like start, submit, finalize etc
+        - status is current state of report in any given stage line new, inprocess, confirmed etc
+    - IN the test report, add state and status as the top along with other data
+
+    changelist2
+    - add voucher date along with other data
     """
     print("\n" + "-" * 50)
     print("Executing: coll-start - Generate collection list")
@@ -621,7 +868,9 @@ def run_coll_start():
         salesmen_for_report = selection_values
 
     start_data = {
-        "start_status": "new",
+        "stage": "start",
+        "status": "new",
+        "stages": {},
         "selection_type": selection_type,
         "selection": selection_values,
         "vouchers": vouchers,
@@ -630,7 +879,8 @@ def run_coll_start():
     try:
         with json_path.open("w", encoding="utf-8") as f:
             json.dump(start_data, f, indent=2)
-        write_collection_text(txt_path, beats_for_report, salesmen_for_report, vouchers)
+        write_collection_text(txt_path, beats_for_report, salesmen_for_report, vouchers,
+                              stage="start", status="new")
     except Exception as error:
         print(f"Failed to create report files: {error}")
         prompt_continue()
@@ -644,9 +894,12 @@ def run_coll_start():
     while True:
         confirm = input("Verify and confirm this report? (y/n): ").strip().lower()
         if confirm in ("y", "yes"):
-            start_data["start_status"] = "confirmed"
+            start_data["status"] = "confirmed"
+            start_data.setdefault("stages", {})["start"] = "confirmed"
             with json_path.open("w", encoding="utf-8") as f:
                 json.dump(start_data, f, indent=2)
+            write_collection_text(txt_path, beats_for_report, salesmen_for_report, vouchers,
+                                  stage="start", status="confirmed")
             print("Report confirmed.")
             break
         elif confirm in ("n", "no"):
@@ -661,13 +914,78 @@ def run_coll_start():
     prompt_continue()
 
 
-def run_coll_step3():
-    """Execute coll-step3: Review and submit staged reports."""
+def run_coll_finalize():
+    """Execute coll-finalize: Push confirmed submit reports into persistent data files.
+    - Load staging reports where stages["submit"] == "confirmed" (and finalize not yet done)
+    - Present list for user selection
+    - Display the existing TXT report for the selected report
+    - Ask "Ready to finalize these collections? (y/n)"
+    - If n: exit
+    - If y:
+        - Append payment rows to data/installments.csv
+          (columns: bill_no, voucher_date, collection_date, payment, beat, salesman)
+        - Update data/vouchers.csv: reduce balance by payment amount for each bill_no
+        - Update main JSON: stages["finalize"] = "confirmed", stage = "finalize", status = "confirmed"
+        - Move staging files to archive/: main JSON, installments JSON, TXT report
+        - Print summary: N records finalized, total amount
+    """
     print("\n" + "-" * 50)
-    print("Executing: coll-step3 - Review and submit reports")
+    print("Executing: coll-finalize - Finalize collections")
     print("-" * 50)
-    print("(Not yet implemented)")
-    prompt_continue()
+
+    submit_reports = _load_submit_confirmed_reports()
+    if not submit_reports:
+        print("\nNo submitted reports ready for finalization.")
+        prompt_continue()
+        return
+
+    report_map = {p: d for p, d in submit_reports}
+    selected_paths = prompt_report_selection(list(report_map.keys()))
+
+    for report_path in selected_paths:
+        report_data = report_map[report_path]
+        vouchers = report_data["vouchers"]
+
+        txt_path = report_path.with_suffix(".txt")
+        print(f"\nReport: {report_path.name}")
+        if txt_path.exists():
+            print(txt_path.read_text(encoding="utf-8"))
+        else:
+            print(f"  (Text report not found. Vouchers: {len(vouchers)})")
+
+        confirm = input("Ready to finalize these collections? (y/n): ").strip().lower()
+        if confirm not in ["y", "yes"]:
+            print(f"Finalization skipped for {report_path.name}.")
+            continue
+
+        try:
+            _append_installments_csv(vouchers)
+            _update_vouchers_balance(vouchers)
+        except Exception as error:
+            print(f"Failed to update data files for {report_path.name}: {error}")
+            continue
+
+        report_data.setdefault("stages", {})["finalize"] = "confirmed"
+        report_data["stage"] = "finalize"
+        report_data["status"] = "confirmed"
+        try:
+            with report_path.open("w", encoding="utf-8") as f:
+                json.dump(report_data, f, indent=2)
+        except Exception as error:
+            print(f"Failed to update staging JSON for {report_path.name}: {error}")
+            continue
+
+        ARCHIVE_DIR.mkdir(exist_ok=True)
+        for src in [report_path, _installments_path(report_path), txt_path]:
+            if src.exists():
+                try:
+                    src.rename(ARCHIVE_DIR / src.name)
+                except Exception as error:
+                    print(f"  Warning: could not archive {src.name}: {error}")
+
+        total = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
+        paid_count = sum(1 for v in vouchers if v.get("payment"))
+        print(f"Finalized: {report_path.name} — {paid_count} records, total {total}")
 
 
 def run_report_salesman_pending():
@@ -1059,9 +1377,9 @@ def main():
         if choice == 1:
             run_coll_start()
         elif choice == 2:
-            run_coll_step2()
+            run_coll_submit()
         elif choice == 3:
-            run_coll_step3()
+            run_coll_finalize()
         elif choice == 4:
             run_reports()
         elif choice == 5:
