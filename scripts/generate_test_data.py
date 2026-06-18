@@ -27,9 +27,11 @@ Examples:
 import csv
 import sys
 from datetime import datetime, timedelta
-from pathlib import Path
 import random
 from decimal import Decimal
+
+from coll_store import DATA_DIR
+from coll_data import load_beats, load_salesmen
 
 BEATINTERVAL = 14  # days
 
@@ -83,47 +85,22 @@ def parse_args():
     return start_date_str, months, seed, preview
 
 
-def read_beats(beats_file='data/beats.csv'):
-    """Read beat names from beats.csv."""
+def _read_beats_with_salesman():
+    """Return dict[beat_name -> salesman] from beats.csv."""
+    beats_file = DATA_DIR / "beats.csv"
     beats = {}
-    with open(beats_file) as f:
+    with beats_file.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             beats[row['name']] = row.get('salesman', '')
     return beats
 
-def get_salesman_beats(salesman, beats_file='data/beats.csv'):
-    """Get beats for a given salesman from beats.csv."""
-    beats = []
-    with open(beats_file) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row.get('salesman', '') == salesman:
-                beats.append(row['name'])
-    return beats
 
+def generate_data(start_date, end_date, beats_map, salesmen):
+    """Generate vouchers and installments.
 
-def read_salesmen(users_file='data/users.csv'):
-    """Read salesman names from users.csv (role='salesman')."""
-    salesmen = []
-    with open(users_file) as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            role = row.get('role', '').strip().lower()
-            name = row.get('name', '').strip()
-            if role == 'salesman' and name:
-                salesmen.append(name)
-
-    if not salesmen:
-        raise ValueError(
-            'No salesman users found in data/users.csv. ' \
-            'Make sure the file includes at least one row with role=salesman.'
-        )
-    return salesmen
-
-
-def generate_data(start_date, end_date, beats, salesmen):
-    """Generate vouchers and installments."""
+    beats_map: dict[beat_name -> salesman] from _read_beats_with_salesman()
+    """
     created_by = 'test'
 
     vouchers = []
@@ -133,41 +110,46 @@ def generate_data(start_date, end_date, beats, salesmen):
     # Pre-validate and cache beats per salesman
     salesman_beats_map = {}
     for salesman in salesmen:
-        salesman_beats = get_salesman_beats(salesman)
+        salesman_beats = [b for b, s in beats_map.items() if s == salesman]
         if not salesman_beats:
-            print(f'⚠️  Warning: Salesman "{salesman}" does not have an assigned beat in beats.csv')
+            print(f'Warning: Salesman "{salesman}" does not have an assigned beat in beats.csv')
             exit(1)
         salesman_beats_map[salesman] = salesman_beats
 
-    # Each beat repeats every BEATINTERVAL days across the full date range
-    current_date = start_date
-    while current_date <= end_date:
-        for salesman in salesmen:
-            num_vouchers = random.randint(40, 50)
-            for beat in salesman_beats_map[salesman]:
+    # Each beat is visited once every BEATINTERVAL days.
+    # A salesman covers one beat per day, so beats are staggered across the interval.
+    # E.g. with 2 beats and interval=14: beat[0] on days 0,14,28,… beat[1] on days 7,21,35,…
+    for salesman in salesmen:
+        beats = salesman_beats_map[salesman]
+        num_beats = len(beats)
+        for beat_idx, beat in enumerate(beats):
+            offset = timedelta(days=(beat_idx * BEATINTERVAL) // num_beats)
+            beat_date = start_date + offset
+            while beat_date <= end_date:
+                num_vouchers = random.randint(10, 15)
                 for _ in range(num_vouchers):
                     voucher_amount = Decimal(str(random.randint(5000, 25000)))
-                    bill_no = f'{current_date.strftime("%Y%m%d")}{bill_counter:03d}'
+                    bill_no = f'{beat_date.strftime("%Y%m%d")}{bill_counter:03d}'
                     bill_counter += 1
 
                     voucher = {
                         'bill_no': bill_no,
-                        'date': current_date.isoformat(),
+                        'date': beat_date.isoformat(),
                         'amount': str(voucher_amount),
                         'balance': str(voucher_amount),
                         'beat': beat,
                         'salesman': salesman,
                         'created_by': created_by,
-                        'created_at': f'{current_date.isoformat()}T09:00:00'
+                        'created_at': f'{beat_date.isoformat()}T09:00:00'
                     }
                     vouchers.append(voucher)
 
-                    # Generate 3-4 installments at 20-30% of voucher amount each, on BEATINTERVAL schedule
+                    # Generate 3-4 installments at 15-25% of voucher amount each, on BEATINTERVAL schedule
                     num_installments = random.randint(3, 4)
-                    installment_date = current_date + timedelta(days=BEATINTERVAL)
+                    installment_date = beat_date + timedelta(days=BEATINTERVAL)
 
                     for _ in range(num_installments):
-                        pct = Decimal(str(random.randint(20, 30))) / Decimal('100')
+                        pct = Decimal(str(random.randint(15, 25))) / Decimal('100')
                         payment = (voucher_amount * pct).quantize(Decimal('0.01'))
 
                         installment = {
@@ -181,7 +163,7 @@ def generate_data(start_date, end_date, beats, salesmen):
                         installments.append(installment)
                         installment_date += timedelta(days=BEATINTERVAL)
 
-        current_date += timedelta(days=BEATINTERVAL)
+                beat_date += timedelta(days=BEATINTERVAL)
 
     return vouchers, installments
 
@@ -193,13 +175,11 @@ def main():
     start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
     end_date = start_date + timedelta(days=int(30 * months))
 
-    # Read beats and salesmen
-    beats = read_beats()
-    salesmen = read_salesmen()
+    beats_map = _read_beats_with_salesman()
+    salesmen = load_salesmen()
 
-    
     # Generate data
-    vouchers, installments = generate_data(start_date, end_date, beats, salesmen)
+    vouchers, installments = generate_data(start_date, end_date, beats_map, salesmen)
 
     # Recompute voucher balances by subtracting installments payments.
     # This ensures voucher['balance'] reflects actual outstanding after installments.
@@ -242,8 +222,8 @@ def main():
         return
 
     # Write to CSV
-    vouchers_file = Path('data/vouchers.csv')
-    with open(vouchers_file, 'w', newline='') as f:
+    vouchers_file = DATA_DIR / 'vouchers.csv'
+    with vouchers_file.open('w', newline='') as f:
         writer = csv.DictWriter(
             f,
             fieldnames=['bill_no', 'date', 'amount', 'balance', 'beat', 'salesman', 'created_by', 'created_at']
@@ -251,8 +231,8 @@ def main():
         writer.writeheader()
         writer.writerows(vouchers)
 
-    installments_file = Path('data/installments.csv')
-    with open(installments_file, 'w', newline='') as f:
+    installments_file = DATA_DIR / 'installments.csv'
+    with installments_file.open('w', newline='') as f:
         writer = csv.DictWriter(
             f,
             fieldnames=['bill_no', 'date', 'amount', 'salesman', 'created_by', 'created_at']
@@ -260,11 +240,9 @@ def main():
         writer.writeheader()
         writer.writerows(installments)
 
-    # Print summary
-    print(f'✓ Generated {len(vouchers)} vouchers and {len(installments)} installments')
+    print(f'Generated {len(vouchers)} vouchers and {len(installments)} installments')
     print(f'  Date range: {start_date} to {end_date}')
-
-    print(f'\n→ Wrote to data/vouchers.csv and data/installments.csv')
+    print(f'  Wrote to {vouchers_file} and {installments_file}')
 
 
 if __name__ == '__main__':
