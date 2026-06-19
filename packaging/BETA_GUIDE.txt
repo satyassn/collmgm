@@ -1,0 +1,102 @@
+================================================================================
+  CollMgm Beta v0.1 - Quick Start Guide
+================================================================================
+
+INSTALLATION
+------------
+1. Double-click  CollMgm-Beta-Setup.exe
+2. Click  Next > Next > Finish
+3. A "CollMgm" shortcut appears on your desktop
+
+
+LAUNCHING THE APP
+-----------------
+Double-click the "CollMgm" icon on your desktop.
+A black terminal window opens showing the main menu:
+
+  ==================================================
+  COLLECTION MANAGEMENT MENU
+  ==================================================
+  1. coll-start    - Generate list of vouchers to start collection
+  2. coll-submit   - Submit today's collections
+  3. coll-finalize - Review and finalize collections
+  4. Reports
+  5. Exit
+  ==================================================
+
+Type a number and press Enter to select an option.
+
+
+TEST DATA INCLUDED
+------------------
+The app comes pre-loaded with sample data covering 2 checkpoints
+(cp1 and cp2), each with 5 beats and 2 salesmen.
+
+  Users / logins available:
+    dist           (distributor role)
+    cp1salesman1   (salesman - handles cp1beat1, cp1beat3, cp1beat5)
+    cp1salesman2   (salesman - handles cp1beat2, cp1beat4)
+    cp2salesman1   (salesman - handles cp2beat1, cp2beat3, cp2beat5)
+    cp2salesman2   (salesman - handles cp2beat2, cp2beat4)
+
+  Note: There are no passwords in this beta — just enter the username
+  when the app asks "Enter your name."
+
+
+SUGGESTED WORKFLOW TO VALIDATE
+-------------------------------
+Follow these steps in order to run through the full collection cycle:
+
+STEP 1 - Start a collection (as distributor)
+  a. Choose option  1  (coll-start)
+  b. Enter name:  dist
+  c. Select a beat, e.g.  cp1beat1
+  d. The app generates a pending voucher list and a .txt report
+  e. Choose option  1  again for another beat if you like
+
+STEP 2 - Submit collections (as salesman)
+  a. Choose option  2  (coll-submit)
+  b. Enter name:  cp1salesman1
+  c. The app shows the vouchers for that salesman's active beats
+  d. Enter payment amounts collected against each voucher
+  e. Confirm submission when prompted
+
+STEP 3 - Finalize (as distributor)
+  a. Choose option  3  (coll-finalize)
+  b. Enter name:  dist
+  c. Review the submitted collections for each beat
+  d. Confirm to archive and close the collection cycle
+
+STEP 4 - Check Reports
+  a. Choose option  4
+  b. Try all 4 sub-reports:
+       4.1  Salesman - pending collections
+       4.2  Beat     - pending collections
+       4.3  Collections by age
+       4.4  Collections by amount
+
+
+CLOSING THE APP
+---------------
+Choose option  5  (Exit) from the main menu.
+Then close the terminal window.
+
+
+KNOWN BETA LIMITATIONS
+-----------------------
+- No password protection (RBAC coming in a future release)
+- Data is stored as CSV files in the install folder — not a database
+- No undo / rollback once a collection is finalized
+- Dates default to today's system date
+
+
+SUPPORT / FEEDBACK
+------------------
+Please report any issues or feedback to:  satyassn@gmail.com
+
+Include a description of:
+  - What you were trying to do
+  - What menu option you chose
+  - What the screen showed (a photo of the terminal window is fine)
+
+================================================================================

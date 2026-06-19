@@ -15,6 +15,7 @@ env/
 # Project data folders
 data/
 staging/
+archive/
 
 # Distribution / packaging
 build/
