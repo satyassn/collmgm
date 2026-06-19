@@ -1,0 +1,7 @@
+name,role
+dist,distributor
+cp1salesman1,salesman
+cp1salesman2,salesman
+cp2salesman1,salesman
+cp2salesman2,salesman
+test,system

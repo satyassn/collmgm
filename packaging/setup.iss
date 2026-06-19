@@ -26,7 +26,7 @@ PrivilegesRequired=lowest
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional icons:"; Flags: checked
+Name: "desktopicon"; Description: "Create a &desktop shortcut"
 
 [Files]
 ; Python embeddable runtime — place python-3.12.x-embed-amd64 contents here before build

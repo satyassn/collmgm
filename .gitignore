@@ -13,7 +13,7 @@ env/
 .env/
 
 # Project data folders
-data/
+# data/
 staging/
 archive/
 
