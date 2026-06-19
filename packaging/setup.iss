@@ -46,7 +46,7 @@ Source: "..\data\vouchers.csv";     DestDir: "{app}\data"; Flags: ignoreversion
 Source: "..\data\installments.csv"; DestDir: "{app}\data"; Flags: ignoreversion
 
 ; Launcher and guide
-Source: "run.bat";           DestDir: "{app}"; Flags: ignoreversion
+Source: "..\run.bat";        DestDir: "{app}"; Flags: ignoreversion
 Source: "BETA_GUIDE.txt";    DestDir: "{app}"; Flags: ignoreversion isreadme
 
 [Dirs]
