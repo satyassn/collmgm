@@ -58,16 +58,12 @@ def write_collection_text(path, beats, salesmen, vouchers, stage=None, status=No
     vdate_width = max(len("voucher_date"), max(len(v.get("voucher_date", "")) for v in vouchers))
     balance_width = max(len("balance"), max(len(v["balance"]) for v in vouchers))
     payment_width = max(len("collection"), max(len(v.get("payment", "")) for v in vouchers))
-    beat_width = max(len("beat"), max(len(v["beat"]) for v in vouchers))
-    salesman_width = max(len("salesman"), max(len(v["salesman"]) for v in vouchers))
 
     header = (
         f"{ 'bill_no':<{bill_width}}  "
         f"{ 'voucher_date':<{vdate_width}}  "
         f"{ 'balance':>{balance_width}}  "
-        f"{ 'collection':>{payment_width}}  "
-        f"{ 'beat':<{beat_width}}  "
-        f"{ 'salesman':<{salesman_width}}"
+        f"{ 'collection':>{payment_width}}"
     )
     separator = "-" * len(header)
 
@@ -90,9 +86,7 @@ def write_collection_text(path, beats, salesmen, vouchers, stage=None, status=No
             f"{voucher['bill_no']:<{bill_width}}  "
             f"{voucher.get('voucher_date', ''):<{vdate_width}}  "
             f"{voucher['balance']:>{balance_width}}  "
-            f"{voucher.get('payment', ''):>{payment_width}}  "
-            f"{voucher['beat']:<{beat_width}}  "
-            f"{voucher['salesman']:<{salesman_width}}"
+            f"{voucher.get('payment', ''):>{payment_width}}"
         )
 
     lines.append(separator)
@@ -151,24 +145,26 @@ def _load_installments(report_path):
 def _append_installments_csv(vouchers):
     inst_file = DATA_DIR / "installments.csv"
     collection_date = datetime.now().strftime("%Y-%m-%d")
+    created_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     write_header = not inst_file.exists()
     with inst_file.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["bill_no", "voucher_date", "collection_date", "payment", "beat", "salesman"])
+        writer = csv.DictWriter(f, fieldnames=["bill_no", "date", "amount", "salesman", "created_by", "created_at"])
         if write_header:
             writer.writeheader()
         for v in vouchers:
             if v.get("payment"):
                 writer.writerow({
                     "bill_no": v["bill_no"],
-                    "voucher_date": v.get("voucher_date", ""),
-                    "collection_date": collection_date,
-                    "payment": v["payment"],
-                    "beat": v["beat"],
+                    "date": collection_date,
+                    "amount": v["payment"],
                     "salesman": v["salesman"],
+                    "created_by": "app",
+                    "created_at": created_at,
                 })
 
 
 def _update_vouchers_balance(vouchers):
+    """Update balances in vouchers.csv. Returns list of bill_nos that reached zero."""
     vouchers_file = DATA_DIR / "vouchers.csv"
     if not vouchers_file.exists():
         raise FileNotFoundError(f"Missing vouchers file: {vouchers_file}")
@@ -179,9 +175,10 @@ def _update_vouchers_balance(vouchers):
         if v.get("payment")
     }
     if not payment_map:
-        return
+        return []
 
     rows = []
+    completed_bill_nos = []
     fieldnames = None
     with vouchers_file.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -193,6 +190,8 @@ def _update_vouchers_balance(vouchers):
                     old_balance = Decimal(row["balance"].strip())
                     new_balance = max(Decimal("0"), old_balance - payment_map[bill_no])
                     row["balance"] = str(new_balance.quantize(Decimal("0.01")))
+                    if new_balance == Decimal("0"):
+                        completed_bill_nos.append(bill_no)
                 except Exception:
                     pass
             rows.append(row)
@@ -201,3 +200,66 @@ def _update_vouchers_balance(vouchers):
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+    return completed_bill_nos
+
+
+def _archive_completed(bill_nos):
+    """Move completed vouchers and their installments to completed_* CSV files."""
+    if not bill_nos:
+        return
+    bill_set = set(bill_nos)
+
+    # --- Archive vouchers ---
+    vouchers_file = DATA_DIR / "vouchers.csv"
+    completed_vouchers_file = DATA_DIR / "completed_vouchers.csv"
+    remaining_vouchers = []
+    completed_vouchers = []
+    v_fieldnames = None
+    if vouchers_file.exists():
+        with vouchers_file.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            v_fieldnames = reader.fieldnames
+            for row in reader:
+                if row.get("bill_no", "").strip() in bill_set:
+                    completed_vouchers.append(row)
+                else:
+                    remaining_vouchers.append(row)
+        with vouchers_file.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=v_fieldnames)
+            writer.writeheader()
+            writer.writerows(remaining_vouchers)
+        if completed_vouchers:
+            write_header = not completed_vouchers_file.exists() or completed_vouchers_file.stat().st_size == 0
+            with completed_vouchers_file.open("a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=v_fieldnames)
+                if write_header:
+                    writer.writeheader()
+                writer.writerows(completed_vouchers)
+
+    # --- Archive installments ---
+    inst_file = DATA_DIR / "installments.csv"
+    completed_inst_file = DATA_DIR / "completed_installments.csv"
+    remaining_inst = []
+    completed_inst = []
+    i_fieldnames = None
+    if inst_file.exists():
+        with inst_file.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            i_fieldnames = reader.fieldnames
+            for row in reader:
+                if row.get("bill_no", "").strip() in bill_set:
+                    completed_inst.append(row)
+                else:
+                    remaining_inst.append(row)
+        with inst_file.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=i_fieldnames)
+            writer.writeheader()
+            writer.writerows(remaining_inst)
+        if completed_inst and i_fieldnames:
+            write_header = not completed_inst_file.exists() or completed_inst_file.stat().st_size == 0
+            with completed_inst_file.open("a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=i_fieldnames)
+                if write_header:
+                    writer.writeheader()
+                writer.writerows(completed_inst)

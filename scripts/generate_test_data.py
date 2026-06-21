@@ -3,24 +3,27 @@
 Test data generator for collmgm POC.
 
 Generates vouchers and installments.
-- Vouchers: For a given saleman generate 40-50 vouchers per beat.
-    Each beat repeats after BEATINTERVAL
-    Each voucher has a random amount between 5000 and 25000. 
+- Vouchers: For a given salesman generate 10-15 vouchers per beat per visit.
+    Each beat repeats after BEATINTERVAL. Use --visits to control how many
+    times each beat is visited (default 1, giving 10-15 vouchers per salesman/beat).
+    Each voucher has a random amount between 5000 and 25000.
 - Installments: 3-4 installments per voucher, paid on BEATINTERVAL
-    - Installment amounts are calculated as 20-30 % of the voucher amount
+    - Installment amounts are calculated as 15-25% of the voucher amount
 
 Usage:
-  python scripts/generate_test_data.py [--start YYYY-MM-DD] [--months N] [--seed S] [--preview] [-h]
-  All arguments are required for script to run but will have default values if not specified.
+  python scripts/generate_test_data.py [--start YYYY-MM-DD] [--months N] [--visits N] [--seed S] [--preview] [-h]
+  All arguments are optional and have default values.
   --start: Start date for the data generation range. Default: 2020-01-01
-  --months: Number of months to generate data for, default 6 months
-  --seed: Random seed for reproducible results. default is 42
+  --months: Number of months to generate data for. Default: 6
+  --visits: Max beat visits per salesman per beat. Default: 1
+  --seed: Random seed for reproducible results. Default: 42
   --preview: Print sample rows without writing to files.
   --help: Show this help message.
 
 Examples:
   python scripts/generate_test_data.py
   python scripts/generate_test_data.py --start 2025-12-01 --months 6 --seed 42
+  python scripts/generate_test_data.py --visits 3  # 3 beat visits = 30-45 vouchers per salesman/beat
   python scripts/generate_test_data.py --preview  # Print sample rows without writing
 """
 
@@ -37,11 +40,12 @@ BEATINTERVAL = 14  # days
 
 USAGE = """\
 Usage:
-  python scripts/generate_test_data.py [--start YYYY-MM-DD] [--months N] [--seed S] [--preview] [-h]
+  python scripts/generate_test_data.py [--start YYYY-MM-DD] [--months N] [--visits N] [--seed S] [--preview] [-h]
 
 Options:
   --start YYYY-MM-DD  Start date for data generation. Default: 2020-01-01
   --months N          Number of months to generate. Default: 6
+  --visits N          Max beat visits per salesman per beat. Default: 1
   --seed S            Random seed for reproducible results. Default: 42
   --preview           Print sample rows without writing to files.
   -h, --help          Show this help message.
@@ -49,6 +53,7 @@ Options:
 Examples:
   python scripts/generate_test_data.py
   python scripts/generate_test_data.py --start 2025-12-01 --months 6 --seed 42
+  python scripts/generate_test_data.py --visits 3
   python scripts/generate_test_data.py --preview
 """
 
@@ -56,6 +61,7 @@ def parse_args():
     """Parse simple CLI arguments."""
     start_date_str = '2020-01-01'
     months = 6
+    max_visits = 1
     seed = 42
     preview = False
 
@@ -71,6 +77,9 @@ def parse_args():
         elif args[i] == '--months' and i + 1 < len(args):
             months = int(args[i + 1])
             i += 2
+        elif args[i] == '--visits' and i + 1 < len(args):
+            max_visits = int(args[i + 1])
+            i += 2
         elif args[i] == '--seed' and i + 1 < len(args):
             seed = int(args[i + 1])
             i += 2
@@ -82,7 +91,7 @@ def parse_args():
             print(USAGE, file=sys.stderr)
             sys.exit(1)
 
-    return start_date_str, months, seed, preview
+    return start_date_str, months, max_visits, seed, preview
 
 
 def _read_beats_with_salesman():
@@ -96,7 +105,7 @@ def _read_beats_with_salesman():
     return beats
 
 
-def generate_data(start_date, end_date, beats_map, salesmen):
+def generate_data(start_date, end_date, beats_map, salesmen, max_visits=1):
     """Generate vouchers and installments.
 
     beats_map: dict[beat_name -> salesman] from _read_beats_with_salesman()
@@ -125,7 +134,8 @@ def generate_data(start_date, end_date, beats_map, salesmen):
         for beat_idx, beat in enumerate(beats):
             offset = timedelta(days=(beat_idx * BEATINTERVAL) // num_beats)
             beat_date = start_date + offset
-            while beat_date <= end_date:
+            visits = 0
+            while beat_date <= end_date and visits < max_visits:
                 num_vouchers = random.randint(10, 15)
                 for _ in range(num_vouchers):
                     voucher_amount = Decimal(str(random.randint(5000, 25000)))
@@ -164,12 +174,13 @@ def generate_data(start_date, end_date, beats_map, salesmen):
                         installment_date += timedelta(days=BEATINTERVAL)
 
                 beat_date += timedelta(days=BEATINTERVAL)
+                visits += 1
 
     return vouchers, installments
 
 
 def main():
-    start_date_str, months, seed, preview = parse_args()
+    start_date_str, months, max_visits, seed, preview = parse_args()
 
     random.seed(seed)
     start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
@@ -179,7 +190,7 @@ def main():
     salesmen = load_salesmen()
 
     # Generate data
-    vouchers, installments = generate_data(start_date, end_date, beats_map, salesmen)
+    vouchers, installments = generate_data(start_date, end_date, beats_map, salesmen, max_visits)
 
     # Recompute voucher balances by subtracting installments payments.
     # This ensures voucher['balance'] reflects actual outstanding after installments.
@@ -218,7 +229,7 @@ def main():
         print('\nSample installments (first 5):')
         for i in installments[:5]:
             print('  ', i)
-        print(f'\nWould generate {len(vouchers)} vouchers, {len(installments)} installments')
+        print(f'\nWould generate {len(vouchers)} vouchers, {len(installments)} installments (visits={max_visits})')
         return
 
     # Write to CSV
@@ -240,7 +251,7 @@ def main():
         writer.writeheader()
         writer.writerows(installments)
 
-    print(f'Generated {len(vouchers)} vouchers and {len(installments)} installments')
+    print(f'Generated {len(vouchers)} vouchers and {len(installments)} installments (visits={max_visits})')
     print(f'  Date range: {start_date} to {end_date}')
     print(f'  Wrote to {vouchers_file} and {installments_file}')
 

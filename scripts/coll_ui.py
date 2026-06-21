@@ -22,6 +22,7 @@ def display_menu():
     print("   4.2 - Beat - pending collections")
     print("   4.3 - Collections - Pending by age")
     print("   4.4 - Collections - Pending by amount")
+    print("   4.5 - Search voucher")
     print("5. Exit")
     print("=" * 50)
 
@@ -46,15 +47,16 @@ def get_reports_submenu_choice():
     print("2. Beat - pending collections")
     print("3. Collections - Pending by age")
     print("4. Collections - Pending by amount")
+    print("5. Search voucher")
     print("0. Back to main menu")
     print("-" * 50)
     while True:
         try:
-            choice = input("Enter your choice (0-4): ").strip()
+            choice = input("Enter your choice (0-5): ").strip()
             choice_num = int(choice)
-            if choice_num in [0, 1, 2, 3, 4]:
+            if choice_num in [0, 1, 2, 3, 4, 5]:
                 return choice_num
-            print(f"Invalid choice: {choice_num}. Please enter 0-4.")
+            print(f"Invalid choice: {choice_num}. Please enter 0-5.")
         except ValueError:
             print(f"Invalid input: '{choice}'. Please enter a number.")
 
@@ -150,11 +152,12 @@ def prompt_continue():
     input("\nPress Enter to continue to the main menu...")
 
 
-def prompt_report_selection(reports):
+def prompt_report_selection(reports, labels=None):
     """Prompt user to select one report for editing."""
     print("\nSelect staged report to edit:")
     for index, report in enumerate(reports, start=1):
-        print(f"  {index}. {report.name}")
+        label = labels[index - 1] if labels else report.name
+        print(f"  {index}. {label}")
 
     while True:
         choice = input(f"Enter report number (1-{len(reports)}): ").strip()
@@ -185,16 +188,12 @@ def display_report_with_focus(beats, salesmen, vouchers, current_idx):
     vdate_width = max(len("voucher_date"), max(len(v.get("voucher_date", "")) for v in vouchers))
     balance_width = max(len("balance"), max(len(v["balance"]) for v in vouchers))
     payment_width = max(len("collection"), max(len(v.get("payment", "")) for v in vouchers))
-    beat_width = max(len("beat"), max(len(v["beat"]) for v in vouchers))
-    salesman_width = max(len("salesman"), max(len(v["salesman"]) for v in vouchers))
 
     header = (
         f"   {'bill_no':<{bill_width}}  "
         f"{'voucher_date':<{vdate_width}}  "
         f"{'balance':>{balance_width}}  "
-        f"{'collection':>{payment_width}}  "
-        f"{'beat':<{beat_width}}  "
-        f"{'salesman':<{salesman_width}}"
+        f"{'collection':>{payment_width}}"
     )
     separator = "-" * len(header)
 
@@ -207,9 +206,7 @@ def display_report_with_focus(beats, salesmen, vouchers, current_idx):
             f"{marker} {voucher['bill_no']:<{bill_width}}  "
             f"{voucher.get('voucher_date', ''):<{vdate_width}}  "
             f"{voucher['balance']:>{balance_width}}  "
-            f"{voucher.get('payment', ''):>{payment_width}}  "
-            f"{voucher['beat']:<{beat_width}}  "
-            f"{voucher['salesman']:<{salesman_width}}"
+            f"{voucher.get('payment', ''):>{payment_width}}"
         )
         print(line)
 
@@ -234,11 +231,9 @@ def get_payment_input(voucher, current_idx, total_records, total_payments_so_far
     print("Controls: Enter amount, or press:")
     print("  [n] = next record  [p] = previous record  [s] = skip  [q] = quit")
 
-    prompt = (
-        f"Payment amount (or command) [{current_payment}]: "
-        if current_payment
-        else "Payment amount (or command): "
-    )
+    default = current_payment if current_payment else str(balance.to_integral() if balance == balance.to_integral() else balance.quantize(Decimal('0.01')))
+    prompt = f"Payment amount (or command) [{default}]: "
+
     while True:
         value = input(prompt).strip().lower()
 
@@ -251,7 +246,7 @@ def get_payment_input(voucher, current_idx, total_records, total_payments_so_far
         elif value == "q":
             return current_payment, "quit"
         elif value == "":
-            return current_payment, "next"
+            return default, "next"
         else:
             try:
                 payment = Decimal(value)
@@ -438,6 +433,58 @@ def display_report_by_amount(vouchers, total_pending, limit):
     print("=" * 60)
 
 
+def display_voucher_detail(voucher, installments, is_completed):
+    """Display a voucher header and its full installment history."""
+    status = "Completed" if is_completed else "Active"
+
+    print("\n" + "=" * 60)
+    print("VOUCHER DETAIL")
+    print(f"Bill No  : {voucher['bill_no']}")
+    print(f"Date     : {voucher['date']}")
+    print(f"Amount   : {voucher['amount']}")
+    print(f"Balance  : {voucher['balance']}")
+    print(f"Beat     : {voucher['beat']}")
+    print(f"Salesman : {voucher['salesman']}")
+    print(f"Status   : {status}")
+    print("=" * 60)
+
+    if not installments:
+        print("\nNo installment records found.")
+        return
+
+    print("\nInstallment History:")
+
+    rows = []
+    total = Decimal("0")
+    for inst in installments:
+        date = inst.get("date", "")
+        amount_str = inst.get("amount", "")
+        salesman = inst.get("salesman", "")
+        try:
+            amt = Decimal(amount_str)
+        except Exception:
+            amt = Decimal("0")
+        total += amt
+        rows.append((date, str(amt), salesman))
+
+    rows.sort(key=lambda r: r[0], reverse=True)
+
+    date_w = max(len("date"), max(len(r[0]) for r in rows))
+    amt_w = max(len("amount"), max(len(r[1]) for r in rows))
+    sm_w = max(len("salesman"), max(len(r[2]) for r in rows))
+
+    header = f"  {'date':<{date_w}}  {'amount':>{amt_w}}  {'salesman':<{sm_w}}"
+    sep = "-" * len(header)
+    print(sep)
+    print(header)
+    print(sep)
+    for date, amt, salesman in rows:
+        print(f"  {date:<{date_w}}  {amt:>{amt_w}}  {salesman:<{sm_w}}")
+    print(sep)
+    print(f"  Total paid: {total}")
+    print("=" * 60)
+
+
 def interactive_payment_editor(vouchers, beats, salesmen, start_idx=0):
     """Interactive payment editor with report display and navigation.
 
@@ -467,4 +514,6 @@ def interactive_payment_editor(vouchers, beats, salesmen, start_idx=0):
             elif confirm == "n":
                 return None, False, None
 
+    # Redisplay with all payments filled in; current_idx == len(vouchers) so no >>> marker
+    display_report_with_focus(beats, salesmen, vouchers, current_idx)
     return vouchers, True, None

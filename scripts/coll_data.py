@@ -78,7 +78,7 @@ def load_beats_pending_summary(current_user=None):
 
 
 def _load_vouchers_by_criterion(selection_type, selection_values, current_user=None):
-    """Return pending vouchers filtered by beat or salesman (not both)."""
+    """Return pending vouchers filtered by beat, salesman, or both (beat_salesman)."""
     today = datetime.now().strftime("%Y-%m-%d")
     selected = set(selection_values)
     vouchers = []
@@ -91,6 +91,9 @@ def _load_vouchers_by_criterion(selection_type, selection_values, current_user=N
             continue
         if selection_type == "salesman" and row_salesman not in selected:
             continue
+        if selection_type == "beat_salesman":
+            if row_beat != selection_values[0] or row_salesman != selection_values[1]:
+                continue
 
         balance_str = row.get("balance", "0").strip()
         try:
@@ -300,3 +303,61 @@ def query_pending_by_amount(limit, current_user=None):
     for v in top:
         v["balance"] = str(v["balance"])
     return top, len(pending)
+
+
+def _read_installments_for_bill(bill_no, inst_file):
+    """Read installment rows matching bill_no from a CSV file."""
+    if not inst_file.exists():
+        return []
+    rows = []
+    with inst_file.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get("bill_no", "").strip() == bill_no:
+                rows.append(row)
+    return rows
+
+
+def search_voucher(bill_no):
+    """Search active and completed vouchers by bill_no.
+
+    Returns (voucher_dict, [installment_dicts], is_completed) or None if not found.
+    Installment dicts use flexible keys — callers should use .get() with fallbacks.
+    """
+    bill_no = bill_no.strip()
+
+    # Search active vouchers first
+    for row in load_vouchers_raw():
+        if row.get("bill_no", "").strip() == bill_no:
+            voucher = {
+                "bill_no": row.get("bill_no", "").strip(),
+                "date": row.get("date", "").strip(),
+                "amount": row.get("amount", "").strip(),
+                "balance": row.get("balance", "").strip(),
+                "beat": row.get("beat", "").strip(),
+                "salesman": row.get("salesman", "").strip(),
+            }
+            installments = _read_installments_for_bill(bill_no, DATA_DIR / "installments.csv")
+            return voucher, installments, False
+
+    # Search completed vouchers
+    completed_file = DATA_DIR / "completed_vouchers.csv"
+    if completed_file.exists():
+        with completed_file.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("bill_no", "").strip() == bill_no:
+                    voucher = {
+                        "bill_no": row.get("bill_no", "").strip(),
+                        "date": row.get("date", "").strip(),
+                        "amount": row.get("amount", "").strip(),
+                        "balance": row.get("balance", "").strip(),
+                        "beat": row.get("beat", "").strip(),
+                        "salesman": row.get("salesman", "").strip(),
+                    }
+                    installments = _read_installments_for_bill(
+                        bill_no, DATA_DIR / "completed_installments.csv"
+                    )
+                    return voucher, installments, True
+
+    return None

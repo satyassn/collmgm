@@ -16,7 +16,7 @@ from coll_store import (
     ensure_staging_dir, save_report_json,
     write_collection_text, sanitize_filename_component,
     _installments_path, _save_installments, _load_installments,
-    _append_installments_csv, _update_vouchers_balance,
+    _append_installments_csv, _update_vouchers_balance, _archive_completed,
 )
 from coll_data import (
     load_beats, load_salesmen, load_beats_pending_summary, _load_vouchers_by_criterion,
@@ -25,13 +25,24 @@ from coll_data import (
     query_pending_by_salesman, query_pending_by_beat,
     query_pending_by_age, query_pending_by_amount,
     NUMOF_TOP_AGED_VOUCHERS, NUMOF_TOP_AMOUNT_VOUCHERS,
+    search_voucher,
 )
 from coll_ui import (
     select_from_list, select_beat_with_summary, prompt_continue, prompt_report_selection,
     interactive_payment_editor,
     display_report_salesman_pending, display_report_beat_pending,
     display_report_by_age, display_report_by_amount,
+    display_voucher_detail,
 )
+
+
+def _report_label(report_data, fallback_name):
+    """Return a human-readable label for a staging report."""
+    sel_type = report_data.get("selection_type", "beat")
+    sel = report_data.get("selection", [])
+    if sel_type == "beat_salesman" and len(sel) >= 2:
+        return f"Beat: {sel[0]} | Salesman: {sel[1]}"
+    return fallback_name
 
 
 def run_coll_start():
@@ -42,12 +53,37 @@ def run_coll_start():
     try:
         beats = load_beats()
         summary = load_beats_pending_summary()
-        selection_values = [select_beat_with_summary(beats, summary)]
+        beat = select_beat_with_summary(beats, summary)
     except Exception as error:
         print(f"Error: {error}")
         prompt_continue()
         return
-    selection_type = "beat"
+
+    # Load pending vouchers for the selected beat to discover salesmen
+    try:
+        beat_vouchers = _load_vouchers_by_criterion("beat", [beat])
+    except Exception as error:
+        print(f"Error loading vouchers: {error}")
+        prompt_continue()
+        return
+
+    if not beat_vouchers:
+        print("\nNO Records Found\n")
+        prompt_continue()
+        return
+
+    # Nested salesman selection — prompt only when beat has multiple salesmen
+    salesmen_in_beat = sorted({v["salesman"] for v in beat_vouchers})
+    if len(salesmen_in_beat) > 1:
+        chosen_salesman = select_from_list(salesmen_in_beat, "salesman")
+    else:
+        chosen_salesman = salesmen_in_beat[0]
+
+    selection_type = "beat_salesman"
+    selection_values = [beat, chosen_salesman]
+
+    # Filter in-memory to chosen salesman (no second CSV read)
+    vouchers = [v for v in beat_vouchers if v["salesman"] == chosen_salesman]
 
     existing = _find_any_active_beat_report(selection_type, selection_values)
     if existing:
@@ -55,7 +91,7 @@ def run_coll_start():
         stages = existing_data.get("stages", {})
         submit_confirmed = stages.get("submit") == "confirmed"
 
-        print(f"\nAn active collection already exists for this beat: {existing_path.name}")
+        print(f"\nAn active collection already exists for Beat: {beat} | Salesman: {chosen_salesman}")
 
         if submit_confirmed:
             print("This report is in the finalize pipeline. Complete finalization before starting a new collection.")
@@ -72,15 +108,13 @@ def run_coll_start():
                     else:
                         print(f"  (Text report not found)  Vouchers: {len(existing_data['vouchers'])}")
                     ex_vouchers = existing_data["vouchers"]
-                    ex_beats = existing_data.get("selection", selection_values)
-                    ex_salesmen = sorted({v["salesman"] for v in ex_vouchers})
                     while True:
                         confirm = input("Verify and confirm this report? (y/n): ").strip().lower()
                         if confirm in ("y", "yes"):
                             existing_data["status"] = "confirmed"
                             existing_data.setdefault("stages", {})["start"] = "confirmed"
                             save_report_json(existing_path, existing_data)
-                            write_collection_text(txt_path, ex_beats, ex_salesmen, ex_vouchers,
+                            write_collection_text(txt_path, [beat], [chosen_salesman], ex_vouchers,
                                                   stage="start", status="confirmed")
                             print("Report confirmed.")
                             break
@@ -104,27 +138,12 @@ def run_coll_start():
                 else:
                     print("Please enter 'u' or 'n'.")
 
-    try:
-        vouchers = _load_vouchers_by_criterion(selection_type, selection_values)
-    except Exception as error:
-        print(f"Error loading vouchers: {error}")
-        prompt_continue()
-        return
-
-    if not vouchers:
-        print("\nNO Records Found\n")
-        prompt_continue()
-        return
-
     ensure_staging_dir()
     timestamp = datetime.now().strftime("%Y%m%d")
     safe_selection = "_".join(sanitize_filename_component(v) for v in selection_values)
     base_name = f"coll{timestamp}-{selection_type}-{safe_selection}"
     json_path = STAGING_DIR / f"{base_name}.json"
     txt_path = STAGING_DIR / f"{base_name}.txt"
-
-    beats_for_report = selection_values
-    salesmen_for_report = sorted({v["salesman"] for v in vouchers})
 
     start_data = {
         "stage": "start",
@@ -137,7 +156,7 @@ def run_coll_start():
 
     try:
         save_report_json(json_path, start_data)
-        write_collection_text(txt_path, beats_for_report, salesmen_for_report, vouchers,
+        write_collection_text(txt_path, [beat], [chosen_salesman], vouchers,
                               stage="start", status="new")
     except Exception as error:
         print(f"Failed to create report files: {error}")
@@ -153,7 +172,7 @@ def run_coll_start():
             start_data["status"] = "confirmed"
             start_data.setdefault("stages", {})["start"] = "confirmed"
             save_report_json(json_path, start_data)
-            write_collection_text(txt_path, beats_for_report, salesmen_for_report, vouchers,
+            write_collection_text(txt_path, [beat], [chosen_salesman], vouchers,
                                   stage="start", status="confirmed")
             print("Report confirmed.")
             break
@@ -181,7 +200,9 @@ def run_coll_submit():
         return
 
     confirmed_map = {p: d for p, d in confirmed_reports}
-    selected_paths = prompt_report_selection(list(confirmed_map.keys()))
+    report_paths = list(confirmed_map.keys())
+    labels = [_report_label(confirmed_map[p], p.name) for p in report_paths]
+    selected_paths = prompt_report_selection(report_paths, labels)
 
     for report_path in selected_paths:
         report_data = confirmed_map[report_path]
@@ -189,7 +210,10 @@ def run_coll_submit():
         selection_type = report_data.get("selection_type", "beat")
         selection = report_data.get("selection", [])
 
-        if selection_type == "beat":
+        if selection_type == "beat_salesman":
+            beats = [selection[0]]
+            salesmen = [selection[1]]
+        elif selection_type == "beat":
             beats = selection
             salesmen = sorted({v["salesman"] for v in vouchers})
         else:
@@ -238,8 +262,12 @@ def run_coll_submit():
         print(f"  Total vouchers: {total_vouchers}")
         print(f"  Total collections: {total_collections}")
 
-        save_confirm = input("\nSave these collections? (y/n): ").strip().lower()
-        if save_confirm not in ["y", "yes"]:
+        while True:
+            save_confirm = input("\nSave these collections? (y/n): ").strip().lower()
+            if save_confirm in ("y", "yes", "n", "no"):
+                break
+            print("Please enter 'y' or 'n'.")
+        if save_confirm in ("n", "no"):
             print(f"Collections discarded for {report_path.name}.")
             continue
 
@@ -288,7 +316,9 @@ def run_coll_finalize():
         return
 
     report_map = {p: d for p, d in submit_reports}
-    selected_paths = prompt_report_selection(list(report_map.keys()))
+    report_paths = list(report_map.keys())
+    labels = [_report_label(report_map[p], p.name) for p in report_paths]
+    selected_paths = prompt_report_selection(report_paths, labels)
 
     for report_path in selected_paths:
         report_data = report_map[report_path]
@@ -308,7 +338,9 @@ def run_coll_finalize():
 
         try:
             _append_installments_csv(vouchers)
-            _update_vouchers_balance(vouchers)
+            completed_bill_nos = _update_vouchers_balance(vouchers)
+            if completed_bill_nos:
+                _archive_completed(completed_bill_nos)
         except Exception as error:
             print(f"Failed to update data files for {report_path.name}: {error}")
             continue
@@ -401,6 +433,23 @@ def run_report_collections_by_amount():
     prompt_continue()
 
 
+def run_voucher_search():
+    print("\n" + "-" * 50)
+    print("Report: Search Voucher")
+    print("-" * 50)
+    bill_no = input("Enter bill number: ").strip()
+    if not bill_no:
+        prompt_continue()
+        return
+    result = search_voucher(bill_no)
+    if result is None:
+        print(f"\nVoucher '{bill_no}' not found.")
+    else:
+        voucher, installments, is_completed = result
+        display_voucher_detail(voucher, installments, is_completed)
+    prompt_continue()
+
+
 def run_reports():
     """Reports sub-menu loop."""
     from coll_ui import get_reports_submenu_choice
@@ -416,3 +465,5 @@ def run_reports():
             run_report_collections_by_age()
         elif choice == 4:
             run_report_collections_by_amount()
+        elif choice == 5:
+            run_voucher_search()

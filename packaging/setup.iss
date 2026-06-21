@@ -40,10 +40,12 @@ Source: "..\scripts\coll_data.py";       DestDir: "{app}\scripts"; Flags: ignore
 Source: "..\scripts\coll_store.py";      DestDir: "{app}\scripts"; Flags: ignoreversion
 
 ; Test data (pre-seeded CSVs)
-Source: "..\data\users.csv";        DestDir: "{app}\data"; Flags: ignoreversion
-Source: "..\data\beats.csv";        DestDir: "{app}\data"; Flags: ignoreversion
-Source: "..\data\vouchers.csv";     DestDir: "{app}\data"; Flags: ignoreversion
-Source: "..\data\installments.csv"; DestDir: "{app}\data"; Flags: ignoreversion
+Source: "..\data\users.csv";                    DestDir: "{app}\data"; Flags: ignoreversion
+Source: "..\data\beats.csv";                    DestDir: "{app}\data"; Flags: ignoreversion
+Source: "..\data\vouchers.csv";                 DestDir: "{app}\data"; Flags: ignoreversion
+Source: "..\data\installments.csv";             DestDir: "{app}\data"; Flags: ignoreversion
+Source: "..\data\completed_vouchers.csv";       DestDir: "{app}\data"; Flags: ignoreversion
+Source: "..\data\completed_installments.csv";   DestDir: "{app}\data"; Flags: ignoreversion
 
 ; Launcher and guide
 Source: "..\run.bat";        DestDir: "{app}"; Flags: ignoreversion

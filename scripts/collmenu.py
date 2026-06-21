@@ -12,6 +12,7 @@ COLLECTION MANAGEMENT MENU
     4.2 - Beat - pending collections
     4.3 - Collections - Pending by age
     4.4 - Collections - Pending by amount
+    4.5 - Search voucher
 5. Exit
 ==================================================
 """
