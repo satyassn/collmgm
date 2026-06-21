@@ -7,14 +7,15 @@ No direct file I/O (delegates to coll_store).
 No direct CSV reads (delegates to coll_data).
 """
 
+import os
 import sys
 from datetime import datetime
 from decimal import Decimal
 
 from coll_store import (
-    STAGING_DIR, ARCHIVE_DIR,
-    ensure_staging_dir, save_report_json,
-    write_collection_text, sanitize_filename_component,
+    STAGING_DIR, ARCHIVE_DIR, PRINTS_DIR,
+    ensure_staging_dir, ensure_prints_dir, save_report_json,
+    write_collection_text, write_print_collection_txt, sanitize_filename_component,
     _installments_path, _save_installments, _load_installments,
     _append_installments_csv, _update_vouchers_balance, _archive_completed,
 )
@@ -46,6 +47,7 @@ def _report_label(report_data, fallback_name):
 
 
 def run_coll_start():
+    os.system("cls" if os.name == "nt" else "clear")
     print("\n" + "-" * 50)
     print("Executing: coll-start - Generate collection list")
     print("-" * 50)
@@ -99,8 +101,12 @@ def run_coll_start():
             return
         else:
             while True:
-                choice = input("Use existing (u) or discard and create new (n)? ").strip().lower()
-                if choice == "u":
+                choice = input("Use existing (u) / discard and create new (n) / skip [s]: ").strip().lower()
+                if choice in ("s", ""):
+                    print("Skipped.")
+                    prompt_continue()
+                    return
+                elif choice == "u":
                     txt_path = existing_path.with_suffix(".txt")
                     print("\nExisting report:\n")
                     if txt_path.exists():
@@ -136,7 +142,7 @@ def run_coll_start():
                     print("Existing report discarded. Generating new list...")
                     break
                 else:
-                    print("Please enter 'u' or 'n'.")
+                    print("Please enter 'u', 'n', or 's'.")
 
     ensure_staging_dir()
     timestamp = datetime.now().strftime("%Y%m%d")
@@ -189,6 +195,7 @@ def run_coll_start():
 
 
 def run_coll_submit():
+    os.system("cls" if os.name == "nt" else "clear")
     print("\n" + "-" * 50)
     print("Executing: coll-submit - Enter and submit collections")
     print("-" * 50)
@@ -202,7 +209,32 @@ def run_coll_submit():
     confirmed_map = {p: d for p, d in confirmed_reports}
     report_paths = list(confirmed_map.keys())
     labels = [_report_label(confirmed_map[p], p.name) for p in report_paths]
-    selected_paths = prompt_report_selection(report_paths, labels)
+
+    while True:
+        selected_paths = prompt_report_selection(report_paths, labels, show_print=True)
+        if selected_paths is None:
+            return
+        if selected_paths != "PRINT":
+            break
+
+        # Print branch: multi-select up to 3 reports and generate print TXT
+        chosen_labels = select_from_list(labels, "reports to print (up to 3)", allow_multiple=True)
+        if len(chosen_labels) > 3:
+            print("  Note: only the first 3 will be printed.")
+            chosen_labels = chosen_labels[:3]
+        chosen_reports = [confirmed_map[report_paths[labels.index(lbl)]] for lbl in chosen_labels]
+        try:
+            ensure_prints_dir()
+            out_path = PRINTS_DIR / f"print_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            write_print_collection_txt(out_path, chosen_reports)
+            print(f"\nPrint file saved: {out_path}")
+            try:
+                os.startfile(str(out_path))
+            except Exception:
+                pass
+        except Exception as err:
+            print(f"Failed to generate print file: {err}")
+        # loop back to report selection
 
     for report_path in selected_paths:
         report_data = confirmed_map[report_path]
@@ -305,6 +337,7 @@ def run_coll_submit():
 
 
 def run_coll_finalize():
+    os.system("cls" if os.name == "nt" else "clear")
     print("\n" + "-" * 50)
     print("Executing: coll-finalize - Finalize collections")
     print("-" * 50)
@@ -319,6 +352,8 @@ def run_coll_finalize():
     report_paths = list(report_map.keys())
     labels = [_report_label(report_map[p], p.name) for p in report_paths]
     selected_paths = prompt_report_selection(report_paths, labels)
+    if selected_paths is None:
+        return
 
     for report_path in selected_paths:
         report_data = report_map[report_path]

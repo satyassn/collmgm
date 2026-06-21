@@ -15,10 +15,20 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
 STAGING_DIR = ROOT_DIR / "staging"
 ARCHIVE_DIR = ROOT_DIR / "archive"
+PRINTS_DIR = ROOT_DIR / "prints"
+
+_PRINT_COL_WIDTH = 28
+_PRINT_COL_SEP = " | "
+_PRINT_PAGE_HEIGHT = 66
+_PRINT_FILE_HEADER_LINES = 3
 
 
 def ensure_staging_dir():
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def ensure_prints_dir():
+    PRINTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def save_collection_json(path, vouchers):
@@ -263,3 +273,81 @@ def _archive_completed(bill_nos):
                 if write_header:
                     writer.writeheader()
                 writer.writerows(completed_inst)
+
+
+def _build_print_column(report_data, bal_width, coll_width):
+    """Render one report as a list of _PRINT_COL_WIDTH-char padded strings."""
+    W = _PRINT_COL_WIDTH
+    sel_type = report_data.get("selection_type", "beat")
+    sel = report_data.get("selection", [])
+
+    if sel_type == "beat_salesman" and len(sel) >= 2:
+        sal_width = max(1, W - len(sel[0]) - 2)
+        heading = f"{sel[0]}  {sel[1]:>{sal_width}}"
+    elif sel_type == "beat":
+        heading = ",".join(sel)
+    else:
+        heading = ",".join(sel)
+
+    dash = "-" * W
+    col_hdr = f"{'Bill No':<7}  {'Balance':>{bal_width}}  {'Coll':>{coll_width}}"
+
+    vouchers = report_data.get("vouchers", [])
+    total_vouchers = len(vouchers)
+    total_coll = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
+    summary = f"Vouch:{total_vouchers}  Coll:{total_coll}"
+
+    lines = [
+        heading[:W].ljust(W),
+        dash,
+        col_hdr[:W].ljust(W),
+        dash,
+    ]
+    for v in vouchers:
+        bill = v["bill_no"][-7:]
+        bal = v.get("balance", "")
+        pay = v.get("payment", "") or ""
+        row = f"{bill:<7}  {bal:>{bal_width}}  {pay:>{coll_width}}"
+        lines.append(row[:W].ljust(W))
+    lines.append(dash)
+    lines.append(summary[:W].ljust(W))
+    return lines
+
+
+def write_print_collection_txt(output_path, reports_data):
+    """Write up to 3 reports side by side in A4-optimized columns to a print TXT file."""
+    if not reports_data:
+        return
+
+    all_vouchers = [v for r in reports_data for v in r.get("vouchers", [])]
+    bal_width = max(
+        len("Balance"),
+        max((len(v.get("balance", "")) for v in all_vouchers), default=0),
+    )
+    coll_width = max(4, _PRINT_COL_WIDTH - 7 - 2 - bal_width - 2)
+
+    columns = [_build_print_column(r, bal_width, coll_width) for r in reports_data]
+    num_cols = len(columns)
+    max_rows = max(len(c) for c in columns)
+
+    for col in columns:
+        while len(col) < max_rows:
+            col.append(" " * _PRINT_COL_WIDTH)
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    full_width = _PRINT_COL_WIDTH * num_cols + len(_PRINT_COL_SEP) * (num_cols - 1)
+    eq_sep = "=" * full_width
+    title_line = f"{'COLLECTION REPORT':<{full_width - 10}}{date_str:>10}"
+
+    output_lines = [eq_sep, title_line, eq_sep]
+    remaining = _PRINT_PAGE_HEIGHT - _PRINT_FILE_HEADER_LINES
+
+    for row_idx in range(max_rows):
+        if remaining <= 0:
+            output_lines.append("\f")
+            remaining = _PRINT_PAGE_HEIGHT
+        output_lines.append(_PRINT_COL_SEP.join(col[row_idx] for col in columns))
+        remaining -= 1
+
+    with output_path.open("w", encoding="utf-8") as f:
+        f.write("\n".join(output_lines) + "\n")

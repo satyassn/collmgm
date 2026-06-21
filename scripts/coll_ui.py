@@ -11,6 +11,7 @@ from decimal import Decimal
 
 
 def display_menu():
+    os.system("cls" if os.name == "nt" else "clear")
     print("\n" + "=" * 50)
     print("COLLECTION MANAGEMENT MENU")
     print("=" * 50)
@@ -40,6 +41,7 @@ def get_menu_choice():
 
 
 def get_reports_submenu_choice():
+    os.system("cls" if os.name == "nt" else "clear")
     print("\n" + "-" * 50)
     print("REPORTS")
     print("-" * 50)
@@ -152,20 +154,31 @@ def prompt_continue():
     input("\nPress Enter to continue to the main menu...")
 
 
-def prompt_report_selection(reports, labels=None):
-    """Prompt user to select one report for editing."""
+def prompt_report_selection(reports, labels=None, show_print=False):
+    """Prompt user to select one report for editing.
+
+    Returns None if user goes back, "PRINT" if user chose the print option,
+    or [selected_path] for a normal selection.
+    """
     print("\nSelect staged report to edit:")
     for index, report in enumerate(reports, start=1):
         label = labels[index - 1] if labels else report.name
         print(f"  {index}. {label}")
+    if show_print:
+        print("  P. Print reports")
+    print("  0. Back to main menu")
 
     while True:
-        choice = input(f"Enter report number (1-{len(reports)}): ").strip()
+        choice = input(f"Enter report number (0-{len(reports)}): ").strip()
+        if show_print and choice.lower() == "p":
+            return "PRINT"
         try:
             selected = int(choice)
+            if selected == 0:
+                return None
             if 1 <= selected <= len(reports):
                 return [reports[selected - 1]]
-            print(f"Invalid selection: {selected}. Choose a number between 1 and {len(reports)}.")
+            print(f"Invalid selection: {selected}. Choose a number between 0 and {len(reports)}.")
         except ValueError:
             print(f"Invalid input: '{choice}'. Please enter a number.")
 
