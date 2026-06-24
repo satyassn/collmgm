@@ -55,11 +55,12 @@ Source: "BETA_GUIDE.txt";    DestDir: "{app}"; Flags: ignoreversion isreadme
 ; Create staging and archive dirs so the app can write to them immediately
 Name: "{app}\staging"
 Name: "{app}\archive"
+Name: "{app}\prints"
 
 [Icons]
-Name: "{group}\CollMgm";              Filename: "{sys}\cmd.exe"; Parameters: "/k ""{app}\run.bat"""; WorkingDir: "{app}"; IconFilename: "{sys}\cmd.exe"
+Name: "{group}\CollMgm";              Filename: "{sys}\cmd.exe"; Parameters: "/k ""{app}\run.bat"" --run"; WorkingDir: "{app}"; IconFilename: "{sys}\cmd.exe"
 Name: "{group}\Uninstall CollMgm";    Filename: "{uninstallexe}"
-Name: "{commondesktop}\CollMgm";      Filename: "{sys}\cmd.exe"; Parameters: "/k ""{app}\run.bat"""; WorkingDir: "{app}"; IconFilename: "{sys}\cmd.exe"; Tasks: desktopicon
+Name: "{commondesktop}\CollMgm";      Filename: "{sys}\cmd.exe"; Parameters: "/k ""{app}\run.bat"" --run"; WorkingDir: "{app}"; IconFilename: "{sys}\cmd.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{sys}\cmd.exe"; Parameters: "/k ""{app}\run.bat"""; Description: "Launch CollMgm now"; Flags: nowait postinstall skipifsilent
+Filename: "{sys}\cmd.exe"; Parameters: "/k ""{app}\run.bat"" --run"; Description: "Launch CollMgm now"; Flags: nowait postinstall skipifsilent
