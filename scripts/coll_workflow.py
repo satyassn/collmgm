@@ -47,75 +47,85 @@ def _report_label(report_data, fallback_name):
 
 
 def run_coll_start():
-    os.system("cls" if os.name == "nt" else "clear")
-    print("\n" + "-" * 50)
-    print("Executing: coll-start - Generate collection list")
-    print("-" * 50)
-
     try:
         beats = load_beats()
         summary = load_beats_pending_summary()
-        beat = select_beat_with_summary(beats, summary)
     except Exception as error:
         print(f"Error: {error}")
         prompt_continue()
         return
 
-    # Load pending vouchers for the selected beat to discover salesmen
-    try:
-        beat_vouchers = _load_vouchers_by_criterion("beat", [beat])
-    except Exception as error:
-        print(f"Error loading vouchers: {error}")
-        prompt_continue()
-        return
+    while True:
+        os.system("cls" if os.name == "nt" else "clear")
+        print("\n" + "-" * 50)
+        print("coll-start - Generate collection list")
+        print("-" * 50)
 
-    if not beat_vouchers:
-        print("\nNO Records Found\n")
-        prompt_continue()
-        return
+        beat = select_beat_with_summary(beats, summary)
+        if beat is None:
+            return  # 'b' at beat selection → exit to main menu
 
-    # Nested salesman selection — prompt only when beat has multiple salesmen
-    salesmen_in_beat = sorted({v["salesman"] for v in beat_vouchers})
-    if len(salesmen_in_beat) > 1:
-        chosen_salesman = select_from_list(salesmen_in_beat, "salesman")
-    else:
-        chosen_salesman = salesmen_in_beat[0]
-
-    selection_type = "beat_salesman"
-    selection_values = [beat, chosen_salesman]
-
-    # Filter in-memory to chosen salesman (no second CSV read)
-    vouchers = [v for v in beat_vouchers if v["salesman"] == chosen_salesman]
-
-    existing = _find_any_active_beat_report(selection_type, selection_values)
-    if existing:
-        existing_path, existing_data = existing
-        stages = existing_data.get("stages", {})
-        submit_confirmed = stages.get("submit") == "confirmed"
-
-        print(f"\nAn active collection already exists for Beat: {beat} | Salesman: {chosen_salesman}")
-
-        if submit_confirmed:
-            print("This report is in the finalize pipeline. Complete finalization before starting a new collection.")
+        try:
+            beat_vouchers = _load_vouchers_by_criterion("beat", [beat])
+        except Exception as error:
+            print(f"Error loading vouchers: {error}")
             prompt_continue()
             return
+
+        if not beat_vouchers:
+            print("\nNO Records Found\n")
+            prompt_continue()
+            return
+
+        # Nested salesman selection — prompt only when beat has multiple salesmen
+        salesmen_in_beat = sorted({v["salesman"] for v in beat_vouchers})
+        if len(salesmen_in_beat) > 1:
+            chosen_salesman = select_from_list(salesmen_in_beat, "salesman")
+            if chosen_salesman is None:
+                continue  # 'b' at salesman → back to beat selection
         else:
+            chosen_salesman = salesmen_in_beat[0]
+
+        selection_type = "beat_salesman"
+        selection_values = [beat, chosen_salesman]
+
+        # Filter in-memory to chosen salesman (no second CSV read)
+        vouchers = [v for v in beat_vouchers if v["salesman"] == chosen_salesman]
+
+        existing = _find_any_active_beat_report(selection_type, selection_values)
+        if existing:
+            existing_path, existing_data = existing
+            stages = existing_data.get("stages", {})
+            submit_confirmed = stages.get("submit") == "confirmed"
+
+            print(f"\nAn active collection already exists for Beat: {beat} | Salesman: {chosen_salesman}")
+
+            if submit_confirmed:
+                print("This report is in the finalize pipeline. Complete finalization before starting a new collection.")
+                prompt_continue()
+                return
+
+            go_back = False
             while True:
-                choice = input("Use existing (u) / discard and create new (n) / skip [s]: ").strip().lower()
+                choice = input("Use existing (u) / discard and create new (n) / skip (s) / back (b): ").strip().lower()
                 if choice in ("s", ""):
                     print("Skipped.")
                     prompt_continue()
                     return
+                elif choice == "b":
+                    go_back = True
+                    break
                 elif choice == "u":
                     txt_path = existing_path.with_suffix(".txt")
-                    print("\nExisting report:\n")
+                    os.system("cls" if os.name == "nt" else "clear")
                     if txt_path.exists():
                         print(txt_path.read_text(encoding="utf-8"))
                     else:
                         print(f"  (Text report not found)  Vouchers: {len(existing_data['vouchers'])}")
                     ex_vouchers = existing_data["vouchers"]
+                    inner_back = False
                     while True:
-                        confirm = input("Verify and confirm this report? (y/n): ").strip().lower()
+                        confirm = input("Verify and confirm this report? (y/n/b): ").strip().lower()
                         if confirm in ("y", "yes"):
                             existing_data["status"] = "confirmed"
                             existing_data.setdefault("stages", {})["start"] = "confirmed"
@@ -130,8 +140,14 @@ def run_coll_start():
                                 txt_path.unlink()
                             print("Report discarded.")
                             break
+                        elif confirm == "b":
+                            inner_back = True
+                            break
                         else:
-                            print("Please enter 'y' or 'n'.")
+                            print("Please enter 'y', 'n', or 'b'.")
+                    if inner_back:
+                        go_back = True
+                        break
                     prompt_continue()
                     return
                 elif choice == "n":
@@ -142,66 +158,81 @@ def run_coll_start():
                     print("Existing report discarded. Generating new list...")
                     break
                 else:
-                    print("Please enter 'u', 'n', or 's'.")
+                    print("Please enter 'u', 'n', 's', or 'b'.")
 
-    ensure_staging_dir()
-    timestamp = datetime.now().strftime("%Y%m%d")
-    safe_selection = "_".join(sanitize_filename_component(v) for v in selection_values)
-    base_name = f"coll{timestamp}-{selection_type}-{safe_selection}"
-    json_path = STAGING_DIR / f"{base_name}.json"
-    txt_path = STAGING_DIR / f"{base_name}.txt"
+            if go_back:
+                continue  # back to beat selection
 
-    start_data = {
-        "stage": "start",
-        "status": "new",
-        "stages": {},
-        "selection_type": selection_type,
-        "selection": selection_values,
-        "vouchers": vouchers,
-    }
+        ensure_staging_dir()
+        timestamp = datetime.now().strftime("%Y%m%d")
+        safe_selection = "_".join(sanitize_filename_component(v) for v in selection_values)
+        base_name = f"coll{timestamp}-{selection_type}-{safe_selection}"
+        json_path = STAGING_DIR / f"{base_name}.json"
+        txt_path = STAGING_DIR / f"{base_name}.txt"
 
-    try:
-        save_report_json(json_path, start_data)
-        write_collection_text(txt_path, [beat], [chosen_salesman], vouchers,
-                              stage="start", status="new")
-    except Exception as error:
-        print(f"Failed to create report files: {error}")
-        prompt_continue()
-        return
+        start_data = {
+            "stage": "start",
+            "status": "new",
+            "stages": {},
+            "selection_type": selection_type,
+            "selection": selection_values,
+            "vouchers": vouchers,
+        }
 
-    print("\nGenerated report:\n")
-    print(txt_path.read_text(encoding="utf-8"))
-
-    while True:
-        confirm = input("Verify and confirm this report? (y/n): ").strip().lower()
-        if confirm in ("y", "yes"):
-            start_data["status"] = "confirmed"
-            start_data.setdefault("stages", {})["start"] = "confirmed"
+        try:
             save_report_json(json_path, start_data)
             write_collection_text(txt_path, [beat], [chosen_salesman], vouchers,
-                                  stage="start", status="confirmed")
-            print("Report confirmed.")
-            break
-        elif confirm in ("n", "no"):
-            json_path.unlink()
-            if txt_path.exists():
-                txt_path.unlink()
-            print("Report discarded.")
-            break
-        else:
-            print("Please enter 'y' or 'n'.")
+                                  stage="start", status="new")
+        except Exception as error:
+            print(f"Failed to create report files: {error}")
+            prompt_continue()
+            return
+
+        os.system("cls" if os.name == "nt" else "clear")
+        print(txt_path.read_text(encoding="utf-8"))
+
+        go_back = False
+        while True:
+            confirm = input("Verify and confirm this report? (y/n/b): ").strip().lower()
+            if confirm in ("y", "yes"):
+                start_data["status"] = "confirmed"
+                start_data.setdefault("stages", {})["start"] = "confirmed"
+                save_report_json(json_path, start_data)
+                write_collection_text(txt_path, [beat], [chosen_salesman], vouchers,
+                                      stage="start", status="confirmed")
+                print("Report confirmed.")
+                break
+            elif confirm in ("n", "no"):
+                json_path.unlink()
+                if txt_path.exists():
+                    txt_path.unlink()
+                print("Report discarded.")
+                break
+            elif confirm == "b":
+                json_path.unlink()
+                if txt_path.exists():
+                    txt_path.unlink()
+                go_back = True
+                break
+            else:
+                print("Please enter 'y', 'n', or 'b'.")
+
+        if go_back:
+            os.system("cls" if os.name == "nt" else "clear")
+            continue  # back to beat selection
+
+        break  # confirmed or discarded — exit outer loop
 
     prompt_continue()
 
 
 def run_coll_submit():
-    os.system("cls" if os.name == "nt" else "clear")
-    print("\n" + "-" * 50)
-    print("Executing: coll-submit - Enter and submit collections")
-    print("-" * 50)
-
     confirmed_reports = _load_confirmed_start_reports()
     if not confirmed_reports:
+        os.system("cls" if os.name == "nt" else "clear")
+        print("\n" + "-" * 50)
+        print("coll-submit - Enter and submit collections")
+        print("-" * 50)
         print("\nNo confirmed start reports found in staging/.")
         prompt_continue()
         return
@@ -211,6 +242,11 @@ def run_coll_submit():
     labels = [_report_label(confirmed_map[p], p.name) for p in report_paths]
 
     while True:
+        os.system("cls" if os.name == "nt" else "clear")
+        print("\n" + "-" * 50)
+        print("coll-submit - Enter and submit collections")
+        print("-" * 50)
+
         selected_paths = prompt_report_selection(report_paths, labels, show_print=True)
         if selected_paths is None:
             return
@@ -219,6 +255,8 @@ def run_coll_submit():
 
         # Print branch: multi-select up to 3 reports and generate print TXT
         chosen_labels = select_from_list(labels, "reports to print (up to 3)", allow_multiple=True)
+        if chosen_labels is None:
+            continue
         if len(chosen_labels) > 3:
             print("  Note: only the first 3 will be printed.")
             chosen_labels = chosen_labels[:3]
@@ -295,11 +333,11 @@ def run_coll_submit():
         print(f"  Total collections: {total_collections}")
 
         while True:
-            save_confirm = input("\nSave these collections? (y/n): ").strip().lower()
-            if save_confirm in ("y", "yes", "n", "no"):
+            save_confirm = input("\nSave these collections? (y/n/b): ").strip().lower()
+            if save_confirm in ("y", "yes", "n", "no", "b"):
                 break
-            print("Please enter 'y' or 'n'.")
-        if save_confirm in ("n", "no"):
+            print("Please enter 'y', 'n', or 'b'.")
+        if save_confirm in ("n", "no", "b"):
             print(f"Collections discarded for {report_path.name}.")
             continue
 
@@ -315,7 +353,7 @@ def run_coll_submit():
             print(f"Failed to save collections for {report_path.name}: {error}")
             continue
 
-        submit_confirm = input("Submit this report? (y/n): ").strip().lower()
+        submit_confirm = input("Submit this report? (y/n/b): ").strip().lower()
         if submit_confirm not in ["y", "yes"]:
             print(f"Collections saved. Submission deferred for {report_path.name}.")
             continue
@@ -339,7 +377,7 @@ def run_coll_submit():
 def run_coll_finalize():
     os.system("cls" if os.name == "nt" else "clear")
     print("\n" + "-" * 50)
-    print("Executing: coll-finalize - Finalize collections")
+    print("coll-finalize - Finalize collections")
     print("-" * 50)
 
     submit_reports = _load_submit_confirmed_reports()
@@ -366,7 +404,7 @@ def run_coll_finalize():
         else:
             print(f"  (Text report not found. Vouchers: {len(vouchers)})")
 
-        confirm = input("Ready to finalize these collections? (y/n): ").strip().lower()
+        confirm = input("Ready to finalize these collections? (y/n/b): ").strip().lower()
         if confirm not in ["y", "yes"]:
             print(f"Finalization skipped for {report_path.name}.")
             continue
@@ -413,6 +451,8 @@ def run_report_salesman_pending():
         prompt_continue()
         return
     salesman = select_from_list(salesmen, "salesman")
+    if salesman is None:
+        return
     grouped = query_pending_by_salesman(salesman)
     if not grouped:
         print(f"\nNo pending vouchers found for salesman: {salesman}")
@@ -433,6 +473,8 @@ def run_report_beat_pending():
         prompt_continue()
         return
     beat = select_from_list(beats, "beat")
+    if beat is None:
+        return
     grouped = query_pending_by_beat(beat)
     if not grouped:
         print(f"\nNo pending vouchers found for beat: {beat}")

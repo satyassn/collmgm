@@ -55,6 +55,8 @@ def get_reports_submenu_choice():
     while True:
         try:
             choice = input("Enter your choice (0-5): ").strip()
+            if choice.lower() == "b":
+                return 0
             choice_num = int(choice)
             if choice_num in [0, 1, 2, 3, 4, 5]:
                 return choice_num
@@ -68,15 +70,18 @@ def select_from_list(items, label, allow_multiple=False):
     print(f"\nSelect {label}:")
     for index, item in enumerate(items, start=1):
         print(f"  {index}. {item}")
+    print("  b. Back")
 
     prompt = (
         f"Enter the number of the {label} (1-{len(items)})"
         + (" or comma-separated list/ranges (e.g. 1,3-5)" if allow_multiple else "")
-        + ": "
+        + ", or 'b' to go back: "
     )
 
     while True:
         choice = input(prompt).strip()
+        if choice.lower() == "b":
+            return None
         if allow_multiple and choice.lower() == "all":
             return list(items)
 
@@ -137,17 +142,32 @@ def select_beat_with_summary(beats, summary):
             print(f"  {idx:2}. {beat:<{beat_width}}  {info['total']:>4} pending  [{breakdown}]")
         else:
             print(f"  {idx:2}. {beat:<{beat_width}}     no pending")
+    print("   b. Back")
     print()
     while True:
-        choice = input(f"Enter the number of the beat (1-{len(beats)}): ").strip()
+        choice = input(f"Enter the number of the beat (1-{len(beats)}) or 'b': ").strip()
+        if choice.lower() == "b":
+            return None
         try:
             n = int(choice)
         except ValueError:
-            print(f"Invalid input. Enter a number between 1 and {len(beats)}.")
+            print(f"Invalid input. Enter a number between 1 and {len(beats)} or 'b'.")
             continue
         if 1 <= n <= len(beats):
             return beats[n - 1]
-        print(f"Invalid selection. Enter a number between 1 and {len(beats)}.")
+        print(f"Invalid selection. Enter a number between 1 and {len(beats)} or 'b'.")
+
+
+def paginate_text(text, page_size=20):
+    lines = text.splitlines()
+    total_pages = (len(lines) + page_size - 1) // page_size
+    for page_num, start in enumerate(range(0, len(lines), page_size), start=1):
+        for line in lines[start:start + page_size]:
+            print(line)
+        if page_num < total_pages:
+            choice = input(f"--- page {page_num}/{total_pages} --- Enter to continue, 'b' to skip --- ").strip().lower()
+            if choice == "b":
+                return
 
 
 def prompt_continue():
@@ -166,10 +186,11 @@ def prompt_report_selection(reports, labels=None, show_print=False):
         print(f"  {index}. {label}")
     if show_print:
         print("  P. Print reports")
-    print("  0. Back to main menu")
 
     while True:
-        choice = input(f"Enter report number (0-{len(reports)}): ").strip()
+        choice = input(f"Enter report number (1-{len(reports)}, b to go back): ").strip()
+        if choice.lower() == "b":
+            return None
         if show_print and choice.lower() == "p":
             return "PRINT"
         try:
@@ -242,7 +263,7 @@ def get_payment_input(voucher, current_idx, total_records, total_payments_so_far
     print(f"Bill: {voucher['bill_no']} | Balance: {balance}")
     print(f"Current payment: {current_payment or '(none)'} | Running total: {total_payments_so_far}")
     print("Controls: Enter amount, or press:")
-    print("  [n] = next record  [p] = previous record  [s] = skip  [q] = quit")
+    print("  [n] = next record  [p] = previous record  [s] = skip  [q] = quit  [b] = back")
 
     default = current_payment if current_payment else str(balance.to_integral() if balance == balance.to_integral() else balance.quantize(Decimal('0.01')))
     prompt = f"Payment amount (or command) [{default}]: "
@@ -256,7 +277,7 @@ def get_payment_input(voucher, current_idx, total_records, total_payments_so_far
             return current_payment, "prev"
         elif value == "s":
             return current_payment, "skip"
-        elif value == "q":
+        elif value in ("q", "b"):
             return current_payment, "quit"
         elif value == "":
             return default, "next"
@@ -521,10 +542,10 @@ def interactive_payment_editor(vouchers, beats, salesmen, start_idx=0):
         elif action == "skip":
             current_idx += 1
         elif action == "quit":
-            confirm = input("\nDo you want to save changes? (y/n): ").strip().lower()
+            confirm = input("\nDo you want to save changes? (y/n/b): ").strip().lower()
             if confirm == "y":
                 return vouchers, False, current_idx
-            elif confirm == "n":
+            elif confirm in ("n", "b"):
                 return None, False, None
 
     # Redisplay with all payments filled in; current_idx == len(vouchers) so no >>> marker

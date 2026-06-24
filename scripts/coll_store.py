@@ -78,10 +78,6 @@ def write_collection_text(path, beats, salesmen, vouchers, stage=None, status=No
     separator = "-" * len(header)
 
     lines = ["COLLECTION REPORT"]
-    if stage is not None:
-        lines.append(f"Stage : {stage}")
-    if status is not None:
-        lines.append(f"Status: {status}")
     lines += [
         f"Beats: {', '.join(beats)}",
         f"Salesmen: {', '.join(salesmen)}",
