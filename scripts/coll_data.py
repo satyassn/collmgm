@@ -10,25 +10,34 @@ import json
 from datetime import datetime
 from decimal import Decimal
 
-from coll_store import DATA_DIR, STAGING_DIR, load_vouchers_raw
+from coll_store import (
+    DATA_DIR, STAGING_DIR, load_vouchers_raw,
+    _load_pending_start_reports, _load_pending_submit_reports,
+)
 
 NUMOF_TOP_AGED_VOUCHERS = 10
 NUMOF_TOP_AMOUNT_VOUCHERS = 10
 
 
 def load_beats(current_user=None):
-    """Return list of beat names from beats.csv."""
-    beats = []
+    """Return list of beat names from beats.csv.
+
+    For salesman role, returns only beats assigned to that salesman in beats.csv.
+    """
     beats_file = DATA_DIR / "beats.csv"
     if not beats_file.exists():
         raise FileNotFoundError(f"Missing beats file: {beats_file}")
 
+    beats = []
     with beats_file.open(newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
+        for row in csv.DictReader(f):
             name = row.get("name", "").strip()
-            if name:
-                beats.append(name)
+            if not name:
+                continue
+            if current_user and current_user.role == 'salesman':
+                if row.get("salesman", "").strip() != current_user.name:
+                    continue
+            beats.append(name)
 
     if not beats:
         raise ValueError("No beats found in data/beats.csv.")
@@ -36,15 +45,20 @@ def load_beats(current_user=None):
 
 
 def load_salesmen(current_user=None):
-    """Return list of salesman names from users.csv."""
+    """Return list of salesman names from users.csv.
+
+    For salesman role, returns only the current user's own name.
+    """
+    if current_user and current_user.role == 'salesman':
+        return [current_user.name]
+
     salesmen = []
     users_file = DATA_DIR / "users.csv"
     if not users_file.exists():
         raise FileNotFoundError(f"Missing users file: {users_file}")
 
     with users_file.open(newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
+        for row in csv.DictReader(f):
             role = row.get("role", "").strip().lower()
             name = row.get("name", "").strip()
             if role == "salesman" and name:
@@ -56,7 +70,7 @@ def load_salesmen(current_user=None):
 
 
 def load_beats_pending_summary(current_user=None):
-    """Return dict[beat -> {"total": int, "by_salesman": dict[salesman -> int]}] for pending vouchers."""
+    """Return dict[beat -> {"total": int, "balance_sum": Decimal, "by_salesman": dict}] for pending vouchers."""
     rows = load_vouchers_raw()
     summary = {}
     for row in rows:
@@ -71,8 +85,9 @@ def load_beats_pending_summary(current_user=None):
             continue
         salesman = row.get("salesman", "").strip()
         if beat not in summary:
-            summary[beat] = {"total": 0, "by_salesman": {}}
+            summary[beat] = {"total": 0, "balance_sum": Decimal("0"), "by_salesman": {}}
         summary[beat]["total"] += 1
+        summary[beat]["balance_sum"] += bal
         summary[beat]["by_salesman"][salesman] = summary[beat]["by_salesman"].get(salesman, 0) + 1
     return summary
 

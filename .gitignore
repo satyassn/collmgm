@@ -16,6 +16,9 @@ env/
 # data/
 staging/
 archive/
+packaging/python/
+#packaging/
+prints/
 
 # Distribution / packaging
 build/

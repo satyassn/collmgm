@@ -5,11 +5,17 @@ Owns all path constants, CSV reads/writes, and JSON reads/writes.
 No print() or input() calls. No imports from other coll_* modules.
 """
 
+import binascii
 import csv
+import hashlib
 import json
+import os
+from collections import namedtuple
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
+
+User = namedtuple('User', ['name', 'role'])
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
@@ -29,6 +35,79 @@ def ensure_staging_dir():
 
 def ensure_prints_dir():
     PRINTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def hash_password(password: str) -> str:
+    """Return 'salt_hex:hash_hex' for PBKDF2-SHA256 password storage."""
+    salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
+    return binascii.hexlify(salt).decode() + ':' + binascii.hexlify(dk).decode()
+
+
+def _verify_password(stored_hash: str, password: str) -> bool:
+    try:
+        salt_hex, hash_hex = stored_hash.split(':')
+        salt = binascii.unhexlify(salt_hex)
+        dk = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
+        return binascii.hexlify(dk).decode() == hash_hex
+    except Exception:
+        return False
+
+
+def verify_user(name: str, password: str):
+    """Return User if credentials match a salesman/supervisor/distributor row, else None."""
+    users_file = DATA_DIR / 'users.csv'
+    if not users_file.exists():
+        return None
+    with users_file.open(newline='', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            if row.get('name', '').strip() != name:
+                continue
+            role = row.get('role', '').strip()
+            stored = row.get('password_hash', '').strip()
+            if role in ('salesman', 'supervisor', 'distributor') and _verify_password(stored, password):
+                return User(name=name, role=role)
+    return None
+
+
+def _load_pending_start_reports():
+    """Reports generated but not yet supervisor-confirmed (stage=start, stages.start not set)."""
+    if not STAGING_DIR.exists():
+        return []
+    result = []
+    for path in sorted(STAGING_DIR.glob('coll*.json')):
+        try:
+            with path.open(encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get('stage') != 'start':
+            continue
+        if data.get('stages', {}).get('start') == 'confirmed':
+            continue
+        result.append((path, data))
+    return result
+
+
+def _load_pending_submit_reports():
+    """Reports submitted by salesman but not yet supervisor-confirmed (stages.submit == 'submitted')."""
+    if not STAGING_DIR.exists():
+        return []
+    result = []
+    for path in sorted(STAGING_DIR.glob('coll*.json')):
+        try:
+            with path.open(encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get('stages', {}).get('submit') != 'submitted':
+            continue
+        result.append((path, data))
+    return result
 
 
 def save_collection_json(path, vouchers):
@@ -290,8 +369,8 @@ def _build_print_column(report_data, bal_width, coll_width):
 
     vouchers = report_data.get("vouchers", [])
     total_vouchers = len(vouchers)
-    total_coll = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
-    summary = f"Vouch:{total_vouchers}  Coll:{total_coll}"
+    total_bal = sum(Decimal(v.get("balance", "0") or "0") for v in vouchers)
+    summary = f"#:{total_vouchers}  Bal:{total_bal}"
 
     lines = [
         heading[:W].ljust(W),

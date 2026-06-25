@@ -1,46 +1,69 @@
 #!/usr/bin/env python3
 """
 Collection Menu - Main entry point for collection management.
-==================================================
-COLLECTION MANAGEMENT MENU
-==================================================
-1. coll-start  - Generate list of vouchers to start collection
-2. coll-submit - Submit today's collections
-3. coll-finalize - Review and finalize collections
-4. Reports
-    4.1 - Salesman - pending collections
-    4.2 - Beat - pending collections
-    4.3 - Collections - Pending by age
-    4.4 - Collections - Pending by amount
-    4.5 - Search voucher
-5. Exit
-==================================================
+
+Authenticates the user at startup, then displays a role-filtered menu:
+
+  Salesman:
+    1. Generate collection report
+    2. Submit collections
+    3. Reports
+    4. Exit
+
+  Supervisor:
+    1. Generate collection report
+    2. Confirm collection start
+    3. Submit collections
+    4. Confirm submitted collections
+    5. Reports
+    6. Exit
+
+  Distributor:
+    1. Generate collection report
+    2. Confirm collection start
+    3. Submit collections
+    4. Confirm submitted collections
+    5. Finalize collection
+    6. Reports
+    7. Exit
 """
 
 import sys
 
-from coll_ui import display_menu, get_menu_choice
+from coll_ui import display_main_menu, get_menu_choice
 from coll_workflow import (
-    run_coll_start, run_coll_submit, run_coll_finalize, run_reports,
+    run_login,
+    run_coll_start, run_coll_confirm_start,
+    run_coll_submit, run_coll_confirm_submit,
+    run_coll_finalize, run_reports,
 )
+
+ALL_ACTIONS = [
+    ("Generate collection report",    ['salesman', 'supervisor', 'distributor'], run_coll_start),
+    ("Confirm collection start",      ['supervisor', 'distributor'],             run_coll_confirm_start),
+    ("Submit collections",            ['salesman', 'supervisor', 'distributor'], run_coll_submit),
+    ("Confirm submitted collections", ['supervisor', 'distributor'],             run_coll_confirm_submit),
+    ("Finalize collection",           ['distributor'],                           run_coll_finalize),
+    ("Reports",                       ['salesman', 'supervisor', 'distributor'], lambda u: run_reports()),
+]
 
 
 def main():
-    while True:
-        display_menu()
-        choice = get_menu_choice()
+    current_user = run_login()
 
-        if choice == 1:
-            run_coll_start()
-        elif choice == 2:
-            run_coll_submit()
-        elif choice == 3:
-            run_coll_finalize()
-        elif choice == 4:
-            run_reports()
-        elif choice == 5:
+    menu = [(label, fn) for label, roles, fn in ALL_ACTIONS if current_user.role in roles]
+    labels = [label for label, _ in menu]
+
+    while True:
+        display_main_menu(labels, current_user)
+        choice = get_menu_choice(len(labels) + 1)
+
+        if choice == len(labels) + 1:
             print("\nExiting Collection Management Menu. Goodbye!\n")
             sys.exit(0)
+
+        _, fn = menu[choice - 1]
+        fn(current_user)
 
 
 if __name__ == "__main__":

@@ -10,32 +10,37 @@ from datetime import datetime
 from decimal import Decimal
 
 
-def display_menu():
+def prompt_login():
+    """Display login prompt and return (username, password)."""
     os.system("cls" if os.name == "nt" else "clear")
     print("\n" + "=" * 50)
-    print("COLLECTION MANAGEMENT MENU")
+    print("COLLECTION MANAGEMENT")
     print("=" * 50)
-    print("1. coll-start  - Generate collection report")
-    print("2. coll-submit - Submit today collections")
-    print("3. coll-finalize  - Review and submit reports")
-    print("4. Reports")
-    print("   4.1 - Salesman - pending collections")
-    print("   4.2 - Beat - pending collections")
-    print("   4.3 - Collections - Pending by age")
-    print("   4.4 - Collections - Pending by amount")
-    print("   4.5 - Search voucher")
-    print("5. Exit")
+    name = input("Username: ").strip()
+    password = input("Password: ").strip()
+    return name, password
+
+
+def display_main_menu(menu_items, current_user):
+    """Display the role-filtered main menu. menu_items is a list of label strings."""
+    os.system("cls" if os.name == "nt" else "clear")
+    print("\n" + "=" * 50)
+    print(f"COLLECTION MANAGEMENT  |  {current_user.name}  [{current_user.role}]")
+    print("=" * 50)
+    for i, label in enumerate(menu_items, start=1):
+        print(f"{i}. {label}")
+    print(f"{len(menu_items) + 1}. Exit")
     print("=" * 50)
 
 
-def get_menu_choice():
+def get_menu_choice(max_choice=5):
     while True:
         try:
-            choice = input("Enter your choice (1-5): ").strip()
+            choice = input(f"Enter your choice (1-{max_choice}): ").strip()
             choice_num = int(choice)
-            if choice_num in [1, 2, 3, 4, 5]:
+            if 1 <= choice_num <= max_choice:
                 return choice_num
-            print(f"Invalid choice: {choice_num}. Please enter 1-5.")
+            print(f"Invalid choice: {choice_num}. Please enter 1-{max_choice}.")
         except ValueError:
             print(f"Invalid input: '{choice}'. Please enter a number.")
 
@@ -131,15 +136,16 @@ def select_from_list(items, label, allow_multiple=False):
         return items[normalized[0] - 1]
 
 
-def select_beat_with_summary(beats, summary):
-    """Display beats with pending voucher counts and salesman breakdown, return selected beat name."""
+def select_beat_with_summary(beats, summary, awaiting_beats=None):
+    """Display beats with voucher count, balance sum, and confirmation status. Return selected beat name."""
     print("\nSelect a beat:\n")
     beat_width = max(len(b) for b in beats)
     for idx, beat in enumerate(beats, start=1):
         info = summary.get(beat)
         if info and info["total"] > 0:
-            breakdown = ", ".join(f"{s}: {c}" for s, c in sorted(info["by_salesman"].items()))
-            print(f"  {idx:2}. {beat:<{beat_width}}  {info['total']:>4} pending  [{breakdown}]")
+            bal = info.get("balance_sum", 0)
+            flag = "  [awaiting confirmation]" if awaiting_beats and beat in awaiting_beats else ""
+            print(f"  {idx:2}. {beat:<{beat_width}}  {info['total']:>4} pending  bal: {bal}{flag}")
         else:
             print(f"  {idx:2}. {beat:<{beat_width}}     no pending")
     print("   b. Back")
@@ -517,6 +523,41 @@ def display_voucher_detail(voucher, installments, is_completed):
     print(sep)
     print(f"  Total paid: {total}")
     print("=" * 60)
+
+
+def display_confirm_stage_reports(reports, labels, stage_label):
+    """Show a numbered list of reports awaiting confirmation. Returns chosen index or None."""
+    print(f"\nSelect report to {stage_label}:")
+    for i, label in enumerate(labels, start=1):
+        print(f"  {i}. {label}")
+    print("  b. Back")
+    while True:
+        choice = input(f"Enter report number (1-{len(labels)}, b to go back): ").strip()
+        if choice.lower() == "b":
+            return None
+        try:
+            n = int(choice)
+            if 1 <= n <= len(labels):
+                return n - 1
+            print(f"Invalid selection. Choose 1-{len(labels)}.")
+        except ValueError:
+            print("Invalid input. Enter a number or 'b'.")
+
+
+def display_report_for_review(report_data, txt_path):
+    """Display a staging report's text file (or a fallback summary) for supervisor review."""
+    if txt_path and txt_path.exists():
+        print(txt_path.read_text(encoding="utf-8"))
+    else:
+        vouchers = report_data.get("vouchers", [])
+        sel = report_data.get("selection", [])
+        print(f"\n  Report: {', '.join(sel)}")
+        print(f"  Vouchers: {len(vouchers)}")
+        total_bal = sum(Decimal(v.get("balance", "0") or "0") for v in vouchers)
+        total_pay = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
+        print(f"  Total balance: {total_bal}")
+        if total_pay:
+            print(f"  Total collected: {total_pay}")
 
 
 def interactive_payment_editor(vouchers, beats, salesmen, start_idx=0):
