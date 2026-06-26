@@ -12,7 +12,7 @@ import json
 import os
 from collections import namedtuple
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 User = namedtuple('User', ['name', 'role'])
@@ -176,7 +176,7 @@ def write_collection_text(path, beats, salesmen, vouchers, stage=None, status=No
 
     lines.append(separator)
     total_vouchers = len(vouchers)
-    total_balance = sum(Decimal(v["balance"]) for v in vouchers)
+    total_balance = sum(Decimal(v.get("balance", "0") or "0") for v in vouchers)
     total_payments = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
     lines.append(f"Total vouchers: {total_vouchers}")
     lines.append(f"Sum of coll: {total_balance}")
@@ -237,15 +237,24 @@ def _append_installments_csv(vouchers):
         if write_header:
             writer.writeheader()
         for v in vouchers:
-            if v.get("payment"):
-                writer.writerow({
-                    "bill_no": v["bill_no"],
-                    "date": collection_date,
-                    "amount": v["payment"],
-                    "salesman": v["salesman"],
-                    "created_by": "app",
-                    "created_at": created_at,
-                })
+            payment = (v.get("payment") or "").strip()
+            if not payment:
+                continue
+            try:
+                amount = Decimal(payment)
+            except (ValueError, InvalidOperation):
+                print(f"Warning: skipping invalid payment for {v.get('bill_no')}: {payment!r}")
+                continue
+            if amount <= 0:
+                continue
+            writer.writerow({
+                "bill_no": v["bill_no"],
+                "date": collection_date,
+                "amount": payment,
+                "salesman": v["salesman"],
+                "created_by": "app",
+                "created_at": created_at,
+            })
 
 
 def _update_vouchers_balance(vouchers):
@@ -268,6 +277,8 @@ def _update_vouchers_balance(vouchers):
     with vouchers_file.open(newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         fieldnames = reader.fieldnames
+        if not fieldnames:
+            raise ValueError(f"Cannot read columns from {vouchers_file} — file may be empty or malformed")
         for row in reader:
             bill_no = row.get("bill_no", "").strip()
             if bill_no in payment_map:
@@ -277,8 +288,8 @@ def _update_vouchers_balance(vouchers):
                     row["balance"] = str(new_balance.quantize(Decimal("0.01")))
                     if new_balance == Decimal("0"):
                         completed_bill_nos.append(bill_no)
-                except Exception:
-                    pass
+                except (ValueError, InvalidOperation):
+                    print(f"Warning: bill_no {row.get('bill_no')} — balance '{row.get('balance')}' is invalid; skipping payment update")
             rows.append(row)
 
     with vouchers_file.open("w", newline="", encoding="utf-8") as f:

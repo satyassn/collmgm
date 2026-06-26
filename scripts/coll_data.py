@@ -8,7 +8,7 @@ Imports only from coll_store. current_user parameter is reserved for future RBAC
 import csv
 import json
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from coll_store import (
     DATA_DIR, STAGING_DIR, load_vouchers_raw,
@@ -79,7 +79,7 @@ def load_beats_pending_summary(current_user=None):
             continue
         try:
             bal = Decimal(row.get("balance", "0").strip())
-        except Exception:
+        except (ValueError, InvalidOperation):
             continue
         if bal <= 0:
             continue
@@ -113,7 +113,7 @@ def _load_vouchers_by_criterion(selection_type, selection_values, current_user=N
         balance_str = row.get("balance", "0").strip()
         try:
             balance = Decimal(balance_str)
-        except Exception:
+        except (ValueError, InvalidOperation):
             continue
 
         if balance > 0:
@@ -234,7 +234,7 @@ def query_pending_by_salesman(salesman, current_user=None):
             continue
         try:
             balance = Decimal(row.get("balance", "0").strip())
-        except Exception:
+        except (ValueError, InvalidOperation):
             continue
         if balance <= 0:
             continue
@@ -255,7 +255,7 @@ def query_pending_by_beat(beat, current_user=None):
             continue
         try:
             balance = Decimal(row.get("balance", "0").strip())
-        except Exception:
+        except (ValueError, InvalidOperation):
             continue
         if balance <= 0:
             continue
@@ -271,18 +271,21 @@ def query_pending_by_beat(beat, current_user=None):
 def query_pending_by_age(limit, current_user=None):
     """Return (top_vouchers, total_count) — top `limit` pending vouchers oldest first with age field."""
     today_date = datetime.now().date()
+    salesman_filter = current_user.name if current_user and current_user.role == 'salesman' else None
     pending = []
     for row in load_vouchers_raw():
+        if salesman_filter and row.get("salesman", "").strip() != salesman_filter:
+            continue
         try:
             balance = Decimal(row.get("balance", "0").strip())
-        except Exception:
+        except (ValueError, InvalidOperation):
             continue
         if balance <= 0:
             continue
         date_str = row.get("date", "").strip()
         try:
             age = (today_date - datetime.strptime(date_str, "%Y-%m-%d").date()).days
-        except Exception:
+        except ValueError:
             age = 0
         pending.append({
             "bill_no": row.get("bill_no", "").strip(),
@@ -298,11 +301,14 @@ def query_pending_by_age(limit, current_user=None):
 
 def query_pending_by_amount(limit, current_user=None):
     """Return (top_vouchers, total_count) — top `limit` pending vouchers by balance descending."""
+    salesman_filter = current_user.name if current_user and current_user.role == 'salesman' else None
     pending = []
     for row in load_vouchers_raw():
+        if salesman_filter and row.get("salesman", "").strip() != salesman_filter:
+            continue
         try:
             balance = Decimal(row.get("balance", "0").strip())
-        except Exception:
+        except (ValueError, InvalidOperation):
             continue
         if balance <= 0:
             continue

@@ -7,23 +7,41 @@ No file paths, no CSV/JSON access, no imports from other coll_* modules.
 
 import os
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+
+
+def clear_screen():
+    os.system("cls" if os.name == "nt" else "clear")
+
+
+def _sum_decimal_field(items, field, default="0"):
+    return sum(Decimal(v.get(field, default) or default) for v in items)
+
+
+def _format_decimal(d):
+    if d == d.to_integral_value():
+        return str(d.to_integral_value())
+    return str(d.quantize(Decimal("0.01")))
 
 
 def prompt_login():
-    """Display login prompt and return (username, password)."""
-    os.system("cls" if os.name == "nt" else "clear")
+    """Display login prompt and return (username, password), or None to exit."""
+    clear_screen()
     print("\n" + "=" * 50)
     print("COLLECTION MANAGEMENT")
     print("=" * 50)
-    name = input("Username: ").strip()
+    print("  0. Exit")
+    print("=" * 50)
+    name = input("Username (0 to exit): ").strip()
+    if name == "0":
+        return None
     password = input("Password: ").strip()
     return name, password
 
 
 def display_main_menu(menu_items, current_user):
     """Display the role-filtered main menu. menu_items is a list of label strings."""
-    os.system("cls" if os.name == "nt" else "clear")
+    clear_screen()
     print("\n" + "=" * 50)
     print(f"COLLECTION MANAGEMENT  |  {current_user.name}  [{current_user.role}]")
     print("=" * 50)
@@ -45,27 +63,34 @@ def get_menu_choice(max_choice=5):
             print(f"Invalid input: '{choice}'. Please enter a number.")
 
 
-def get_reports_submenu_choice():
-    os.system("cls" if os.name == "nt" else "clear")
+def get_reports_submenu_choice(current_role='distributor'):
+    options = [("Salesman - pending collections", "salesman")]
+    if current_role != 'salesman':
+        options.append(("Beat - pending collections", "beat"))
+    options += [
+        ("Collections - Pending by age", "age"),
+        ("Collections - Pending by amount", "amount"),
+        ("Search voucher", "search"),
+    ]
+    clear_screen()
     print("\n" + "-" * 50)
     print("REPORTS")
     print("-" * 50)
-    print("1. Salesman - pending collections")
-    print("2. Beat - pending collections")
-    print("3. Collections - Pending by age")
-    print("4. Collections - Pending by amount")
-    print("5. Search voucher")
+    for i, (label, _) in enumerate(options, start=1):
+        print(f"{i}. {label}")
     print("0. Back to main menu")
     print("-" * 50)
     while True:
         try:
-            choice = input("Enter your choice (0-5): ").strip()
+            choice = input(f"Enter your choice (0-{len(options)}): ").strip()
             if choice.lower() == "b":
-                return 0
-            choice_num = int(choice)
-            if choice_num in [0, 1, 2, 3, 4, 5]:
-                return choice_num
-            print(f"Invalid choice: {choice_num}. Please enter 0-5.")
+                return "back"
+            n = int(choice)
+            if n == 0:
+                return "back"
+            if 1 <= n <= len(options):
+                return options[n - 1][1]
+            print(f"Invalid choice: {n}. Please enter 0-{len(options)}.")
         except ValueError:
             print(f"Invalid input: '{choice}'. Please enter a number.")
 
@@ -177,7 +202,8 @@ def paginate_text(text, page_size=20):
 
 
 def prompt_continue():
-    input("\nPress Enter to continue to the main menu...")
+    while input("\nEnter 'b' to go back: ").strip().lower() != "b":
+        pass
 
 
 def prompt_report_selection(reports, labels=None, show_print=False):
@@ -212,7 +238,7 @@ def prompt_report_selection(reports, labels=None, show_print=False):
 
 def display_report_with_focus(beats, salesmen, vouchers, current_idx):
     """Display full report with current record marked with >>>."""
-    os.system("clear" if os.name == "posix" else "cls")
+    clear_screen()
 
     print("\n" + "=" * 80)
     print("COLLECTION REPORT")
@@ -251,8 +277,8 @@ def display_report_with_focus(beats, salesmen, vouchers, current_idx):
         print(line)
 
     print(separator)
-    total_balance = sum(Decimal(v["balance"]) for v in vouchers)
-    total_payments = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
+    total_balance = _sum_decimal_field(vouchers, "balance")
+    total_payments = _sum_decimal_field(vouchers, "payment")
     print(f"Total vouchers: {len(vouchers)} | Total due: {total_balance} | Total collection: {total_payments}")
     print("=" * 80)
 
@@ -271,7 +297,7 @@ def get_payment_input(voucher, current_idx, total_records, total_payments_so_far
     print("Controls: Enter amount, or press:")
     print("  [n] = next record  [p] = previous record  [s] = skip  [q] = quit  [b] = back")
 
-    default = current_payment if current_payment else str(balance.to_integral() if balance == balance.to_integral() else balance.quantize(Decimal('0.01')))
+    default = current_payment if current_payment else _format_decimal(balance)
     prompt = f"Payment amount (or command) [{default}]: "
 
     while True:
@@ -297,65 +323,86 @@ def get_payment_input(voucher, current_idx, total_records, total_payments_so_far
                     print(f"Payment cannot exceed balance ({balance}).")
                     continue
                 payment = payment.quantize(Decimal('0.01'))
-                return (str(payment) if payment != payment.to_integral() else str(payment.to_integral())), "next"
-            except Exception:
+                return _format_decimal(payment), "next"
+            except (ValueError, InvalidOperation):
                 print(f"Invalid input. Enter a numeric amount or a command (n/p/s/q).")
 
 
 # --- Report display functions ---
 
-def display_report_salesman_pending(salesman, grouped_by_beat):
+def display_salesman_beat_summary(salesman, grouped_by_beat):
+    """Display beat-level summary for a salesman. Returns selected beat name or None."""
     today = datetime.now().strftime("%Y-%m-%d")
+    clear_screen()
     print("\n" + "=" * 60)
     print("PENDING COLLECTIONS REPORT")
     print(f"Salesman : {salesman}")
     print(f"Date     : {today}")
     print("=" * 60)
 
+    beats = sorted(grouped_by_beat)
+    beat_stats = []
     grand_count = 0
     grand_balance = Decimal("0")
-    beat_stats = []
 
-    for beat in sorted(grouped_by_beat):
-        beat_vouchers = grouped_by_beat[beat]
-        beat_balance = sum(Decimal(v["balance"]) for v in beat_vouchers)
+    for beat in beats:
+        vouchers = grouped_by_beat[beat]
+        balance = _sum_decimal_field(vouchers, "balance")
+        beat_stats.append((beat, len(vouchers), balance))
+        grand_count += len(vouchers)
+        grand_balance += balance
 
-        bill_w = max(len("bill_no"), max(len(v["bill_no"]) for v in beat_vouchers))
-        date_w = max(len("date"), max(len(v["date"]) for v in beat_vouchers))
-        bal_w = max(len("balance"), max(len(v["balance"]) for v in beat_vouchers))
-
-        header = f"  {'bill_no':<{bill_w}}  {'date':<{date_w}}  {'balance':>{bal_w}}"
-        sep = "-" * len(header)
-
-        print(f"\nBeat: {beat}")
-        print(sep)
-        print(header)
-        print(sep)
-        for v in beat_vouchers:
-            print(f"  {v['bill_no']:<{bill_w}}  {v['date']:<{date_w}}  {v['balance']:>{bal_w}}")
-        print(sep)
-        print(f"  Vouchers: {len(beat_vouchers)}   Beat total: {beat_balance}")
-
-        grand_count += len(beat_vouchers)
-        grand_balance += beat_balance
-        beat_stats.append((beat, len(beat_vouchers), beat_balance))
-
-    beat_w = max(len("beat"), max(len(b) for b, _, _ in beat_stats))
+    beat_w = max(len("beat"), max(len(b) for b in beats))
     cnt_w = max(len("vouchers"), max(len(str(c)) for _, c, _ in beat_stats))
     bal_w = max(len("balance"), max(len(str(b)) for _, _, b in beat_stats))
 
-    sum_header = f"  {'beat':<{beat_w}}  {'vouchers':>{cnt_w}}  {'balance':>{bal_w}}"
-    sum_sep = "-" * len(sum_header)
+    header = f"  {'#':>3}  {'beat':<{beat_w}}  {'vouchers':>{cnt_w}}  {'balance':>{bal_w}}"
+    sep = "-" * len(header)
+    print(header)
+    print(sep)
+    for i, (beat, count, balance) in enumerate(beat_stats, start=1):
+        print(f"  {i:>3}. {beat:<{beat_w}}  {count:>{cnt_w}}  {str(balance):>{bal_w}}")
+    print(sep)
+    print(f"  {'':>3}  {'TOTAL':<{beat_w}}  {grand_count:>{cnt_w}}  {str(grand_balance):>{bal_w}}")
+    print("=" * 60)
 
+    while True:
+        choice = input(f"\nSelect beat (1-{len(beats)}) or 'b' to go back: ").strip().lower()
+        if choice == "b":
+            return None
+        try:
+            n = int(choice)
+            if 1 <= n <= len(beats):
+                return beats[n - 1]
+            print(f"Invalid selection. Choose 1-{len(beats)}.")
+        except ValueError:
+            print("Invalid input. Enter a number or 'b'.")
+
+
+def display_salesman_beat_vouchers(salesman, beat, vouchers):
+    """Display all pending vouchers for a salesman in a specific beat."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    clear_screen()
     print("\n" + "=" * 60)
-    print("SUMMARY")
-    print(sum_sep)
-    print(sum_header)
-    print(sum_sep)
-    for beat, count, balance in beat_stats:
-        print(f"  {beat:<{beat_w}}  {count:>{cnt_w}}  {str(balance):>{bal_w}}")
-    print(sum_sep)
-    print(f"  {'TOTAL':<{beat_w}}  {grand_count:>{cnt_w}}  {str(grand_balance):>{bal_w}}")
+    print("PENDING COLLECTIONS - BEAT DETAIL")
+    print(f"Salesman : {salesman}")
+    print(f"Beat     : {beat}")
+    print(f"Date     : {today}")
+    print("=" * 60)
+
+    bill_w = max(len("bill_no"), max(len(v["bill_no"]) for v in vouchers))
+    date_w = max(len("date"), max(len(v["date"]) for v in vouchers))
+    bal_w = max(len("balance"), max(len(v["balance"]) for v in vouchers))
+
+    header = f"  {'bill_no':<{bill_w}}  {'date':<{date_w}}  {'balance':>{bal_w}}"
+    sep = "-" * len(header)
+    print(header)
+    print(sep)
+    for v in vouchers:
+        print(f"  {v['bill_no']:<{bill_w}}  {v['date']:<{date_w}}  {v['balance']:>{bal_w}}")
+    print(sep)
+    total = _sum_decimal_field(vouchers, "balance")
+    print(f"  Vouchers: {len(vouchers)}   Total balance: {total}")
     print("=" * 60)
 
 
@@ -373,7 +420,7 @@ def display_report_beat_pending(beat, grouped_by_salesman):
 
     for salesman in sorted(grouped_by_salesman):
         sm_vouchers = grouped_by_salesman[salesman]
-        sm_balance = sum(Decimal(v["balance"]) for v in sm_vouchers)
+        sm_balance = _sum_decimal_field(sm_vouchers, "balance")
 
         bill_w = max(len("bill_no"), max(len(v["bill_no"]) for v in sm_vouchers))
         date_w = max(len("date"), max(len(v["date"]) for v in sm_vouchers))
@@ -415,6 +462,9 @@ def display_report_beat_pending(beat, grouped_by_salesman):
 
 
 def display_report_by_age(vouchers, total_pending, limit):
+    if not vouchers:
+        print("No pending vouchers found.")
+        return
     today = datetime.now().strftime("%Y-%m-%d")
     print("\n" + "=" * 60)
     print(f"TOP {limit} AGED PENDING VOUCHERS")
@@ -445,6 +495,9 @@ def display_report_by_age(vouchers, total_pending, limit):
 
 
 def display_report_by_amount(vouchers, total_pending, limit):
+    if not vouchers:
+        print("No pending vouchers found.")
+        return
     today = datetime.now().strftime("%Y-%m-%d")
     print("\n" + "=" * 60)
     print(f"TOP {limit} PENDING VOUCHERS BY AMOUNT")
@@ -502,7 +555,7 @@ def display_voucher_detail(voucher, installments, is_completed):
         salesman = inst.get("salesman", "")
         try:
             amt = Decimal(amount_str)
-        except Exception:
+        except (ValueError, InvalidOperation):
             amt = Decimal("0")
         total += amt
         rows.append((date, str(amt), salesman))
@@ -553,8 +606,8 @@ def display_report_for_review(report_data, txt_path):
         sel = report_data.get("selection", [])
         print(f"\n  Report: {', '.join(sel)}")
         print(f"  Vouchers: {len(vouchers)}")
-        total_bal = sum(Decimal(v.get("balance", "0") or "0") for v in vouchers)
-        total_pay = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
+        total_bal = _sum_decimal_field(vouchers, "balance")
+        total_pay = _sum_decimal_field(vouchers, "payment")
         print(f"  Total balance: {total_bal}")
         if total_pay:
             print(f"  Total collected: {total_pay}")
@@ -570,7 +623,7 @@ def interactive_payment_editor(vouchers, beats, salesmen, start_idx=0):
     current_idx = start_idx
 
     while current_idx < len(vouchers):
-        total_payments = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
+        total_payments = _sum_decimal_field(vouchers, "payment")
         display_report_with_focus(beats, salesmen, vouchers, current_idx)
 
         payment, action = get_payment_input(vouchers[current_idx], current_idx, len(vouchers), total_payments)

@@ -30,11 +30,12 @@ from coll_data import (
     search_voucher,
 )
 from coll_ui import (
-    prompt_login,
+    prompt_login, clear_screen,
     select_from_list, select_beat_with_summary, prompt_continue, prompt_report_selection,
     interactive_payment_editor,
     display_confirm_stage_reports, display_report_for_review,
-    display_report_salesman_pending, display_report_beat_pending,
+    display_salesman_beat_summary, display_salesman_beat_vouchers,
+    display_report_beat_pending,
     display_report_by_age, display_report_by_amount,
     display_voucher_detail,
 )
@@ -43,7 +44,11 @@ from coll_ui import (
 def run_login():
     """Prompt for credentials until valid. Returns authenticated User."""
     while True:
-        name, password = prompt_login()
+        result = prompt_login()
+        if result is None:
+            print("\nGoodbye!\n")
+            sys.exit(0)
+        name, password = result
         user = verify_user(name, password)
         if user:
             return user
@@ -60,6 +65,13 @@ def _report_label(report_data, fallback_name):
     return fallback_name
 
 
+def _build_report_map_and_labels(reports):
+    report_map = {p: d for p, d in reports}
+    report_paths = list(report_map.keys())
+    labels = [_report_label(report_map[p], p.name) for p in report_paths]
+    return report_map, report_paths, labels
+
+
 def run_coll_start(current_user):
     try:
         beats = load_beats(current_user)
@@ -73,7 +85,7 @@ def run_coll_start(current_user):
     awaiting_beats = {d.get("selection", [None])[0] for _, d in pending_start if d.get("selection")}
 
     while True:
-        os.system("cls" if os.name == "nt" else "clear")
+        clear_screen()
         print("\n" + "-" * 50)
         print("coll-start - Generate collection list")
         print("-" * 50)
@@ -122,12 +134,16 @@ def run_coll_start(current_user):
         if existing:
             existing_path, existing_data = existing
             stages = existing_data.get("stages", {})
+            start_confirmed = stages.get("start") == "confirmed"
             in_submit_pipeline = stages.get("submit") in ("submitted", "inprogress", "confirmed")
 
             print(f"\nAn active collection already exists for Beat: {beat} | Salesman: {chosen_salesman}")
 
-            if in_submit_pipeline:
-                print("This report is in the submit/finalize pipeline. Complete it before starting a new collection.")
+            if start_confirmed or in_submit_pipeline:
+                if start_confirmed and not in_submit_pipeline:
+                    print("This report has been confirmed by a supervisor. It cannot be modified.")
+                else:
+                    print("This report is in the submit/finalize pipeline. Complete it before starting a new collection.")
                 prompt_continue()
                 return
 
@@ -144,7 +160,7 @@ def run_coll_start(current_user):
                     break
                 elif choice == "v":
                     txt_path = existing_path.with_suffix(".txt")
-                    os.system("cls" if os.name == "nt" else "clear")
+                    clear_screen()
                     display_report_for_review(existing_data, txt_path)
                     print("\n(Report is awaiting supervisor confirmation.)")
                     input("Press Enter to continue...")
@@ -188,7 +204,7 @@ def run_coll_start(current_user):
             prompt_continue()
             return
 
-        os.system("cls" if os.name == "nt" else "clear")
+        clear_screen()
         print(txt_path.read_text(encoding="utf-8"))
 
         go_back = False
@@ -213,7 +229,7 @@ def run_coll_start(current_user):
                 print("Please enter 'y', 'n', or 'b'.")
 
         if go_back:
-            os.system("cls" if os.name == "nt" else "clear")
+            clear_screen()
             continue  # back to beat selection
 
         break  # kept or discarded — exit outer loop
@@ -232,7 +248,7 @@ def run_coll_submit(current_user):
     else:
         confirmed_reports = all_confirmed
     if not confirmed_reports:
-        os.system("cls" if os.name == "nt" else "clear")
+        clear_screen()
         print("\n" + "-" * 50)
         print("Submit Collections")
         print("-" * 50)
@@ -240,12 +256,10 @@ def run_coll_submit(current_user):
         prompt_continue()
         return
 
-    confirmed_map = {p: d for p, d in confirmed_reports}
-    report_paths = list(confirmed_map.keys())
-    labels = [_report_label(confirmed_map[p], p.name) for p in report_paths]
+    confirmed_map, report_paths, labels = _build_report_map_and_labels(confirmed_reports)
 
     while True:
-        os.system("cls" if os.name == "nt" else "clear")
+        clear_screen()
         print("\n" + "-" * 50)
         print("Submit Collections")
         print("-" * 50)
@@ -279,6 +293,14 @@ def run_coll_submit(current_user):
 
     for report_path in selected_paths:
         report_data = confirmed_map[report_path]
+        if report_data.get("stages", {}).get("submit") == "submitted":
+            txt_path = report_path.with_suffix(".txt")
+            clear_screen()
+            display_report_for_review(report_data, txt_path)
+            print("\nThis report has been submitted for supervisor review. Editing is not allowed.")
+            prompt_continue()
+            continue
+
         vouchers = report_data["vouchers"]
         selection_type = report_data.get("selection_type", "beat")
         selection = report_data.get("selection", [])
@@ -372,7 +394,7 @@ def run_coll_submit(current_user):
 
 
 def run_coll_finalize(current_user):
-    os.system("cls" if os.name == "nt" else "clear")
+    clear_screen()
     print("\n" + "-" * 50)
     print("coll-finalize - Finalize collections")
     print("-" * 50)
@@ -383,9 +405,7 @@ def run_coll_finalize(current_user):
         prompt_continue()
         return
 
-    report_map = {p: d for p, d in submit_reports}
-    report_paths = list(report_map.keys())
-    labels = [_report_label(report_map[p], p.name) for p in report_paths]
+    report_map, report_paths, labels = _build_report_map_and_labels(submit_reports)
     selected_paths = prompt_report_selection(report_paths, labels)
     if selected_paths is None:
         return
@@ -438,7 +458,7 @@ def run_coll_finalize(current_user):
 
 
 def run_coll_confirm_start(current_user):
-    os.system("cls" if os.name == "nt" else "clear")
+    clear_screen()
     print("\n" + "-" * 50)
     print("coll-confirm-start - Confirm collection start reports")
     print("-" * 50)
@@ -449,9 +469,7 @@ def run_coll_confirm_start(current_user):
         prompt_continue()
         return
 
-    report_map = {p: d for p, d in pending}
-    report_paths = list(report_map.keys())
-    labels = [_report_label(report_map[p], p.name) for p in report_paths]
+    report_map, report_paths, labels = _build_report_map_and_labels(pending)
 
     while True:
         idx = display_confirm_stage_reports(report_paths, labels, "confirm start")
@@ -462,7 +480,7 @@ def run_coll_confirm_start(current_user):
         report_data = report_map[report_path]
         txt_path = report_path.with_suffix(".txt")
 
-        os.system("cls" if os.name == "nt" else "clear")
+        clear_screen()
         display_report_for_review(report_data, txt_path)
 
         confirm = input("\nConfirm this start report? (y/n/b): ").strip().lower()
@@ -490,7 +508,7 @@ def run_coll_confirm_start(current_user):
 
 
 def run_coll_confirm_submit(current_user):
-    os.system("cls" if os.name == "nt" else "clear")
+    clear_screen()
     print("\n" + "-" * 50)
     print("coll-confirm-submit - Confirm submitted collections")
     print("-" * 50)
@@ -501,9 +519,7 @@ def run_coll_confirm_submit(current_user):
         prompt_continue()
         return
 
-    report_map = {p: d for p, d in pending}
-    report_paths = list(report_map.keys())
-    labels = [_report_label(report_map[p], p.name) for p in report_paths]
+    report_map, report_paths, labels = _build_report_map_and_labels(pending)
 
     while True:
         idx = display_confirm_stage_reports(report_paths, labels, "confirm collections")
@@ -514,7 +530,7 @@ def run_coll_confirm_submit(current_user):
         report_data = report_map[report_path]
         txt_path = report_path.with_suffix(".txt")
 
-        os.system("cls" if os.name == "nt" else "clear")
+        clear_screen()
         display_report_for_review(report_data, txt_path)
 
         confirm = input("\nConfirm these submitted collections? (y/n/b): ").strip().lower()
@@ -537,26 +553,38 @@ def run_coll_confirm_submit(current_user):
         return
 
 
-def run_report_salesman_pending():
-    print("\n" + "-" * 50)
-    print("Report: Salesman - Pending Collections")
-    print("-" * 50)
-    try:
-        salesmen = load_salesmen()
-    except Exception as error:
-        print(f"Error: {error}")
-        prompt_continue()
-        return
-    salesman = select_from_list(salesmen, "salesman")
-    if salesman is None:
-        return
+def run_report_salesman_pending(current_user):
+    if current_user.role == 'salesman':
+        salesman = current_user.name
+    else:
+        print("\n" + "-" * 50)
+        print("Report: Salesman - Pending Collections")
+        print("-" * 50)
+        try:
+            salesmen = load_salesmen()
+        except Exception as error:
+            print(f"Error: {error}")
+            prompt_continue()
+            return
+        salesman = select_from_list(salesmen, "salesman")
+        if salesman is None:
+            return
+
     grouped = query_pending_by_salesman(salesman)
     if not grouped:
+        clear_screen()
         print(f"\nNo pending vouchers found for salesman: {salesman}")
         prompt_continue()
         return
-    display_report_salesman_pending(salesman, grouped)
-    prompt_continue()
+
+    while True:
+        beat = display_salesman_beat_summary(salesman, grouped)
+        if beat is None:
+            return
+        display_salesman_beat_vouchers(salesman, beat, grouped[beat])
+        while input("\nEnter 'b' to go back: ").strip().lower() != "b":
+            pass
+
 
 
 def run_report_beat_pending():
@@ -581,11 +609,11 @@ def run_report_beat_pending():
     prompt_continue()
 
 
-def run_report_collections_by_age():
+def run_report_collections_by_age(current_user=None):
     print("\n" + "-" * 50)
     print("Report: Collections - Pending by Age")
     print("-" * 50)
-    top, total = query_pending_by_age(NUMOF_TOP_AGED_VOUCHERS)
+    top, total = query_pending_by_age(NUMOF_TOP_AGED_VOUCHERS, current_user)
     if not top:
         print("\nNo pending vouchers found.")
         prompt_continue()
@@ -594,11 +622,11 @@ def run_report_collections_by_age():
     prompt_continue()
 
 
-def run_report_collections_by_amount():
+def run_report_collections_by_amount(current_user=None):
     print("\n" + "-" * 50)
     print("Report: Collections - Pending by Amount")
     print("-" * 50)
-    top, total = query_pending_by_amount(NUMOF_TOP_AMOUNT_VOUCHERS)
+    top, total = query_pending_by_amount(NUMOF_TOP_AMOUNT_VOUCHERS, current_user)
     if not top:
         print("\nNo pending vouchers found.")
         prompt_continue()
@@ -624,20 +652,20 @@ def run_voucher_search():
     prompt_continue()
 
 
-def run_reports():
+def run_reports(current_user):
     """Reports sub-menu loop."""
     from coll_ui import get_reports_submenu_choice
     while True:
-        choice = get_reports_submenu_choice()
-        if choice == 0:
+        action = get_reports_submenu_choice(current_user.role)
+        if action == "back":
             return
-        elif choice == 1:
-            run_report_salesman_pending()
-        elif choice == 2:
+        elif action == "salesman":
+            run_report_salesman_pending(current_user)
+        elif action == "beat":
             run_report_beat_pending()
-        elif choice == 3:
-            run_report_collections_by_age()
-        elif choice == 4:
-            run_report_collections_by_amount()
-        elif choice == 5:
+        elif action == "age":
+            run_report_collections_by_age(current_user)
+        elif action == "amount":
+            run_report_collections_by_amount(current_user)
+        elif action == "search":
             run_voucher_search()

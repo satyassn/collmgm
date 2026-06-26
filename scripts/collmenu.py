@@ -28,8 +28,6 @@ Authenticates the user at startup, then displays a role-filtered menu:
     7. Exit
 """
 
-import sys
-
 from coll_ui import display_main_menu, get_menu_choice
 from coll_workflow import (
     run_login,
@@ -44,26 +42,26 @@ ALL_ACTIONS = [
     ("Submit collections",            ['salesman', 'supervisor', 'distributor'], run_coll_submit),
     ("Confirm submitted collections", ['supervisor', 'distributor'],             run_coll_confirm_submit),
     ("Finalize collection",           ['distributor'],                           run_coll_finalize),
-    ("Reports",                       ['salesman', 'supervisor', 'distributor'], lambda u: run_reports()),
+    ("Reports",                       ['salesman', 'supervisor', 'distributor'], run_reports),
 ]
 
 
 def main():
-    current_user = run_login()
-
-    menu = [(label, fn) for label, roles, fn in ALL_ACTIONS if current_user.role in roles]
-    labels = [label for label, _ in menu]
-
     while True:
-        display_main_menu(labels, current_user)
-        choice = get_menu_choice(len(labels) + 1)
+        current_user = run_login()
 
-        if choice == len(labels) + 1:
-            print("\nExiting Collection Management Menu. Goodbye!\n")
-            sys.exit(0)
+        menu = [(label, fn) for label, roles, fn in ALL_ACTIONS if current_user.role in roles]
+        labels = [label for label, _ in menu]
 
-        _, fn = menu[choice - 1]
-        fn(current_user)
+        while True:
+            display_main_menu(labels, current_user)
+            choice = get_menu_choice(len(labels) + 1)
+
+            if choice == len(labels) + 1:
+                break
+
+            _, fn = menu[choice - 1]
+            fn(current_user)
 
 
 if __name__ == "__main__":
