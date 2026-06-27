@@ -70,12 +70,19 @@ def load_salesmen(current_user=None):
 
 
 def load_beats_pending_summary(current_user=None):
-    """Return dict[beat -> {"total": int, "balance_sum": Decimal, "by_salesman": dict}] for pending vouchers."""
+    """Return dict[beat -> {"total": int, "balance_sum": Decimal, "by_salesman": dict}] for pending vouchers.
+
+    When current_user is a salesman, only that salesman's vouchers are counted.
+    """
     rows = load_vouchers_raw()
+    filter_salesman = current_user.name if (current_user and current_user.role == 'salesman') else None
     summary = {}
     for row in rows:
         beat = row.get("beat", "").strip()
         if not beat:
+            continue
+        salesman = row.get("salesman", "").strip()
+        if filter_salesman and salesman != filter_salesman:
             continue
         try:
             bal = Decimal(row.get("balance", "0").strip())
@@ -83,7 +90,6 @@ def load_beats_pending_summary(current_user=None):
             continue
         if bal <= 0:
             continue
-        salesman = row.get("salesman", "").strip()
         if beat not in summary:
             summary[beat] = {"total": 0, "balance_sum": Decimal("0"), "by_salesman": {}}
         summary[beat]["total"] += 1
@@ -143,11 +149,7 @@ def _find_confirmed_start_report(selection_type, selection_values):
         if not isinstance(data, dict):
             continue
         stages = data.get("stages", {})
-        start_confirmed = (
-            stages.get("start") == "confirmed"
-            or (data.get("stage") == "start" and data.get("status") == "confirmed")
-        )
-        if not start_confirmed or stages.get("submit") == "confirmed":
+        if stages.get("start") != "confirmed" or stages.get("submit") == "confirmed":
             continue
         if data.get("selection_type") != selection_type:
             continue
@@ -178,8 +180,40 @@ def _find_any_active_beat_report(selection_type, selection_values):
     return None
 
 
+def load_active_beat_statuses():
+    """Return dict[beat -> status_label] for every beat that has an active report in staging/."""
+    if not STAGING_DIR.exists():
+        return {}
+    result = {}
+    for path in sorted(STAGING_DIR.glob("coll*.json")):
+        try:
+            with path.open(encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        stages = data.get("stages", {})
+        if stages.get("finalize") == "confirmed":
+            continue
+        sel = data.get("selection", [])
+        beat = sel[0] if sel else None
+        if not beat:
+            continue
+        if stages.get("submit") == "confirmed":
+            label = "submit confirmed"
+        elif stages.get("submit") in ("submitted", "inprogress"):
+            label = "submit in progress"
+        elif stages.get("start") == "confirmed":
+            label = "start confirmed"
+        else:
+            label = "awaiting confirmation"
+        result[beat] = label
+    return result
+
+
 def _load_confirmed_start_reports():
-    """Return list of (path, data) for all stage:start status:confirmed reports in staging."""
+    """Return (path, data) pairs where start is confirmed and submit not yet started or in progress."""
     if not STAGING_DIR.exists():
         return []
     result = []
@@ -192,12 +226,11 @@ def _load_confirmed_start_reports():
         if not isinstance(data, dict):
             continue
         stages = data.get("stages", {})
-        start_confirmed = (
-            stages.get("start") == "confirmed"
-            or (data.get("stage") == "start" and data.get("status") == "confirmed")
-        )
-        if start_confirmed and stages.get("submit") != "confirmed":
-            result.append((path, data))
+        if stages.get("start") != "confirmed":
+            continue
+        if stages.get("submit") in ("submitted", "confirmed"):
+            continue
+        result.append((path, data))
     return result
 
 
@@ -215,11 +248,7 @@ def _load_submit_confirmed_reports():
         if not isinstance(data, dict):
             continue
         stages = data.get("stages", {})
-        submit_confirmed = (
-            stages.get("submit") == "confirmed"
-            or (data.get("stage") == "submit" and data.get("status") == "confirmed")
-        )
-        if submit_confirmed and stages.get("finalize") != "confirmed":
+        if stages.get("submit") == "confirmed" and stages.get("finalize") != "confirmed":
             result.append((path, data))
     return result
 
@@ -382,3 +411,204 @@ def search_voucher(bill_no):
                     return voucher, installments, True
 
     return None
+
+
+# --- Add-vouchers query ---
+
+def load_addv_pending_confirm_by_beat():
+    """Group pending addv staging reports by beat for supervisor confirmation.
+
+    Returns dict[beat -> {"files": [(path, data)], "vouchers": [...], "installments": [...]}].
+    A staging file appears under every beat its vouchers belong to.
+    """
+    grouped = {}
+    seen_paths = {}
+
+    if not STAGING_DIR.exists():
+        return grouped
+
+    for path in sorted(STAGING_DIR.glob("addv*.json")):
+        try:
+            with path.open(encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        stages = data.get("stages", {})
+        if stages.get("add") != "done" or stages.get("confirm") == "confirmed":
+            continue
+
+        bill_beat = {v.get("bill_no", ""): v.get("beat", "") for v in data.get("vouchers", [])}
+
+        for v in data.get("vouchers", []):
+            beat = v.get("beat", "")
+            if not beat:
+                continue
+            if beat not in grouped:
+                grouped[beat] = {"files": [], "vouchers": [], "installments": []}
+                seen_paths[beat] = set()
+            if path not in seen_paths[beat]:
+                grouped[beat]["files"].append((path, data))
+                seen_paths[beat].add(path)
+            grouped[beat]["vouchers"].append(v)
+
+        for inst in data.get("installments", []):
+            beat = bill_beat.get(inst.get("bill_no", ""), "")
+            if beat in grouped:
+                grouped[beat]["installments"].append(inst)
+
+    return grouped
+
+
+# --- Add-vouchers validation ---
+
+def validate_single_voucher(bill_no, date_str, amount_str, beat, salesman,
+                             existing_bill_nos, valid_beats, valid_salesmen):
+    """Validate one voucher's fields. Returns (errors: list[str], amount: Decimal or None)."""
+    errors = []
+    amount = None
+
+    if not bill_no:
+        errors.append("Bill No is required.")
+    elif bill_no in existing_bill_nos:
+        errors.append(f"Bill No '{bill_no}' already exists in the system.")
+
+    if not date_str:
+        errors.append("Date is required.")
+    else:
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            errors.append(f"Invalid date '{date_str}'; expected YYYY-MM-DD.")
+
+    if not amount_str:
+        errors.append("Amount is required.")
+    else:
+        try:
+            amount = Decimal(amount_str)
+            if amount <= 0:
+                errors.append("Amount must be positive.")
+                amount = None
+        except InvalidOperation:
+            errors.append(f"Invalid amount '{amount_str}'.")
+
+    if not beat:
+        errors.append("Beat is required.")
+    elif beat not in valid_beats:
+        errors.append(f"Beat '{beat}' not found in beats.csv.")
+
+    if not salesman:
+        errors.append("Salesman is required.")
+    elif salesman not in valid_salesmen:
+        errors.append(f"Salesman '{salesman}' not found in users.csv.")
+
+    return errors, amount
+
+
+def validate_addv_batch(voucher_rows, inst_rows, existing_bill_nos,
+                        valid_beats, valid_salesmen, created_by, now_str):
+    """Validate batch CSV data. Returns (errors, vouchers, installments).
+
+    Errors block the entire import. Vouchers/installments are enriched with metadata
+    and balance is calculated from installment sums.
+    """
+    errors = []
+    vouchers = []
+    seen_bill_nos = set()
+
+    for i, row in enumerate(voucher_rows, start=2):
+        bill_no = row.get("bill_no", "").strip()
+        date_str = row.get("date", "").strip()
+        amount_str = row.get("amount", "").strip()
+        beat = row.get("beat", "").strip()
+        salesman = row.get("salesman", "").strip()
+
+        if bill_no and bill_no in seen_bill_nos:
+            errors.append(f"Voucher row {i}: duplicate bill_no '{bill_no}' in import file.")
+            continue
+
+        row_errors, amount = validate_single_voucher(
+            bill_no, date_str, amount_str, beat, salesman,
+            existing_bill_nos, valid_beats, valid_salesmen,
+        )
+        if row_errors:
+            for e in row_errors:
+                errors.append(f"Voucher row {i}: {e}")
+            continue
+
+        seen_bill_nos.add(bill_no)
+        vouchers.append({
+            "bill_no": bill_no,
+            "date": date_str,
+            "amount": str(amount.quantize(Decimal("0.01"))),
+            "balance": str(amount.quantize(Decimal("0.01"))),
+            "beat": beat,
+            "salesman": salesman,
+            "created_by": created_by,
+            "created_at": now_str,
+        })
+
+    installments = []
+    inst_sums = {}
+
+    for i, row in enumerate(inst_rows, start=2):
+        bill_no = row.get("bill_no", "").strip()
+        date_str = row.get("date", "").strip()
+        amount_str = row.get("amount", "").strip()
+        salesman = row.get("salesman", "").strip()
+
+        if not bill_no:
+            errors.append(f"Installment row {i}: bill_no is empty.")
+            continue
+        if bill_no not in seen_bill_nos:
+            errors.append(f"Installment row {i}: bill_no '{bill_no}' not in vouchers being imported.")
+            continue
+        if not date_str:
+            errors.append(f"Installment row {i} ({bill_no}): date is empty.")
+            continue
+        try:
+            datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            errors.append(f"Installment row {i} ({bill_no}): invalid date '{date_str}'.")
+            continue
+        if not amount_str:
+            errors.append(f"Installment row {i} ({bill_no}): amount is empty.")
+            continue
+        try:
+            inst_amount = Decimal(amount_str)
+        except InvalidOperation:
+            errors.append(f"Installment row {i} ({bill_no}): invalid amount '{amount_str}'.")
+            continue
+        if inst_amount <= 0:
+            errors.append(f"Installment row {i} ({bill_no}): amount must be positive.")
+            continue
+        if not salesman:
+            errors.append(f"Installment row {i} ({bill_no}): salesman is empty.")
+            continue
+        if salesman not in valid_salesmen:
+            errors.append(f"Installment row {i} ({bill_no}): salesman '{salesman}' not found in users.csv.")
+            continue
+
+        inst_sums[bill_no] = inst_sums.get(bill_no, Decimal("0")) + inst_amount
+        installments.append({
+            "bill_no": bill_no,
+            "date": date_str,
+            "amount": str(inst_amount.quantize(Decimal("0.01"))),
+            "salesman": salesman,
+            "created_by": created_by,
+            "created_at": now_str,
+        })
+
+    for v in vouchers:
+        bill_no = v["bill_no"]
+        inst_sum = inst_sums.get(bill_no, Decimal("0"))
+        v_amount = Decimal(v["amount"])
+        if inst_sum > v_amount:
+            errors.append(
+                f"Voucher '{bill_no}': total installments ({inst_sum}) exceed amount ({v_amount})."
+            )
+        else:
+            v["balance"] = str((v_amount - inst_sum).quantize(Decimal("0.01")))
+
+    return errors, vouchers, installments

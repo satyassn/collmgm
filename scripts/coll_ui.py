@@ -161,32 +161,79 @@ def select_from_list(items, label, allow_multiple=False):
         return items[normalized[0] - 1]
 
 
-def select_beat_with_summary(beats, summary, awaiting_beats=None):
-    """Display beats with voucher count, balance sum, and confirmation status. Return selected beat name."""
+def select_beat_with_summary(beats, summary, active_statuses=None, show_salesman_breakdown=False,
+                             awaiting_beats=None):
+    """Display beats with voucher count and status. Only beats with no active report are numbered.
+
+    active_statuses: dict[beat -> status_label] from load_active_beat_statuses().
+    """
     print("\nSelect a beat:\n")
     beat_width = max(len(b) for b in beats)
-    for idx, beat in enumerate(beats, start=1):
+    selectable = []  # ordered list of beat names that get a number
+
+    for beat in beats:
         info = summary.get(beat)
+        status_label = active_statuses.get(beat) if active_statuses else None
+        is_active = status_label is not None
+
         if info and info["total"] > 0:
             bal = info.get("balance_sum", 0)
-            flag = "  [awaiting confirmation]" if awaiting_beats and beat in awaiting_beats else ""
-            print(f"  {idx:2}. {beat:<{beat_width}}  {info['total']:>4} pending  bal: {bal}{flag}")
+            if is_active:
+                print(f"   --  {beat:<{beat_width}}  {info['total']:>4} pending  bal: {bal}  [{status_label}]")
+            else:
+                selectable.append(beat)
+                n = len(selectable)
+                print(f"  {n:2}.  {beat:<{beat_width}}  {info['total']:>4} pending  bal: {bal}")
         else:
-            print(f"  {idx:2}. {beat:<{beat_width}}     no pending")
+            print(f"   --  {beat:<{beat_width}}     no pending")
+
+        if show_salesman_breakdown and info:
+            by_sm = info.get("by_salesman", {})
+            indent = " " * (8 + beat_width)
+            for sm, count in sorted(by_sm.items()):
+                print(f"{indent}{sm}: {count}")
+
     print("   b. Back")
     print()
+
+    if not selectable:
+        input("No beats available to start. Press Enter to go back: ")
+        return None
+
     while True:
-        choice = input(f"Enter the number of the beat (1-{len(beats)}) or 'b': ").strip()
+        choice = input(f"Enter the number of the beat (1-{len(selectable)}) or 'b': ").strip()
         if choice.lower() == "b":
             return None
         try:
             n = int(choice)
         except ValueError:
-            print(f"Invalid input. Enter a number between 1 and {len(beats)} or 'b'.")
+            print(f"Invalid input. Enter a number between 1 and {len(selectable)} or 'b'.")
             continue
-        if 1 <= n <= len(beats):
-            return beats[n - 1]
-        print(f"Invalid selection. Enter a number between 1 and {len(beats)} or 'b'.")
+        if 1 <= n <= len(selectable):
+            return selectable[n - 1]
+        print(f"Invalid selection. Enter a number between 1 and {len(selectable)} or 'b'.")
+
+
+def select_salesman_with_counts(salesmen_counts):
+    """Display salesmen with their pending voucher count. salesmen_counts: [(name, count), ...]. Return selected name or None."""
+    print("\nSelect a salesman:\n")
+    name_width = max(len(s) for s, _ in salesmen_counts)
+    for idx, (name, count) in enumerate(salesmen_counts, start=1):
+        print(f"  {idx:2}. {name:<{name_width}}  {count:>4} pending")
+    print("   b. Back")
+    print()
+    while True:
+        choice = input(f"Enter the number of the salesman (1-{len(salesmen_counts)}) or 'b': ").strip()
+        if choice.lower() == "b":
+            return None
+        try:
+            n = int(choice)
+        except ValueError:
+            print(f"Invalid input. Enter a number between 1 and {len(salesmen_counts)} or 'b'.")
+            continue
+        if 1 <= n <= len(salesmen_counts):
+            return salesmen_counts[n - 1][0]
+        print(f"Invalid selection. Enter a number between 1 and {len(salesmen_counts)} or 'b'.")
 
 
 def paginate_text(text, page_size=20):
@@ -645,3 +692,127 @@ def interactive_payment_editor(vouchers, beats, salesmen, start_idx=0):
     # Redisplay with all payments filled in; current_idx == len(vouchers) so no >>> marker
     display_report_with_focus(beats, salesmen, vouchers, current_idx)
     return vouchers, True, None
+
+
+# --- Add-vouchers UI ---
+
+def prompt_csv_file_path(label):
+    """Prompt for a CSV file path. Returns path string (may be empty to skip), or None to cancel."""
+    value = input(f"\nPath to {label} CSV (Enter to skip, 'b' to cancel): ").strip()
+    if value.lower() == "b":
+        return None
+    return value
+
+
+def prompt_voucher_fields(salesmen=None):
+    """Prompt for one voucher's fields. Returns dict of raw values, or None to finish/cancel.
+
+    Beat is not asked here — it is set once at the session level by the caller.
+    If salesmen is None, salesman is not asked (caller provides a fixed value).
+    If salesmen is a list, a selection prompt is shown.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    print("\n-- New Voucher --")
+
+    bill_no = input("Bill No ('b' or Enter when done): ").strip()
+    if not bill_no or bill_no.lower() == "b":
+        return None
+
+    date_str = input(f"Date [YYYY-MM-DD, Enter for {today}]: ").strip() or today
+    amount_str = input("Amount: ").strip()
+
+    salesman = None
+    if salesmen is not None:
+        salesman = select_from_list(salesmen, "salesman")
+        if salesman is None:
+            return None
+
+    return {"bill_no": bill_no, "date": date_str, "amount_str": amount_str, "salesman": salesman}
+
+
+def prompt_installments_for_voucher(bill_no):
+    """Prompt for installments in a tight loop. Amount first; 'b' or empty to stop.
+
+    Salesman is not collected here — the caller sets it to the current user.
+    """
+    installments = []
+    today = datetime.now().strftime("%Y-%m-%d")
+    print("  Installments — enter amount, 'b' or empty to finish:")
+    while True:
+        amount_str = input("  Amount: ").strip()
+        if not amount_str or amount_str.lower() == "b":
+            break
+        date_str = input(f"  Date [Enter for {today}]: ").strip() or today
+        installments.append({"bill_no": bill_no, "date": date_str, "amount_str": amount_str})
+    return installments
+
+
+def display_addv_summary(vouchers, installments):
+    """Print a summary table of vouchers and installments."""
+    if not vouchers:
+        print("  (No vouchers)")
+        return
+
+    bill_w = max(len("bill_no"), max(len(v["bill_no"]) for v in vouchers))
+    date_w = max(len("date"), max(len(v["date"]) for v in vouchers))
+    amt_w = max(len("amount"), max(len(v["amount"]) for v in vouchers))
+    bal_w = max(len("balance"), max(len(v["balance"]) for v in vouchers))
+    beat_w = max(len("beat"), max(len(v["beat"]) for v in vouchers))
+    sm_w = max(len("salesman"), max(len(v["salesman"]) for v in vouchers))
+
+    header = (
+        f"  {'bill_no':<{bill_w}}  {'date':<{date_w}}"
+        f"  {'amount':>{amt_w}}  {'balance':>{bal_w}}"
+        f"  {'beat':<{beat_w}}  {'salesman':<{sm_w}}"
+    )
+    sep = "-" * len(header)
+    print(header)
+    print(sep)
+    for v in vouchers:
+        print(
+            f"  {v['bill_no']:<{bill_w}}  {v['date']:<{date_w}}"
+            f"  {v['amount']:>{amt_w}}  {v['balance']:>{bal_w}}"
+            f"  {v['beat']:<{beat_w}}  {v['salesman']:<{sm_w}}"
+        )
+    print(sep)
+    total_amount = sum(Decimal(v["amount"]) for v in vouchers)
+    total_balance = sum(Decimal(v["balance"]) for v in vouchers)
+    print(f"  Vouchers: {len(vouchers)}   Total amount: {total_amount}   Total balance: {total_balance}")
+
+    if installments:
+        ib_w = max(len("bill_no"), max(len(i["bill_no"]) for i in installments))
+        id_w = max(len("date"), max(len(i["date"]) for i in installments))
+        ia_w = max(len("amount"), max(len(i["amount"]) for i in installments))
+        ism_w = max(len("salesman"), max(len(i["salesman"]) for i in installments))
+        i_hdr = (
+            f"    {'bill_no':<{ib_w}}  {'date':<{id_w}}"
+            f"  {'amount':>{ia_w}}  {'salesman':<{ism_w}}"
+        )
+        i_sep = "-" * len(i_hdr)
+        print(f"\n  Installments ({len(installments)}):")
+        print(i_hdr)
+        print(i_sep)
+        for inst in installments:
+            print(
+                f"    {inst['bill_no']:<{ib_w}}  {inst['date']:<{id_w}}"
+                f"  {inst['amount']:>{ia_w}}  {inst['salesman']:<{ism_w}}"
+            )
+        print(i_sep)
+        total_inst = sum(Decimal(i["amount"]) for i in installments)
+        print(f"    Total installments: {total_inst}")
+
+
+def display_addv_report(report_data):
+    """Display a staged add-vouchers report for review (confirm/finalize)."""
+    mode = report_data.get("mode", "unknown")
+    created_by = report_data.get("created_by", "")
+    created_at = report_data.get("created_at", "")[:10]
+    stages = report_data.get("stages", {})
+
+    print(f"\nMode: {mode}  |  Created by: {created_by}  |  Date: {created_at}")
+    print(
+        f"Stages: add={stages.get('add','')}  "
+        f"confirm={stages.get('confirm','pending')}  "
+        f"finalize={stages.get('finalize','pending')}"
+    )
+    display_addv_summary(report_data.get("vouchers", []), report_data.get("installments", []))

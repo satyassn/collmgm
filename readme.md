@@ -19,6 +19,39 @@
 - `vouchers.csv`: `bill_no,date,amount,balance,beat,salesman,created_by,created_at`
 - `installments.csv`: `bill_no,date,amount,salesman,created_at`
 
+## Running Tests
+
+Tests use the Python standard library only — no extra packages required.
+
+```
+python -m unittest discover -s tests -v
+```
+
+Run from the **project root** (not from `scripts/` or `tests/`).
+
+### What is tested
+
+| Test class | Coverage |
+|---|---|
+| `TestSanitize` | filename-safe encoding edge cases |
+| `TestPasswordHashing` | PBKDF2 round-trip, wrong password, salt uniqueness |
+| `TestVerifyUser` | valid login, wrong password, unknown user, system role blocked |
+| `TestLoadPendingStartReports` | `stages.start == "new"` predicate; addv files ignored |
+| `TestLoadPendingSubmitReports` | `stages.submit == "submitted"` predicate; all other states excluded |
+| `TestInstallmentsSidecar` | round-trip, bookmark, no legacy `__status__` field |
+| `TestAppendInstallmentsCSV` | dedup on `(bill_no, date)`, header creation, zero/empty skipped |
+| `TestUpdateVouchersBalance` | balance arithmetic, zero detection, atomic write, lock lifecycle |
+| `TestBeatLock` | exclusive acquire, double-acquire blocked, release re-enables |
+| `TestFinalizeCheckpoint` | write, read, overwrite, clear |
+| `TestLoadVouchersRaw` | reads rows, missing file raises |
+| `TestArchiveCompleted` | vouchers and installments moved to completed files |
+
+Each test class uses an isolated temp directory; `coll_store`'s path constants are patched per-test so no real data files are touched.
+
+**Expected output:** `Ran 69 tests in ~1.4s — OK`
+
+---
+
 ## Development guidance
 - Use `PLAN.md` as the authoritative design source.
 - For iteration 1, implement only a test data generator and sample CSV files under `data/`.

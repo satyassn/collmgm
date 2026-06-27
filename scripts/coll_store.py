@@ -71,7 +71,7 @@ def verify_user(name: str, password: str):
 
 
 def _load_pending_start_reports():
-    """Reports generated but not yet supervisor-confirmed (stage=start, stages.start not set)."""
+    """Reports generated but not yet supervisor-confirmed (stages.start == 'new')."""
     if not STAGING_DIR.exists():
         return []
     result = []
@@ -83,11 +83,8 @@ def _load_pending_start_reports():
             continue
         if not isinstance(data, dict):
             continue
-        if data.get('stage') != 'start':
-            continue
-        if data.get('stages', {}).get('start') == 'confirmed':
-            continue
-        result.append((path, data))
+        if data.get('stages', {}).get('start') == 'new':
+            result.append((path, data))
     return result
 
 
@@ -161,7 +158,6 @@ def write_collection_text(path, beats, salesmen, vouchers, stage=None, status=No
         f"Beats: {', '.join(beats)}",
         f"Salesmen: {', '.join(salesmen)}",
         f"Collection date: {date_str}",
-        "",
         header,
         separator,
     ]
@@ -193,6 +189,51 @@ def sanitize_filename_component(value):
     return safe or "unknown"
 
 
+def acquire_beat_lock(beat_name):
+    """Atomically claim a beat. Returns True if acquired, False if already locked."""
+    ensure_staging_dir()
+    import re
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", beat_name.strip()) or "unknown"
+    path = STAGING_DIR / f".beatlock-{safe}.lock"
+    try:
+        path.open('x').close()
+        return True
+    except FileExistsError:
+        return False
+
+
+def release_beat_lock(beat_name):
+    """Release a previously acquired beat lock."""
+    import re
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", beat_name.strip()) or "unknown"
+    path = STAGING_DIR / f".beatlock-{safe}.lock"
+    path.unlink(missing_ok=True)
+
+
+def _checkpoint_path():
+    return STAGING_DIR / ".finalize_checkpoint.json"
+
+
+def write_finalize_checkpoint(report_path, step):
+    with _checkpoint_path().open("w", encoding="utf-8") as f:
+        json.dump({"report": str(report_path), "step": step}, f)
+
+
+def clear_finalize_checkpoint():
+    _checkpoint_path().unlink(missing_ok=True)
+
+
+def read_finalize_checkpoint():
+    p = _checkpoint_path()
+    if not p.exists():
+        return None
+    try:
+        with p.open(encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 def list_staging_reports():
     if not STAGING_DIR.exists():
         return []
@@ -203,12 +244,10 @@ def _installments_path(report_path):
     return report_path.parent / f"{report_path.stem}-installments.json"
 
 
-def _save_installments(report_path, vouchers, bookmark_bill_no=None, inst_status=None):
+def _save_installments(report_path, vouchers, bookmark_bill_no=None):
     data = {v["bill_no"]: v["payment"] for v in vouchers if v.get("payment")}
     if bookmark_bill_no:
         data["__bookmark__"] = bookmark_bill_no
-    if inst_status:
-        data["__status__"] = inst_status
     with _installments_path(report_path).open("w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
@@ -216,50 +255,70 @@ def _save_installments(report_path, vouchers, bookmark_bill_no=None, inst_status
 def _load_installments(report_path):
     path = _installments_path(report_path)
     if not path.exists():
-        return {}, None, None
+        return {}, None
     try:
         with path.open(encoding="utf-8") as f:
             data = json.load(f)
         bookmark = data.pop("__bookmark__", None)
-        status = data.pop("__status__", None)
-        return data, bookmark, status
+        data.pop("__status__", None)  # discard legacy field if present
+        return data, bookmark
     except Exception:
-        return {}, None, None
+        return {}, None
 
 
 def _append_installments_csv(vouchers):
     inst_file = DATA_DIR / "installments.csv"
     collection_date = datetime.now().strftime("%Y-%m-%d")
     created_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    existing_keys = set()
+    if inst_file.exists():
+        with inst_file.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                bn = row.get("bill_no", "").strip()
+                dt = row.get("date", "").strip()
+                if bn and dt:
+                    existing_keys.add((bn, dt))
+
+    rows_to_write = []
+    for v in vouchers:
+        payment = (v.get("payment") or "").strip()
+        if not payment:
+            continue
+        try:
+            amount = Decimal(payment)
+        except (ValueError, InvalidOperation):
+            print(f"Warning: skipping invalid payment for {v.get('bill_no')}: {payment!r}")
+            continue
+        if amount <= 0:
+            continue
+        key = (v["bill_no"], collection_date)
+        if key in existing_keys:
+            continue
+        rows_to_write.append({
+            "bill_no": v["bill_no"],
+            "date": collection_date,
+            "amount": payment,
+            "salesman": v["salesman"],
+            "created_by": "app",
+            "created_at": created_at,
+        })
+
+    if not rows_to_write:
+        return
+
     write_header = not inst_file.exists()
     with inst_file.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["bill_no", "date", "amount", "salesman", "created_by", "created_at"])
         if write_header:
             writer.writeheader()
-        for v in vouchers:
-            payment = (v.get("payment") or "").strip()
-            if not payment:
-                continue
-            try:
-                amount = Decimal(payment)
-            except (ValueError, InvalidOperation):
-                print(f"Warning: skipping invalid payment for {v.get('bill_no')}: {payment!r}")
-                continue
-            if amount <= 0:
-                continue
-            writer.writerow({
-                "bill_no": v["bill_no"],
-                "date": collection_date,
-                "amount": payment,
-                "salesman": v["salesman"],
-                "created_by": "app",
-                "created_at": created_at,
-            })
+        writer.writerows(rows_to_write)
 
 
 def _update_vouchers_balance(vouchers):
-    """Update balances in vouchers.csv. Returns list of bill_nos that reached zero."""
+    """Update balances in vouchers.csv atomically. Returns list of bill_nos that reached zero."""
     vouchers_file = DATA_DIR / "vouchers.csv"
+    lock_file = DATA_DIR / ".vouchers.lock"
     if not vouchers_file.exists():
         raise FileNotFoundError(f"Missing vouchers file: {vouchers_file}")
 
@@ -271,31 +330,41 @@ def _update_vouchers_balance(vouchers):
     if not payment_map:
         return []
 
-    rows = []
-    completed_bill_nos = []
-    fieldnames = None
-    with vouchers_file.open(newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        fieldnames = reader.fieldnames
-        if not fieldnames:
-            raise ValueError(f"Cannot read columns from {vouchers_file} — file may be empty or malformed")
-        for row in reader:
-            bill_no = row.get("bill_no", "").strip()
-            if bill_no in payment_map:
-                try:
-                    old_balance = Decimal(row["balance"].strip())
-                    new_balance = max(Decimal("0"), old_balance - payment_map[bill_no])
-                    row["balance"] = str(new_balance.quantize(Decimal("0.01")))
-                    if new_balance == Decimal("0"):
-                        completed_bill_nos.append(bill_no)
-                except (ValueError, InvalidOperation):
-                    print(f"Warning: bill_no {row.get('bill_no')} — balance '{row.get('balance')}' is invalid; skipping payment update")
-            rows.append(row)
+    try:
+        lock_file.open('x').close()
+    except FileExistsError:
+        raise RuntimeError("vouchers.csv is locked by another process — please retry.")
 
-    with vouchers_file.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    try:
+        rows = []
+        completed_bill_nos = []
+        fieldnames = None
+        with vouchers_file.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            if not fieldnames:
+                raise ValueError(f"Cannot read columns from {vouchers_file} — file may be empty or malformed")
+            for row in reader:
+                bill_no = row.get("bill_no", "").strip()
+                if bill_no in payment_map:
+                    try:
+                        old_balance = Decimal(row["balance"].strip())
+                        new_balance = max(Decimal("0"), old_balance - payment_map[bill_no])
+                        row["balance"] = str(new_balance.quantize(Decimal("0.01")))
+                        if new_balance == Decimal("0"):
+                            completed_bill_nos.append(bill_no)
+                    except (ValueError, InvalidOperation):
+                        print(f"Warning: bill_no {row.get('bill_no')} — balance '{row.get('balance')}' is invalid; skipping")
+                rows.append(row)
+
+        tmp_file = vouchers_file.with_suffix(".tmp")
+        with tmp_file.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(str(tmp_file), str(vouchers_file))
+    finally:
+        lock_file.unlink(missing_ok=True)
 
     return completed_bill_nos
 
@@ -376,7 +445,7 @@ def _build_print_column(report_data, bal_width, coll_width):
         heading = ",".join(sel)
 
     dash = "-" * W
-    col_hdr = f"{'Bill No':<7}  {'Balance':>{bal_width}}  {'Coll':>{coll_width}}"
+    col_hdr = f"{'Bill No':<7} {'Balance':>{bal_width}} {'Coll':>{coll_width}}"
 
     vouchers = report_data.get("vouchers", [])
     total_vouchers = len(vouchers)
@@ -385,7 +454,6 @@ def _build_print_column(report_data, bal_width, coll_width):
 
     lines = [
         heading[:W].ljust(W),
-        dash,
         col_hdr[:W].ljust(W),
         dash,
     ]
@@ -393,9 +461,8 @@ def _build_print_column(report_data, bal_width, coll_width):
         bill = v["bill_no"][-7:]
         bal = v.get("balance", "")
         pay = v.get("payment", "") or ""
-        row = f"{bill:<7}  {bal:>{bal_width}}  {pay:>{coll_width}}"
+        row = f"{bill:<7} {bal:>{bal_width}} {pay:>{coll_width}}"
         lines.append(row[:W].ljust(W))
-    lines.append(dash)
     lines.append(summary[:W].ljust(W))
     return lines
 
@@ -410,7 +477,7 @@ def write_print_collection_txt(output_path, reports_data):
         len("Balance"),
         max((len(v.get("balance", "")) for v in all_vouchers), default=0),
     )
-    coll_width = max(4, _PRINT_COL_WIDTH - 7 - 2 - bal_width - 2)
+    coll_width = max(4, _PRINT_COL_WIDTH - 7 - 1 - bal_width - 1)
 
     columns = [_build_print_column(r, bal_width, coll_width) for r in reports_data]
     num_cols = len(columns)
@@ -437,3 +504,255 @@ def write_print_collection_txt(output_path, reports_data):
 
     with output_path.open("w", encoding="utf-8") as f:
         f.write("\n".join(output_lines) + "\n")
+
+
+def _build_html_column(report_data):
+    sel_type = report_data.get("selection_type", "beat")
+    sel = report_data.get("selection", [])
+    if sel_type == "beat_salesman" and len(sel) >= 2:
+        heading = f"{sel[0]} / {sel[1]}"
+    else:
+        heading = ", ".join(sel)
+
+    vouchers = report_data.get("vouchers", [])
+    total_vouchers = len(vouchers)
+    total_bal = sum(Decimal(v.get("balance", "0") or "0") for v in vouchers)
+    total_coll = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
+
+    rows_html = "".join(
+        f"<tr><td>{v['bill_no'][-7:]}</td>"
+        f'<td class="sep">--</td>'
+        f'<td class="num">{v.get("balance", "")}</td>'
+        f'<td class="num">{v.get("payment", "") or ""}</td></tr>\n'
+        for v in vouchers
+    )
+    coll_str = str(total_coll) if total_coll > 0 else ""
+
+    return (
+        f'<div class="col-heading">{heading}</div>\n'
+        f"<table>\n"
+        f"<colgroup><col style=\"width:10ch\"><col style=\"width:2ch\"><col style=\"width:10ch\"><col></colgroup>\n"
+        f"<thead><tr>"
+        f"<td>Bill No</td>"
+        f'<td class="sep"></td>'
+        f'<td class="num">Balance</td>'
+        f'<td class="num">Coll</td>'
+        f"</tr></thead>\n"
+        f"<tbody>\n{rows_html}</tbody>\n"
+        f"<tfoot><tr>"
+        f"<td colspan=\"3\">#{total_vouchers}&nbsp; Bal:{total_bal}</td>"
+        f'<td class="num">{coll_str}</td>'
+        f"</tr></tfoot>\n"
+        f"</table>"
+    )
+
+
+def write_print_collection_html(output_path, reports_data):
+    """Write up to 3 reports side by side as a print-optimised HTML file."""
+    if not reports_data:
+        return
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    col_divs = "\n".join(
+        f'<div class="col">\n{_build_html_column(r)}\n</div>'
+        for r in reports_data
+    )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Collection Report {date_str}</title>
+<style>
+  @page {{ margin: 10mm 8mm; }}
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 8pt;
+    line-height: 1.05;
+  }}
+  .page-header {{
+    display: flex;
+    justify-content: space-between;
+    font-weight: bold;
+    font-size: 9pt;
+    border-bottom: 2px solid #000;
+    padding-bottom: 2px;
+    margin-bottom: 4px;
+  }}
+  .columns {{
+    display: flex;
+    gap: 6px;
+    align-items: flex-start;
+  }}
+  .col {{
+    flex: 1;
+    border-left: 1px solid #999;
+    padding-left: 4px;
+  }}
+  .col:first-child {{
+    border-left: none;
+    padding-left: 0;
+  }}
+  .col-heading {{
+    font-weight: bold;
+    font-size: 7.5pt;
+    white-space: nowrap;
+    overflow: hidden;
+    border-bottom: 1px solid #000;
+    padding-bottom: 1px;
+    margin-bottom: 1px;
+  }}
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+  }}
+  thead td {{
+    font-weight: bold;
+    border-bottom: 1px solid #000;
+    padding: 0;
+  }}
+  tbody td {{
+    padding: 0;
+    white-space: nowrap;
+  }}
+  tfoot td {{
+    font-weight: bold;
+    border-top: 1px solid #000;
+    padding: 0;
+  }}
+  .num {{ text-align: right; }}
+  .sep {{ text-align: center; }}
+</style>
+</head>
+<body>
+<div class="page-header">
+  <span>COLLECTION REPORT</span>
+  <span>{date_str}</span>
+</div>
+<div class="columns">
+{col_divs}
+</div>
+</body>
+</html>"""
+
+    with output_path.open("w", encoding="utf-8") as f:
+        f.write(html)
+
+
+# --- Add-vouchers pipeline helpers ---
+
+def read_csv_file(path):
+    """Read a CSV file and return (fieldnames, rows). Raises FileNotFoundError or ValueError."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+    with p.open(newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+        if not reader.fieldnames:
+            raise ValueError(f"File appears empty or has no header: {path}")
+        return list(reader.fieldnames), rows
+
+
+def load_all_existing_bill_nos():
+    """Return set of all bill_nos from vouchers.csv and completed_vouchers.csv."""
+    bill_nos = set()
+    for fname in ("vouchers.csv", "completed_vouchers.csv"):
+        fpath = DATA_DIR / fname
+        if not fpath.exists():
+            continue
+        with fpath.open(newline='', encoding='utf-8') as f:
+            for row in csv.DictReader(f):
+                b = row.get("bill_no", "").strip()
+                if b:
+                    bill_nos.add(b)
+    return bill_nos
+
+
+def load_addv_staged_bill_nos():
+    """Return set of bill_nos in all non-finalized addv staging files."""
+    bill_nos = set()
+    if not STAGING_DIR.exists():
+        return bill_nos
+    for path in STAGING_DIR.glob("addv*.json"):
+        try:
+            with path.open(encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                continue
+            if data.get("stages", {}).get("finalize") == "confirmed":
+                continue
+            for v in data.get("vouchers", []):
+                b = v.get("bill_no", "").strip()
+                if b:
+                    bill_nos.add(b)
+        except Exception:
+            continue
+    return bill_nos
+
+
+def load_addv_pending_confirm():
+    """Return (path, data) pairs for addv reports awaiting confirmation."""
+    if not STAGING_DIR.exists():
+        return []
+    result = []
+    for path in sorted(STAGING_DIR.glob("addv*.json")):
+        try:
+            with path.open(encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        stages = data.get("stages", {})
+        if stages.get("add") == "done" and stages.get("confirm") != "confirmed":
+            result.append((path, data))
+    return result
+
+
+def load_addv_pending_finalize():
+    """Return (path, data) pairs for addv reports confirmed but not yet finalized."""
+    if not STAGING_DIR.exists():
+        return []
+    result = []
+    for path in sorted(STAGING_DIR.glob("addv*.json")):
+        try:
+            with path.open(encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        stages = data.get("stages", {})
+        if stages.get("confirm") == "confirmed" and stages.get("finalize") != "confirmed":
+            result.append((path, data))
+    return result
+
+
+def write_new_vouchers(vouchers):
+    """Append new vouchers to data/vouchers.csv."""
+    fpath = DATA_DIR / "vouchers.csv"
+    write_header = not fpath.exists() or fpath.stat().st_size == 0
+    fieldnames = ["bill_no", "date", "amount", "balance", "beat", "salesman", "created_by", "created_at"]
+    with fpath.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        for v in vouchers:
+            writer.writerow({k: v.get(k, "") for k in fieldnames})
+
+
+def write_new_installments(installments):
+    """Append new installments to data/installments.csv."""
+    if not installments:
+        return
+    fpath = DATA_DIR / "installments.csv"
+    write_header = not fpath.exists() or fpath.stat().st_size == 0
+    fieldnames = ["bill_no", "date", "amount", "salesman", "created_by", "created_at"]
+    with fpath.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        for inst in installments:
+            writer.writerow({k: inst.get(k, "") for k in fieldnames})

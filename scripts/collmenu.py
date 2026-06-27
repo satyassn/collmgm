@@ -34,6 +34,8 @@ from coll_workflow import (
     run_coll_start, run_coll_confirm_start,
     run_coll_submit, run_coll_confirm_submit,
     run_coll_finalize, run_reports,
+    run_add_vouchers, run_import_vouchers,
+    run_confirm_new_vouchers, run_finalize_new_vouchers,
 )
 
 ALL_ACTIONS = [
@@ -42,6 +44,10 @@ ALL_ACTIONS = [
     ("Submit collections",            ['salesman', 'supervisor', 'distributor'], run_coll_submit),
     ("Confirm submitted collections", ['supervisor', 'distributor'],             run_coll_confirm_submit),
     ("Finalize collection",           ['distributor'],                           run_coll_finalize),
+    ("Add Vouchers",                  ['salesman', 'supervisor', 'distributor'], run_add_vouchers),
+    ("Import Vouchers",               ['supervisor', 'distributor'],             run_import_vouchers),
+    ("Confirm new vouchers",          ['distributor'],                           run_confirm_new_vouchers),
+    ("Finalize new vouchers",         ['distributor'],                           run_finalize_new_vouchers),
     ("Reports",                       ['salesman', 'supervisor', 'distributor'], run_reports),
 ]
 
