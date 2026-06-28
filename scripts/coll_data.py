@@ -194,20 +194,20 @@ def load_active_beat_statuses():
         if not isinstance(data, dict):
             continue
         stages = data.get("stages", {})
-        if stages.get("finalize") == "confirmed":
+        if stages.get("post") == "confirmed":
             continue
         sel = data.get("selection", [])
         beat = sel[0] if sel else None
         if not beat:
             continue
         if stages.get("submit") == "confirmed":
-            label = "submit confirmed"
+            label = "submit approved"
         elif stages.get("submit") in ("submitted", "inprogress"):
             label = "submit in progress"
         elif stages.get("start") == "confirmed":
-            label = "start confirmed"
+            label = "start approved"
         else:
-            label = "awaiting confirmation"
+            label = "awaiting approval"
         result[beat] = label
     return result
 
@@ -235,7 +235,7 @@ def _load_confirmed_start_reports():
 
 
 def _load_submit_confirmed_reports():
-    """Return (path, data) pairs where submit is confirmed and finalize not yet done."""
+    """Return (path, data) pairs where submit is confirmed and post not yet done."""
     if not STAGING_DIR.exists():
         return []
     result = []
@@ -248,7 +248,7 @@ def _load_submit_confirmed_reports():
         if not isinstance(data, dict):
             continue
         stages = data.get("stages", {})
-        if stages.get("submit") == "confirmed" and stages.get("finalize") != "confirmed":
+        if stages.get("submit") == "confirmed" and stages.get("post") != "confirmed":
             result.append((path, data))
     return result
 

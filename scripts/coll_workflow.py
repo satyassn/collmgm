@@ -2,7 +2,7 @@
 Workflow coordinator layer for collection management.
 
 Orchestrates UI ↔ data ↔ store interactions.
-No direct print/input calls (delegates to coll_ui).
+No direct print/input calls (delegates to coll_cli).
 No direct file I/O (delegates to coll_store).
 No direct CSV reads (delegates to coll_data).
 """
@@ -37,7 +37,7 @@ from coll_data import (
     validate_single_voucher, validate_addv_batch,
     load_addv_pending_confirm_by_beat,
 )
-from coll_ui import (
+from coll_cli import (
     prompt_login, clear_screen,
     select_from_list, select_beat_with_summary, select_salesman_with_counts,
     prompt_continue, prompt_report_selection,
@@ -96,7 +96,7 @@ def run_coll_start(current_user):
     while True:
         clear_screen()
         print("\n" + "-" * 50)
-        print("coll-start - Generate collection list")
+        print("Generate Collection List")
         print("-" * 50)
 
         show_breakdown = current_user.role in ('supervisor', 'distributor')
@@ -156,9 +156,9 @@ def run_coll_start(current_user):
 
             if start_confirmed or in_submit_pipeline:
                 if start_confirmed and not in_submit_pipeline:
-                    print("This report has been confirmed by a supervisor. It cannot be modified.")
+                    print("This report has been approved by a supervisor. It cannot be modified.")
                 else:
-                    print("This report is in the submit/finalize pipeline. Complete it before starting a new collection.")
+                    print("This report is in the submit/post pipeline. Complete it before starting a new collection.")
                 prompt_continue()
                 return
 
@@ -166,10 +166,10 @@ def run_coll_start(current_user):
             txt_path = existing_path.with_suffix(".txt")
             clear_screen()
             display_report_for_review(existing_data, txt_path)
-            print("\n(Report is awaiting supervisor confirmation.)")
+            print("\n(Collection list is awaiting supervisor approval.)")
 
             while True:
-                choice = input("\nConfirm report (y) / Discard (d) / Back (b): ").strip().lower()
+                choice = input("\nApprove (y) / Discard (d) / Back (b): ").strip().lower()
                 if choice == "b":
                     break  # back to beat selection
                 elif choice == "y":
@@ -184,9 +184,9 @@ def run_coll_start(current_user):
                             existing_data["vouchers"],
                             stage="start", status="confirmed",
                         )
-                        print(f"\nReport confirmed: {existing_path.name}")
+                        print(f"\nReport approved: {existing_path.name}")
                     except Exception as error:
-                        print(f"Failed to confirm report: {error}")
+                        print(f"Failed to approve report: {error}")
                     active_statuses = load_active_beat_statuses()
                     prompt_continue()
                     break
@@ -239,9 +239,9 @@ def run_coll_start(current_user):
 
         go_back = False
         while True:
-            confirm = input("Keep this report? (y/n/b to go back): ").strip().lower()
+            confirm = input("Keep this collection list? (y/n/b to go back): ").strip().lower()
             if confirm in ("y", "yes"):
-                print("Report generated. Awaiting supervisor confirmation.")
+                print("Collection list generated. Awaiting supervisor approval.")
                 active_statuses = load_active_beat_statuses()
                 break
             elif confirm in ("n", "no"):
@@ -250,7 +250,7 @@ def run_coll_start(current_user):
                     txt_path.unlink()
                 release_beat_lock(beat)
                 active_statuses = load_active_beat_statuses()
-                print("Report discarded.")
+                print("Collection list discarded.")
                 break
             elif confirm == "b":
                 json_path.unlink()
@@ -287,7 +287,7 @@ def run_coll_submit(current_user):
         print("\n" + "-" * 50)
         print("Submit Collections")
         print("-" * 50)
-        print("\nNo confirmed start reports found in staging/.")
+        print("\nNo approved collection lists found in staging/.")
         prompt_continue()
         return
 
@@ -421,21 +421,21 @@ def run_coll_submit(current_user):
     prompt_continue()
 
 
-def run_coll_finalize(current_user):
+def run_coll_post(current_user):
     clear_screen()
     print("\n" + "-" * 50)
-    print("coll-finalize - Finalize collections")
+    print("Post Collections")
     print("-" * 50)
 
     stale = read_finalize_checkpoint()
     if stale:
-        print(f"\n  WARNING: A previous finalize was interrupted at step {stale.get('step')}.")
+        print(f"\n  WARNING: A previous post was interrupted at step {stale.get('step')}.")
         print(f"  Report: {stale.get('report')}")
         print("  Manual data verification is recommended before proceeding.\n")
 
     submit_reports = _load_submit_confirmed_reports()
     if not submit_reports:
-        print("\nNo submitted reports ready for finalization.")
+        print("\nNo submitted reports ready for posting.")
         prompt_continue()
         return
 
@@ -456,9 +456,9 @@ def run_coll_finalize(current_user):
         else:
             print(f"  (Text report not found. Vouchers: {len(vouchers)})")
 
-        confirm = input("Ready to finalize these collections? (y/n/b): ").strip().lower()
+        confirm = input("Ready to post these collections? (y/n/b): ").strip().lower()
         if confirm not in ["y", "yes"]:
-            print(f"Finalization skipped for {report_path.name}.")
+            print(f"Posting skipped for {report_path.name}.")
             continue
 
         write_finalize_checkpoint(report_path, 1)
@@ -472,10 +472,10 @@ def run_coll_finalize(current_user):
             write_finalize_checkpoint(report_path, 4)
         except Exception as error:
             print(f"Failed to update data files for {report_path.name}: {error}")
-            print("  IMPORTANT: A finalize checkpoint remains. Verify data before retrying.")
+            print("  IMPORTANT: A post checkpoint remains. Verify data before retrying.")
             continue
 
-        report_data.setdefault("stages", {})["finalize"] = "confirmed"
+        report_data.setdefault("stages", {})["post"] = "confirmed"
         try:
             save_report_json(report_path, report_data)
             write_finalize_checkpoint(report_path, 5)
@@ -497,25 +497,25 @@ def run_coll_finalize(current_user):
 
         total = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
         paid_count = sum(1 for v in vouchers if v.get("payment"))
-        print(f"Finalized: {report_path.name} — {paid_count} records, total {total}")
+        print(f"Posted: {report_path.name} — {paid_count} records, total {total}")
 
 
-def run_coll_confirm_start(current_user):
+def run_coll_approve_start(current_user):
     clear_screen()
     print("\n" + "-" * 50)
-    print("coll-confirm-start - Confirm collection start reports")
+    print("Approve Collection List")
     print("-" * 50)
 
-    pending = _load_pending_start_reports()
-    if not pending:
-        print("\nNo reports awaiting start confirmation.")
-        prompt_continue()
-        return
-
-    report_map, report_paths, labels = _build_report_map_and_labels(pending)
-
     while True:
-        idx = display_confirm_stage_reports(report_paths, labels, "confirm start")
+        pending = _load_pending_start_reports()
+        if not pending:
+            print("\nNo reports awaiting approval.")
+            prompt_continue()
+            return
+
+        report_map, report_paths, labels = _build_report_map_and_labels(pending)
+
+        idx = display_confirm_stage_reports(report_paths, labels, "approve")
         if idx is None:
             return
 
@@ -527,7 +527,7 @@ def run_coll_confirm_start(current_user):
         display_report_for_review(report_data, txt_path)
 
         while True:
-            confirm = input("\nConfirm (y) / Discard (d) / Back (b): ").strip().lower()
+            confirm = input("\nApprove (y) / Discard (d) / Back (b): ").strip().lower()
             if confirm == "b":
                 break
             if confirm == "d":
@@ -557,29 +557,28 @@ def run_coll_confirm_start(current_user):
             salesman = sel[1] if len(sel) > 1 else ""
             write_collection_text(txt_path, [beat], [salesman], report_data["vouchers"],
                                   stage="start", status="confirmed")
-            print(f"Start report confirmed: {report_path.name}")
+            print(f"Collection list approved: {report_path.name}")
         except Exception as error:
-            print(f"Failed to confirm report: {error}")
+            print(f"Failed to approve report: {error}")
         prompt_continue()
-        return
 
 
-def run_coll_confirm_submit(current_user):
+def run_coll_approve_submit(current_user):
     clear_screen()
     print("\n" + "-" * 50)
-    print("coll-confirm-submit - Confirm submitted collections")
+    print("Approve Collections")
     print("-" * 50)
 
-    pending = _load_pending_submit_reports()
-    if not pending:
-        print("\nNo submitted collections awaiting confirmation.")
-        prompt_continue()
-        return
-
-    report_map, report_paths, labels = _build_report_map_and_labels(pending)
-
     while True:
-        idx = display_confirm_stage_reports(report_paths, labels, "confirm collections")
+        pending = _load_pending_submit_reports()
+        if not pending:
+            print("\nNo submitted collections awaiting approval.")
+            prompt_continue()
+            return
+
+        report_map, report_paths, labels = _build_report_map_and_labels(pending)
+
+        idx = display_confirm_stage_reports(report_paths, labels, "approve")
         if idx is None:
             return
 
@@ -590,22 +589,21 @@ def run_coll_confirm_submit(current_user):
         clear_screen()
         display_report_for_review(report_data, txt_path)
 
-        confirm = input("\nConfirm these submitted collections? (y/n/b): ").strip().lower()
+        confirm = input("\nApprove these submitted collections? (y/n/b): ").strip().lower()
         if confirm == "b":
             continue
         if confirm not in ("y", "yes"):
-            print("Confirmation skipped.")
+            print("Approval skipped.")
             prompt_continue()
             return
 
         report_data.setdefault("stages", {})["submit"] = "confirmed"
         try:
             save_report_json(report_path, report_data)
-            print(f"Collections confirmed: {report_path.name}")
+            print(f"Collections approved: {report_path.name}")
         except Exception as error:
-            print(f"Failed to confirm collections: {error}")
+            print(f"Failed to approve collections: {error}")
         prompt_continue()
-        return
 
 
 def run_report_salesman_pending(current_user):
@@ -709,7 +707,7 @@ def run_voucher_search():
 
 def run_reports(current_user):
     """Reports sub-menu loop."""
-    from coll_ui import get_reports_submenu_choice
+    from coll_cli import get_reports_submenu_choice
     while True:
         action = get_reports_submenu_choice(current_user.role)
         if action == "back":
@@ -742,7 +740,7 @@ def _run_add_vouchers_supervisor_menu(current_user):
         print("ADD VOUCHERS")
         print("=" * 50)
         print("1. Add new vouchers")
-        print("2. Confirm new vouchers")
+        print("2. Approve new vouchers")
         print("0. Back")
         print("=" * 50)
         choice = input("Enter choice (0-2): ").strip()
@@ -761,12 +759,12 @@ def run_confirm_addv_by_beat(current_user):
     while True:
         clear_screen()
         print("\n" + "-" * 50)
-        print("Confirm New Vouchers")
+        print("Approve New Vouchers")
         print("-" * 50)
 
         grouped = load_addv_pending_confirm_by_beat()
         if not grouped:
-            print("\nNo new vouchers awaiting confirmation.")
+            print("\nNo new vouchers awaiting approval.")
             prompt_continue()
             return
 
@@ -792,11 +790,11 @@ def run_confirm_addv_by_beat(current_user):
         beat_data = grouped[beat]
 
         clear_screen()
-        print(f"\nBeat: {beat}  —  {len(beat_data['vouchers'])} voucher(s) pending confirmation")
+        print(f"\nBeat: {beat}  —  {len(beat_data['vouchers'])} voucher(s) pending approval")
         print("-" * 50)
         display_addv_summary(beat_data["vouchers"], beat_data["installments"])
 
-        confirm = input("\nConfirm these new vouchers? (y/n/b): ").strip().lower()
+        confirm = input("\nApprove these new vouchers? (y/n/b): ").strip().lower()
         if confirm == "b":
             continue
         if confirm not in ("y", "yes"):
@@ -813,7 +811,7 @@ def run_confirm_addv_by_beat(current_user):
             except Exception as e:
                 print(f"  Error saving {path.name}: {e}")
 
-        print(f"\nConfirmed: {len(beat_data['vouchers'])} voucher(s) for beat '{beat}'.")
+        print(f"\nApproved: {len(beat_data['vouchers'])} voucher(s) for beat '{beat}'.")
         prompt_continue()
         return
 
@@ -955,7 +953,7 @@ def run_add_vouchers_inline(current_user):
         "created_by": current_user.name,
         "created_at": now_str,
         "stage": "added",
-        "stages": {"add": "done", "confirm": "", "finalize": ""},
+        "stages": {"add": "done", "confirm": "", "post": ""},
         "vouchers": all_vouchers,
         "installments": all_installments,
     }
@@ -1070,7 +1068,7 @@ def run_import_vouchers(current_user):
         "created_by": current_user.name,
         "created_at": now_str,
         "stage": "added",
-        "stages": {"add": "done", "confirm": "", "finalize": ""},
+        "stages": {"add": "done", "confirm": "", "post": ""},
         "vouchers": vouchers,
         "installments": installments,
     }
@@ -1082,16 +1080,16 @@ def run_import_vouchers(current_user):
     prompt_continue()
 
 
-def run_confirm_new_vouchers(current_user):
+def run_approve_new_vouchers(current_user):
     """Supervisor/distributor reviews and confirms a staged add-vouchers batch."""
     clear_screen()
     print("\n" + "-" * 50)
-    print("Confirm New Vouchers")
+    print("Approve New Vouchers")
     print("-" * 50)
 
     pending = load_addv_pending_confirm()
     if not pending:
-        print("\nNo new voucher batches awaiting confirmation.")
+        print("\nNo new voucher batches awaiting approval.")
         prompt_continue()
         return
 
@@ -1103,7 +1101,7 @@ def run_confirm_new_vouchers(current_user):
     ]
 
     while True:
-        idx = display_confirm_stage_reports(report_paths, labels, "confirm")
+        idx = display_confirm_stage_reports(report_paths, labels, "approve")
         if idx is None:
             return
 
@@ -1113,11 +1111,11 @@ def run_confirm_new_vouchers(current_user):
         clear_screen()
         display_addv_report(report_data)
 
-        confirm = input("\nConfirm these new vouchers? (y/n/b): ").strip().lower()
+        confirm = input("\nApprove these new vouchers? (y/n/b): ").strip().lower()
         if confirm == "b":
             continue
         if confirm not in ("y", "yes"):
-            print("Confirmation skipped.")
+            print("Approval skipped.")
             prompt_continue()
             return
 
@@ -1125,23 +1123,23 @@ def run_confirm_new_vouchers(current_user):
         report_data["stage"] = "confirmed"
         try:
             save_report_json(report_path, report_data)
-            print(f"Confirmed: {report_path.name}")
+            print(f"Approved: {report_path.name}")
         except Exception as e:
             print(f"Failed to save: {e}")
         prompt_continue()
         return
 
 
-def run_finalize_new_vouchers(current_user):
+def run_post_new_vouchers(current_user):
     """Distributor writes confirmed new vouchers to data/vouchers.csv and data/installments.csv."""
     clear_screen()
     print("\n" + "-" * 50)
-    print("Finalize New Vouchers")
+    print("Post New Vouchers")
     print("-" * 50)
 
     pending = load_addv_pending_finalize()
     if not pending:
-        print("\nNo confirmed voucher batches awaiting finalization.")
+        print("\nNo approved voucher batches awaiting posting.")
         prompt_continue()
         return
 
@@ -1162,9 +1160,9 @@ def run_finalize_new_vouchers(current_user):
     clear_screen()
     display_addv_report(report_data)
 
-    confirm = input("\nFinalize and write to data files? (y/n/b): ").strip().lower()
+    confirm = input("\nPost and write to data files? (y/n/b): ").strip().lower()
     if confirm not in ("y", "yes"):
-        print("Finalization cancelled.")
+        print("Posting cancelled.")
         prompt_continue()
         return
 
@@ -1179,7 +1177,7 @@ def run_finalize_new_vouchers(current_user):
         prompt_continue()
         return
 
-    report_data["stages"]["finalize"] = "confirmed"
+    report_data["stages"]["post"] = "confirmed"
     report_data["stage"] = "finalized"
     try:
         save_report_json(report_path, report_data)
@@ -1192,7 +1190,25 @@ def run_finalize_new_vouchers(current_user):
     except Exception as e:
         print(f"Warning: could not archive {report_path.name}: {e}")
 
-    print(f"\nFinalized: {len(vouchers)} voucher(s) written to data files.")
+    print(f"\nPosted: {len(vouchers)} voucher(s) written to data files.")
     if installments:
         print(f"           {len(installments)} installment(s) written.")
+    prompt_continue()
+
+
+def run_manage_users(current_user):
+    clear_screen()
+    print("\n" + "-" * 50)
+    print("Manage Users")
+    print("-" * 50)
+    print("\nThis feature is coming soon.")
+    prompt_continue()
+
+
+def run_manage_beats(current_user):
+    clear_screen()
+    print("\n" + "-" * 50)
+    print("Manage Beats")
+    print("-" * 50)
+    print("\nThis feature is coming soon.")
     prompt_continue()

@@ -70,6 +70,24 @@ def verify_user(name: str, password: str):
     return None
 
 
+def load_permissions():
+    """Return dict[role -> frozenset[action_key]] from data/permissions.csv.
+
+    Fails loudly if the file is missing. Unknown action keys are accepted (forward-compat).
+    """
+    pfile = DATA_DIR / "permissions.csv"
+    if not pfile.exists():
+        raise FileNotFoundError(f"Missing permissions file: {pfile}")
+    result = {}
+    with pfile.open(newline='', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            role = row.get('role', '').strip()
+            key  = row.get('action_key', '').strip()
+            if role and key:
+                result.setdefault(role, set()).add(key)
+    return {r: frozenset(keys) for r, keys in result.items()}
+
+
 def _load_pending_start_reports():
     """Reports generated but not yet supervisor-confirmed (stages.start == 'new')."""
     if not STAGING_DIR.exists():
@@ -153,7 +171,7 @@ def write_collection_text(path, beats, salesmen, vouchers, stage=None, status=No
     )
     separator = "-" * len(header)
 
-    lines = ["COLLECTION REPORT"]
+    lines = ["COLLECTION LIST"]
     lines += [
         f"Beats: {', '.join(beats)}",
         f"Salesmen: {', '.join(salesmen)}",
@@ -490,7 +508,7 @@ def write_print_collection_txt(output_path, reports_data):
     date_str = datetime.now().strftime("%Y-%m-%d")
     full_width = _PRINT_COL_WIDTH * num_cols + len(_PRINT_COL_SEP) * (num_cols - 1)
     eq_sep = "=" * full_width
-    title_line = f"{'COLLECTION REPORT':<{full_width - 10}}{date_str:>10}"
+    title_line = f"{'COLLECTION LIST':<{full_width - 10}}{date_str:>10}"
 
     output_lines = [eq_sep, title_line, eq_sep]
     remaining = _PRINT_PAGE_HEIGHT - _PRINT_FILE_HEADER_LINES
@@ -562,7 +580,7 @@ def write_print_collection_html(output_path, reports_data):
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Collection Report {date_str}</title>
+<title>Collection List {date_str}</title>
 <style>
   @page {{ margin: 10mm 8mm; }}
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -627,7 +645,7 @@ def write_print_collection_html(output_path, reports_data):
 </head>
 <body>
 <div class="page-header">
-  <span>COLLECTION REPORT</span>
+  <span>COLLECTION LIST</span>
   <span>{date_str}</span>
 </div>
 <div class="columns">
@@ -681,7 +699,7 @@ def load_addv_staged_bill_nos():
                 data = json.load(f)
             if not isinstance(data, dict):
                 continue
-            if data.get("stages", {}).get("finalize") == "confirmed":
+            if data.get("stages", {}).get("post") == "confirmed":
                 continue
             for v in data.get("vouchers", []):
                 b = v.get("bill_no", "").strip()
@@ -725,7 +743,7 @@ def load_addv_pending_finalize():
         if not isinstance(data, dict):
             continue
         stages = data.get("stages", {})
-        if stages.get("confirm") == "confirmed" and stages.get("finalize") != "confirmed":
+        if stages.get("confirm") == "confirmed" and stages.get("post") != "confirmed":
             result.append((path, data))
     return result
 
