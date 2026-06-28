@@ -5,7 +5,7 @@
 ### beta0.1 — Collection workflow (CLI)
 - Three-stage pipeline: `coll-start` → `coll-submit` → `coll-finalize`
 - Beat-level pipeline guard: blocks duplicate collections for a beat already in staging
-- Modular architecture: `coll_store` / `coll_data` / `coll_ui` / `coll_workflow`
+- Modular architecture: `coll_store` / `coll_data` / `coll_cli` / `coll_workflow`
 - Report generation (JSON + TXT) with staging and archive lifecycle
 - Batch balance update to `vouchers.csv` on finalize
 

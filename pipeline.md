@@ -41,27 +41,27 @@ Its state is encoded entirely in the `stages` sub-dict — the canonical single 
 ## States
 
 ### 1. START / new
-> Report generated, awaiting confirmation.
+> Collection list generated, awaiting supervisor approval.
 
 | Field     | Value                              |
 |-----------|------------------------------------|
 | `stages`  | `{"start": "new"}`                 |
 | Location  | `staging/`                         |
-| UI label  | `[awaiting confirmation]`          |
+| UI label  | `[awaiting approval]`              |
 
 **Actor:** Salesman, supervisor, or distributor via **coll-start**.  
-**Next:** Supervisor or distributor confirms (`y`) → START / confirmed, or discards (`d`) → file deleted.
+**Next:** Supervisor or distributor approves (`y`) → START / confirmed, or discards (`d`) → file deleted.
 
 ---
 
 ### 2. START / confirmed
-> Supervisor or distributor approved the voucher list. Salesman may now submit payments.
+> Collection list approved. Salesman may now submit payments.
 
 | Field     | Value                              |
 |-----------|------------------------------------|
 | `stages`  | `{"start": "confirmed"}`           |
 | Location  | `staging/`                         |
-| UI label  | `[start confirmed]`                |
+| UI label  | `[list approved]`                  |
 
 **Actor:** Supervisor or distributor via **coll-start → y** or **coll-confirm-start**.  
 **Next:** Salesman opens **coll-submit** → SUBMIT / inprogress.
@@ -97,16 +97,16 @@ Its state is encoded entirely in the `stages` sub-dict — the canonical single 
 ---
 
 ### 5. SUBMIT / confirmed
-> Supervisor or distributor approved the payment submission. Ready for distributor to finalize.
+> Supervisor or distributor approved the payment submission. Ready for distributor to post.
 
 | Field     | Value                                              |
 |-----------|----------------------------------------------------|
 | `stages`  | `{"start": "confirmed", "submit": "confirmed"}`    |
 | Location  | `staging/`                                         |
-| UI label  | `[submit confirmed]`                               |
+| UI label  | `[collections approved]`                           |
 
 **Actor:** Supervisor or distributor via **coll-confirm-submit**.  
-**Next:** Distributor finalizes via **coll-finalize** → FINALIZE / confirmed → archived.
+**Next:** Distributor posts via **coll-finalize** → FINALIZE / confirmed → archived.
 
 ---
 

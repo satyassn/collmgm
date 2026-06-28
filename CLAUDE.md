@@ -13,7 +13,7 @@ Run the app: `run.bat` from the project root (launches `scripts/collmenu.py`).
 ```
 collmenu.py          ← entry point / menu loop
     └── coll_workflow.py   ← orchestration (no I/O side-effects, calls ui + store + data)
-            ├── coll_ui.py       ← all print()/input() calls live here
+            ├── coll_cli.py       ← all print()/input() calls live here
             ├── coll_data.py     ← query layer: reads CSVs + staging JSON, pure logic
             └── coll_store.py    ← persistence layer: paths, CSV/JSON reads and writes
 ```
@@ -24,11 +24,11 @@ collmenu.py          ← entry point / menu loop
 |---|---|---|
 | `coll_store.py` | All path constants, CSV/JSON reads/writes | print(), input(), import other coll_* modules |
 | `coll_data.py` | Load and query master data; build report structures | print(), input() |
-| `coll_ui.py` | All terminal I/O: prompts, display, editing | direct file I/O, business logic |
-| `coll_workflow.py` | Orchestrate steps; enforce pipeline guards | own file paths (use coll_store), own terminal I/O (use coll_ui) |
+| `coll_cli.py` | All terminal I/O: prompts, display, editing | direct file I/O, business logic |
+| `coll_workflow.py` | Orchestrate steps; enforce pipeline guards | own file paths (use coll_store), own terminal I/O (use coll_cli) |
 | `collmenu.py` | Menu loop only | business logic |
 
-The layering is strict: `coll_store` has no upstream deps; `coll_data` imports only from `coll_store`; `coll_ui` is standalone; `coll_workflow` imports all three.
+The layering is strict: `coll_store` has no upstream deps; `coll_data` imports only from `coll_store`; `coll_cli` is standalone; `coll_workflow` imports all three.
 
 ---
 
@@ -38,7 +38,7 @@ Three sequential stages per beat:
 
 1. **coll-start** (`run_coll_start`) — select beat + salesman → generate voucher list report → write `staging/collYYYYMMDD-<beat>-<salesman>.json` + `.txt`. Stage = `step1`, all `isconfirmed = false`.
 2. **coll-submit** (`run_coll_submit`) — pick a `step1`-confirmed report → enter payment amounts in edit mode → save payments to staging JSON. Advances stage to `step2`.
-3. **coll-finalize** (`run_coll_finalize`) — pick a `step2`-confirmed report → batch-update `data/vouchers.csv` balances + `data/installments.csv` → move report to `archive/`.
+3. **coll-finalize** (`run_coll_post`) — pick a `step2`-confirmed report → batch-update `data/vouchers.csv` balances + `data/installments.csv` → move report to `archive/`.
 
 **Beat-level pipeline guard:** only one active staging report per beat is allowed. A second `coll-start` for the same beat is blocked until the existing report is finalized or removed.
 
@@ -81,6 +81,32 @@ archive/              — finalized collection reports (JSON + TXT pairs)
 CSV conventions: comma delimiter, UTF-8, ISO 8601 dates, `Decimal` for amounts (never float).
 
 `bill_no` is the voucher primary key. Installments reference it. `balance` is a derived stored value (total amount minus paid installments).
+
+---
+
+## UI naming conventions
+
+These rules apply to all **user-facing strings** — menu labels, screen headers, document headers, and user prompts. Internal identifiers (function names, variable names, JSON keys, file prefixes) are unaffected.
+
+| Term | Definition | Used for |
+|---|---|---|
+| **Collection List** | The working document generated at coll-start — the voucher list a salesman takes to the field | Menu labels, screen headers, TXT/HTML file headers |
+| **Collection Report** | Analytical/summary views only | Reports sub-menu screens |
+| **Approve** | Supervisor grants sign-off to advance a pipeline stage | Replaces "Confirm" for all supervisor gatekeeping actions |
+| **Post** | Distributor writes approved data to master CSV files | Replaces "Finalize" for write-to-master actions |
+
+### Role-action pattern
+
+```
+Salesman generates / submits  →  Supervisor approves  →  Distributor posts
+```
+
+### Style rules
+
+- Menu labels and screen headers: **Title Case**
+- Screen headers must match the corresponding menu label exactly — no technical prefixes (e.g. no `coll-start - `)
+- Document file headers (TXT/HTML): **ALL CAPS** (e.g. `COLLECTION LIST`)
+- "Confirm" is reserved for user acknowledgement prompts (e.g. "Keep this collection list? y/n"), not for supervisor sign-off actions
 
 ---
 

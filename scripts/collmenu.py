@@ -2,61 +2,43 @@
 """
 Collection Menu - Main entry point for collection management.
 
-Authenticates the user at startup, then displays a role-filtered menu:
-
-  Salesman:
-    1. Generate collection report
-    2. Submit collections
-    3. Reports
-    4. Exit
-
-  Supervisor:
-    1. Generate collection report
-    2. Confirm collection start
-    3. Submit collections
-    4. Confirm submitted collections
-    5. Reports
-    6. Exit
-
-  Distributor:
-    1. Generate collection report
-    2. Confirm collection start
-    3. Submit collections
-    4. Confirm submitted collections
-    5. Finalize collection
-    6. Reports
-    7. Exit
+Role-based menu items are driven by data/permissions.csv (loaded on each login).
+ACTION_REGISTRY maps action keys to display labels and workflow handlers.
 """
 
-from coll_ui import display_main_menu, get_menu_choice
+from coll_store import load_permissions
+from coll_cli import display_main_menu, get_menu_choice, build_role_menu
 from coll_workflow import (
     run_login,
-    run_coll_start, run_coll_confirm_start,
-    run_coll_submit, run_coll_confirm_submit,
-    run_coll_finalize, run_reports,
+    run_coll_start, run_coll_approve_start,
+    run_coll_submit, run_coll_approve_submit,
+    run_coll_post, run_reports,
     run_add_vouchers, run_import_vouchers,
-    run_confirm_new_vouchers, run_finalize_new_vouchers,
+    run_approve_new_vouchers, run_post_new_vouchers,
+    run_manage_users, run_manage_beats,
 )
 
-ALL_ACTIONS = [
-    ("Generate collection report",    ['salesman', 'supervisor', 'distributor'], run_coll_start),
-    ("Confirm collection start",      ['supervisor', 'distributor'],             run_coll_confirm_start),
-    ("Submit collections",            ['salesman', 'supervisor', 'distributor'], run_coll_submit),
-    ("Confirm submitted collections", ['supervisor', 'distributor'],             run_coll_confirm_submit),
-    ("Finalize collection",           ['distributor'],                           run_coll_finalize),
-    ("Add Vouchers",                  ['salesman', 'supervisor', 'distributor'], run_add_vouchers),
-    ("Import Vouchers",               ['supervisor', 'distributor'],             run_import_vouchers),
-    ("Confirm new vouchers",          ['distributor'],                           run_confirm_new_vouchers),
-    ("Finalize new vouchers",         ['distributor'],                           run_finalize_new_vouchers),
-    ("Reports",                       ['salesman', 'supervisor', 'distributor'], run_reports),
+ACTION_REGISTRY = [
+    ("coll_start",            "Generate Collection List",  run_coll_start),
+    ("coll_approve_start",    "Approve Collection List",   run_coll_approve_start),
+    ("coll_submit",           "Submit Collections",        run_coll_submit),
+    ("coll_approve_submit",   "Approve Collections",       run_coll_approve_submit),
+    ("coll_post",             "Post Collections",          run_coll_post),
+    ("add_vouchers",          "Add Vouchers",              run_add_vouchers),
+    ("import_vouchers",       "Import Vouchers",           run_import_vouchers),
+    ("approve_new_vouchers",  "Approve New Vouchers",      run_approve_new_vouchers),
+    ("post_new_vouchers",     "Post New Vouchers",         run_post_new_vouchers),
+    ("reports",               "Reports",                   run_reports),
+    ("manage_users",          "Manage Users",              run_manage_users),
+    ("manage_beats",          "Manage Beats",              run_manage_beats),
 ]
 
 
 def main():
     while True:
         current_user = run_login()
-
-        menu = [(label, fn) for label, roles, fn in ALL_ACTIONS if current_user.role in roles]
+        permissions = load_permissions()
+        menu = build_role_menu(current_user, permissions, ACTION_REGISTRY)
         labels = [label for label, _ in menu]
 
         while True:
