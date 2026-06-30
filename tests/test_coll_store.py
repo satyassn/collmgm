@@ -257,9 +257,16 @@ class TestInstallmentsSidecar(StoreTestCase):
         vouchers = self._vouchers({"B001": "100.00", "B002": "50.00"})
         coll_store._save_installments(path, vouchers)
         data, bookmark = coll_store._load_installments(path)
-        self.assertEqual(data["B001"], "100.00")
-        self.assertEqual(data["B002"], "50.00")
+        self.assertEqual(data["B001"]["payment"], "100.00")
+        self.assertEqual(data["B002"]["payment"], "50.00")
         self.assertIsNone(bookmark)
+
+    def test_round_trip_preserves_payment_date(self):
+        path = self._report_path()
+        vouchers = [{"bill_no": "B001", "payment": "100.00", "payment_date": "2026-06-20"}]
+        coll_store._save_installments(path, vouchers)
+        data, _ = coll_store._load_installments(path)
+        self.assertEqual(data["B001"]["date"], "2026-06-20")
 
     def test_bookmark_preserved(self):
         path = self._report_path()
@@ -295,6 +302,13 @@ class TestInstallmentsSidecar(StoreTestCase):
         data, _ = coll_store._load_installments(path)
         self.assertNotIn("__status__", data)
         self.assertIn("B1", data)
+
+    def test_legacy_flat_string_normalized_to_dict(self):
+        path = self._report_path()
+        sidecar = path.parent / f"{path.stem}-installments.json"
+        sidecar.write_text(json.dumps({"B1": "5.00"}))
+        data, _ = coll_store._load_installments(path)
+        self.assertEqual(data["B1"], {"payment": "5.00", "date": ""})
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +375,30 @@ class TestAppendInstallmentsCSV(StoreTestCase):
     def test_no_rows_no_file_created(self):
         coll_store._append_installments_csv([])
         self.assertFalse((self.tmp / "data" / "installments.csv").exists())
+
+    def test_uses_voucher_payment_date_not_today(self):
+        vouchers = [{"bill_no": "B001", "payment": "10.00", "salesman": "sm1",
+                     "payment_date": "2026-06-20"}]
+        coll_store._append_installments_csv(vouchers)
+        rows = self._read_installments()
+        self.assertEqual(rows[0]["date"], "2026-06-20")
+
+    def test_missing_payment_date_falls_back_to_today(self):
+        from datetime import datetime as _dt
+        today = _dt.now().strftime("%Y-%m-%d")
+        coll_store._append_installments_csv(self._vouchers(("B001", "10.00")))
+        rows = self._read_installments()
+        self.assertEqual(rows[0]["date"], today)
+
+    def test_dedup_keyed_on_per_voucher_date(self):
+        self._write_csv("data", "installments.csv", self._FIELDS,
+                        [{"bill_no": "B001", "date": "2026-06-20", "amount": "10.00",
+                          "salesman": "sm1", "created_by": "app", "created_at": "t"}])
+        vouchers = [{"bill_no": "B001", "payment": "10.00", "salesman": "sm1",
+                     "payment_date": "2026-06-20"}]
+        coll_store._append_installments_csv(vouchers)
+        rows = self._read_installments()
+        self.assertEqual(len(rows), 1)
 
 
 # ---------------------------------------------------------------------------

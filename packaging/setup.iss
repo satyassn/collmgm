@@ -2,20 +2,26 @@
 ; Build with Inno Setup 6.x: https://jrsoftware.org/isinfo.php
 
 #define MyAppName "CollMgm"
-#define MyAppVersion "0.1-beta"
+#define MyAppVersion "0.1"
+#ifndef MyAppRelease
+  #define MyAppRelease "alpha"
+#endif
+#ifndef MyAppBuild
+  #define MyAppBuild "0"
+#endif
 #define MyAppPublisher "Your Company Name"
 #define MyAppExeName "run.bat"
 
 [Setup]
 AppId={{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
 AppName={#MyAppName}
-AppVersion={#MyAppVersion}
+AppVersion={#MyAppVersion}-{#MyAppRelease}-build{#MyAppBuild}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={localappdata}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=dist
-OutputBaseFilename=CollMgm-Beta-Setup-{#GetDateTimeString('yyyymmdd-hhnnss', '', '')}
+OutputBaseFilename=CollMgm-{#MyAppRelease}-Build{#MyAppBuild}-Setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
@@ -34,7 +40,7 @@ Source: "python\*"; DestDir: "{app}\python"; Flags: ignoreversion recursesubdirs
 
 ; Application scripts
 Source: "..\scripts\collmenu.py";        DestDir: "{app}\scripts"; Flags: ignoreversion
-Source: "..\scripts\coll_ui.py";         DestDir: "{app}\scripts"; Flags: ignoreversion
+Source: "..\scripts\coll_cli.py";        DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\scripts\coll_workflow.py";   DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\scripts\coll_data.py";       DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\scripts\coll_store.py";      DestDir: "{app}\scripts"; Flags: ignoreversion

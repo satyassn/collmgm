@@ -29,6 +29,16 @@ _PRINT_PAGE_HEIGHT = 66
 _PRINT_FILE_HEADER_LINES = 3
 
 
+def bill_no_sort_key(bill_no):
+    """Sort key for bill_no: numeric value when digits-only, else the string itself.
+
+    bill_no values are normally fixed-width numeric strings, but manually
+    added vouchers can have shorter numeric ids (e.g. "999"); a plain string
+    sort would lexically order those after longer numeric bill_no values.
+    """
+    return (0, int(bill_no)) if bill_no.isdigit() else (1, bill_no)
+
+
 def ensure_staging_dir():
     STAGING_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -180,7 +190,7 @@ def write_collection_text(path, beats, salesmen, vouchers, stage=None, status=No
         separator,
     ]
 
-    for voucher in vouchers:
+    for voucher in sorted(vouchers, key=lambda v: bill_no_sort_key(v["bill_no"])):
         lines.append(
             f"{voucher['bill_no']:<{bill_width}}  "
             f"{voucher.get('voucher_date', ''):<{vdate_width}}  "
@@ -193,7 +203,7 @@ def write_collection_text(path, beats, salesmen, vouchers, stage=None, status=No
     total_balance = sum(Decimal(v.get("balance", "0") or "0") for v in vouchers)
     total_payments = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
     lines.append(f"Total vouchers: {total_vouchers}")
-    lines.append(f"Sum of coll: {total_balance}")
+    lines.append(f"Sum of balances: {total_balance}")
     if total_payments > 0:
         lines.append(f"Total payments entered: {total_payments}")
 
@@ -263,7 +273,10 @@ def _installments_path(report_path):
 
 
 def _save_installments(report_path, vouchers, bookmark_bill_no=None):
-    data = {v["bill_no"]: v["payment"] for v in vouchers if v.get("payment")}
+    data = {
+        v["bill_no"]: {"payment": v["payment"], "date": v.get("payment_date", "")}
+        for v in vouchers if v.get("payment")
+    }
     if bookmark_bill_no:
         data["__bookmark__"] = bookmark_bill_no
     with _installments_path(report_path).open("w", encoding="utf-8") as f:
@@ -279,6 +292,11 @@ def _load_installments(report_path):
             data = json.load(f)
         bookmark = data.pop("__bookmark__", None)
         data.pop("__status__", None)  # discard legacy field if present
+        # Legacy cache format stored a plain payment string per bill_no.
+        data = {
+            bn: (entry if isinstance(entry, dict) else {"payment": entry, "date": ""})
+            for bn, entry in data.items()
+        }
         return data, bookmark
     except Exception:
         return {}, None
@@ -286,7 +304,7 @@ def _load_installments(report_path):
 
 def _append_installments_csv(vouchers):
     inst_file = DATA_DIR / "installments.csv"
-    collection_date = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now().strftime("%Y-%m-%d")
     created_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
     existing_keys = set()
@@ -310,6 +328,8 @@ def _append_installments_csv(vouchers):
             continue
         if amount <= 0:
             continue
+        # Reports predating per-voucher payment_date tracking fall back to today.
+        collection_date = (v.get("payment_date") or "").strip() or today
         key = (v["bill_no"], collection_date)
         if key in existing_keys:
             continue
@@ -385,6 +405,39 @@ def _update_vouchers_balance(vouchers):
         lock_file.unlink(missing_ok=True)
 
     return completed_bill_nos
+
+
+def _unique_archive_dest(name):
+    """Return a non-colliding ARCHIVE_DIR path for `name`, adding a '_dupN' suffix if needed."""
+    dest = ARCHIVE_DIR / name
+    if not dest.exists():
+        return dest
+    stem, suffix = Path(name).stem, Path(name).suffix
+    counter = 1
+    while True:
+        dest = ARCHIVE_DIR / f"{stem}_dup{counter}{suffix}"
+        if not dest.exists():
+            return dest
+        counter += 1
+
+
+def archive_files(paths):
+    """Move each existing path in `paths` into ARCHIVE_DIR.
+
+    On Windows, Path.rename() raises FileExistsError if the destination name is
+    already taken (e.g. same beat+salesman archived earlier the same day) — unlike
+    POSIX, which would silently overwrite. Disambiguate with a '_dupN' suffix instead
+    of letting the move fail, so a posted report can never get stranded in staging/.
+    """
+    ARCHIVE_DIR.mkdir(exist_ok=True)
+    archived = {}
+    for src in paths:
+        if not src.exists():
+            continue
+        dest = _unique_archive_dest(src.name)
+        src.rename(dest)
+        archived[src] = dest
+    return archived
 
 
 def _archive_completed(bill_nos):
@@ -475,7 +528,7 @@ def _build_print_column(report_data, bal_width, coll_width):
         col_hdr[:W].ljust(W),
         dash,
     ]
-    for v in vouchers:
+    for v in sorted(vouchers, key=lambda v: bill_no_sort_key(v["bill_no"])):
         bill = v["bill_no"][-7:]
         bal = v.get("balance", "")
         pay = v.get("payment", "") or ""
@@ -542,14 +595,14 @@ def _build_html_column(report_data):
         f'<td class="sep">--</td>'
         f'<td class="num">{v.get("balance", "")}</td>'
         f'<td class="num">{v.get("payment", "") or ""}</td></tr>\n'
-        for v in vouchers
+        for v in sorted(vouchers, key=lambda v: bill_no_sort_key(v["bill_no"]))
     )
     coll_str = str(total_coll) if total_coll > 0 else ""
 
     return (
         f'<div class="col-heading">{heading}</div>\n'
         f"<table>\n"
-        f"<colgroup><col style=\"width:10ch\"><col style=\"width:2ch\"><col style=\"width:10ch\"><col></colgroup>\n"
+        f"<colgroup><col style=\"width:7ch\"><col style=\"width:2ch\"><col style=\"width:8ch\"><col></colgroup>\n"
         f"<thead><tr>"
         f"<td>Bill No</td>"
         f'<td class="sep"></td>'
@@ -586,14 +639,14 @@ def write_print_collection_html(output_path, reports_data):
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{
     font-family: 'Courier New', Courier, monospace;
-    font-size: 8pt;
+    font-size: 11pt;
     line-height: 1.05;
   }}
   .page-header {{
     display: flex;
     justify-content: space-between;
     font-weight: bold;
-    font-size: 9pt;
+    font-size: 12.5pt;
     border-bottom: 2px solid #000;
     padding-bottom: 2px;
     margin-bottom: 4px;
@@ -614,7 +667,7 @@ def write_print_collection_html(output_path, reports_data):
   }}
   .col-heading {{
     font-weight: bold;
-    font-size: 7.5pt;
+    font-size: 10.5pt;
     white-space: nowrap;
     overflow: hidden;
     border-bottom: 1px solid #000;
@@ -631,7 +684,7 @@ def write_print_collection_html(output_path, reports_data):
     padding: 0;
   }}
   tbody td {{
-    padding: 0;
+    padding: 1pt 0;
     white-space: nowrap;
   }}
   tfoot td {{

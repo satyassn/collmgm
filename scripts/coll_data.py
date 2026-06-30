@@ -11,7 +11,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 from coll_store import (
-    DATA_DIR, STAGING_DIR, load_vouchers_raw,
+    DATA_DIR, STAGING_DIR, load_vouchers_raw, bill_no_sort_key,
     _load_pending_start_reports, _load_pending_submit_reports,
 )
 
@@ -132,7 +132,7 @@ def _load_vouchers_by_criterion(selection_type, selection_values, current_user=N
                 "beat": row_beat,
                 "salesman": row_salesman,
             })
-    return vouchers
+    return sorted(vouchers, key=lambda v: bill_no_sort_key(v["bill_no"]))
 
 
 def _find_confirmed_start_report(selection_type, selection_values):

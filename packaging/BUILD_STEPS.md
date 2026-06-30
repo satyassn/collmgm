@@ -41,25 +41,44 @@ packaging/python/
 
 ## Step 3 — Build the Installer
 
-### Option A: On Windows
+The build number is stored in `packaging/build_number.txt` and auto-increments on every build.
+The release label defaults to `alpha`; override with `RELEASE=beta` etc.
+
+| Command | Output EXE |
+|---|---|
+| `make build` | `CollMgm-alpha-Build1-Setup.exe` |
+| `make build` (again) | `CollMgm-alpha-Build2-Setup.exe` |
+| `make build RELEASE=beta` | `CollMgm-beta-Build3-Setup.exe` |
+
+### Option A: On Windows (recommended)
+
+```bat
+make build
+rem or
+make build RELEASE=beta
+```
+
+Requires: GNU Make (e.g. via Git for Windows) and Inno Setup 6.
+
+### Option B: Inno Setup IDE (no build counter increment)
 
 1. Install Inno Setup 6 from https://jrsoftware.org/isinfo.php
 2. Open `packaging/setup.iss` in the Inno Setup Compiler
 3. Press **F9** (or Build > Compile)
-4. Output: `packaging/dist/CollMgm-Beta-Setup.exe`
+4. Output: `packaging/dist/CollMgm-alpha-Build0-Setup.exe` (uses `#ifndef` defaults)
 
-### Option B: On Linux using Wine
+### Option C: On Linux using Wine
 
 ```bash
 # Install Wine and Inno Setup under Wine (one-time)
 sudo apt install wine
 wine InnoSetup-6.x.exe   # run the Inno Setup installer under Wine
 
-# Then compile
-wine ~/.wine/drive_c/Program\ Files\ \(x86\)/Inno\ Setup\ 6/ISCC.exe packaging/setup.iss
+# Then build via make
+make build RELEASE=alpha
 ```
 
-Output will be at `packaging/dist/CollMgm-Beta-Setup.exe`.
+Output will be at `packaging/dist/CollMgm-alpha-Build<N>-Setup.exe`.
 
 ---
 
@@ -87,5 +106,5 @@ Also attach `BETA_GUIDE.txt` separately so they can read it before installing.
 
 1. Update code in `scripts/`
 2. Re-run test data generation if schema changed
-3. Bump `#define MyAppVersion` in `packaging/setup.iss`
-4. Rebuild installer (Step 3)
+3. Bump `#define MyAppVersion` in `packaging/setup.iss` for a new version number
+4. Rebuild installer — `make build RELEASE=<label>` (build number increments automatically)

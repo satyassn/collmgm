@@ -168,32 +168,28 @@ def select_from_list(items, label, allow_multiple=False):
 
 
 def select_beat_with_summary(beats, summary, active_statuses=None, show_salesman_breakdown=False):
-    """Display beats with voucher count and status. Only beats with no active report are numbered.
+    """Display beats with voucher count and status. Every beat gets a fixed number,
+    based on its position in ascending order, regardless of whether it's selectable.
 
     active_statuses: dict[beat -> status_label] from load_active_beat_statuses().
     """
     if not beats:
         input("No beats found. Press Enter to go back: ")
         return None
+    sorted_beats = sorted(beats)
     print("\nSelect a beat:\n")
-    beat_width = max(len(b) for b in beats)
-    selectable = []  # ordered list of beat names that get a number
+    beat_width = max(len(b) for b in sorted_beats)
 
-    for beat in beats:
+    for n, beat in enumerate(sorted_beats, start=1):
         info = summary.get(beat)
         status_label = active_statuses.get(beat) if active_statuses else None
-        is_active = status_label is not None
 
         if info and info["total"] > 0:
             bal = info.get("balance_sum", 0)
-            if is_active:
-                print(f"   --  {beat:<{beat_width}}  {info['total']:>4} pending  bal: {bal}  [{status_label}]")
-            else:
-                selectable.append(beat)
-                n = len(selectable)
-                print(f"  {n:2}.  {beat:<{beat_width}}  {info['total']:>4} pending  bal: {bal}")
+            suffix = f"  [{status_label}]" if status_label else ""
+            print(f"  {n:2}.  {beat:<{beat_width}}  {info['total']:>4} pending  bal: {bal}{suffix}")
         else:
-            print(f"   --  {beat:<{beat_width}}     no pending")
+            print(f"  {n:2}.  {beat:<{beat_width}}     no pending")
 
         if show_salesman_breakdown and info:
             by_sm = info.get("by_salesman", {})
@@ -204,22 +200,29 @@ def select_beat_with_summary(beats, summary, active_statuses=None, show_salesman
     print("   b. Back")
     print()
 
-    if not selectable:
-        input("No beats available to start. Press Enter to go back: ")
-        return None
-
     while True:
-        choice = input(f"Enter the number of the beat (1-{len(selectable)}) or 'b': ").strip()
+        choice = input(f"Enter the number of the beat (1-{len(sorted_beats)}) or 'b': ").strip()
         if choice.lower() == "b":
             return None
         try:
             n = int(choice)
         except ValueError:
-            print(f"Invalid input. Enter a number between 1 and {len(selectable)} or 'b'.")
+            print(f"Invalid input. Enter a number between 1 and {len(sorted_beats)} or 'b'.")
             continue
-        if 1 <= n <= len(selectable):
-            return selectable[n - 1]
-        print(f"Invalid selection. Enter a number between 1 and {len(selectable)} or 'b'.")
+        if not (1 <= n <= len(sorted_beats)):
+            print(f"Invalid selection. Enter a number between 1 and {len(sorted_beats)} or 'b'.")
+            continue
+
+        beat = sorted_beats[n - 1]
+        info = summary.get(beat)
+        status_label = active_statuses.get(beat) if active_statuses else None
+        if status_label:
+            print(f"{beat} is already in pipeline ({status_label}) — cannot select.")
+            continue
+        if not info or info["total"] <= 0:
+            print(f"{beat} has no pending vouchers — cannot select.")
+            continue
+        return beat
 
 
 def select_salesman_with_counts(salesmen_counts):

@@ -13,18 +13,20 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 from coll_store import (
-    STAGING_DIR, ARCHIVE_DIR, PRINTS_DIR,
+    STAGING_DIR, PRINTS_DIR,
     ensure_staging_dir, ensure_prints_dir, save_report_json,
     write_collection_text, write_print_collection_txt, write_print_collection_html,
     sanitize_filename_component,
     _installments_path, _save_installments, _load_installments,
     _append_installments_csv, _update_vouchers_balance, _archive_completed,
+    archive_files,
     acquire_beat_lock, release_beat_lock,
     write_finalize_checkpoint, clear_finalize_checkpoint, read_finalize_checkpoint,
     verify_user, _load_pending_start_reports, _load_pending_submit_reports,
     read_csv_file, load_all_existing_bill_nos, load_addv_staged_bill_nos,
     load_addv_pending_confirm, load_addv_pending_finalize,
     write_new_vouchers, write_new_installments,
+    bill_no_sort_key,
 )
 from coll_data import (
     load_beats, load_salesmen, load_beats_pending_summary, _load_vouchers_by_criterion,
@@ -272,6 +274,24 @@ def run_coll_start(current_user):
     prompt_continue()
 
 
+def _prompt_submit_for_review(report_path, report_data, vouchers, beats, salesmen):
+    """Ask whether to submit a report for supervisor review and apply the result."""
+    submit_confirm = input("Submit this report for supervisor review? (y/n/b): ").strip().lower()
+    if submit_confirm not in ("y", "yes"):
+        print(f"Collections saved. Submission deferred for {report_path.name}.")
+        return
+    try:
+        report_data.setdefault("stages", {})["submit"] = "submitted"
+        save_report_json(report_path, report_data)
+        txt_path = report_path.with_suffix(".txt")
+        write_collection_text(txt_path, beats, salesmen, vouchers,
+                              stage="submit", status="submitted")
+        _save_installments(report_path, vouchers)
+        print(f"Submitted for supervisor review: {report_path.name}")
+    except Exception as error:
+        print(f"Failed to submit report {report_path.name}: {error}")
+
+
 def run_coll_submit(current_user):
     all_confirmed = _load_confirmed_start_reports()
     # Salesmen can only see reports for their own beat+salesman combination
@@ -337,7 +357,7 @@ def run_coll_submit(current_user):
             prompt_continue()
             continue
 
-        vouchers = report_data["vouchers"]
+        vouchers = sorted(report_data["vouchers"], key=lambda v: bill_no_sort_key(v["bill_no"]))
         selection_type = report_data.get("selection_type", "beat")
         selection = report_data.get("selection", [])
 
@@ -355,8 +375,10 @@ def run_coll_submit(current_user):
         start_idx = 0
         if installments:
             for v in vouchers:
-                if v["bill_no"] in installments:
-                    v["payment"] = installments[v["bill_no"]]
+                entry = installments.get(v["bill_no"])
+                if entry:
+                    v["payment"] = entry.get("payment", "")
+                    v["payment_date"] = entry.get("date", "")
             print(f"  Loaded {len(installments)} installment(s) from prior session.")
         if bookmark_bill_no:
             bill_nos = [v["bill_no"] for v in vouchers]
@@ -366,6 +388,19 @@ def run_coll_submit(current_user):
 
         print(f"\nEditing report: {report_path.name}")
         vouchers, completed, quit_idx = interactive_payment_editor(vouchers, beats, salesmen, start_idx=start_idx)
+
+        if vouchers is not None:
+            today = datetime.now().strftime("%Y-%m-%d")
+            for v in vouchers:
+                payment = (v.get("payment") or "").strip()
+                if not payment:
+                    v["payment_date"] = ""
+                    continue
+                prior = installments.get(v["bill_no"])
+                if prior and (prior.get("payment") or "").strip() == payment:
+                    v["payment_date"] = prior.get("date") or today
+                else:
+                    v["payment_date"] = today
 
         if not completed:
             if vouchers is not None:
@@ -378,6 +413,7 @@ def run_coll_submit(current_user):
                     print(f"Progress saved as installments for {report_path.name}.")
                     if bookmark:
                         print(f"Bookmarked at: {bookmark}")
+                    _prompt_submit_for_review(report_path, report_data, vouchers, beats, salesmen)
                 except Exception as error:
                     print(f"Failed to save installments for {report_path.name}: {error}")
             else:
@@ -402,21 +438,7 @@ def run_coll_submit(current_user):
             print(f"Failed to save collections for {report_path.name}: {error}")
             continue
 
-        submit_confirm = input("Submit this report for supervisor review? (y/n/b): ").strip().lower()
-        if submit_confirm not in ["y", "yes"]:
-            print(f"Collections saved. Submission deferred for {report_path.name}.")
-            continue
-
-        try:
-            report_data.setdefault("stages", {})["submit"] = "submitted"
-            save_report_json(report_path, report_data)
-            txt_path = report_path.with_suffix(".txt")
-            write_collection_text(txt_path, beats, salesmen, vouchers,
-                                  stage="submit", status="submitted")
-            _save_installments(report_path, vouchers)
-            print(f"Submitted for supervisor review: {report_path.name}")
-        except Exception as error:
-            print(f"Failed to submit report {report_path.name}: {error}")
+        _prompt_submit_for_review(report_path, report_data, vouchers, beats, salesmen)
 
     prompt_continue()
 
@@ -446,10 +468,29 @@ def run_coll_post(current_user):
 
     for report_path in selected_paths:
         report_data = report_map[report_path]
-        vouchers = report_data["vouchers"]
+        vouchers = sorted(report_data["vouchers"], key=lambda v: bill_no_sort_key(v["bill_no"]))
+        report_data["vouchers"] = vouchers
         beat = report_data.get("selection", [None])[0]
 
+        selection_type = report_data.get("selection_type", "beat")
+        selection = report_data.get("selection", [])
+        if selection_type == "beat_salesman":
+            beats = [selection[0]]
+            salesmen = [selection[1]]
+        elif selection_type == "beat":
+            beats = selection
+            salesmen = sorted({v["salesman"] for v in vouchers})
+        else:
+            beats = sorted({v["beat"] for v in vouchers})
+            salesmen = selection
+
         txt_path = report_path.with_suffix(".txt")
+        try:
+            write_collection_text(txt_path, beats, salesmen, vouchers,
+                                  stage="post", status="pending")
+        except Exception:
+            pass
+
         print(f"\nReport: {report_path.name}")
         if txt_path.exists():
             print(txt_path.read_text(encoding="utf-8"))
@@ -483,21 +524,29 @@ def run_coll_post(current_user):
             print(f"Failed to update staging JSON for {report_path.name}: {error}")
             continue
 
-        ARCHIVE_DIR.mkdir(exist_ok=True)
-        for src in [report_path, _installments_path(report_path), txt_path]:
-            if src.exists():
-                try:
-                    src.rename(ARCHIVE_DIR / src.name)
-                except Exception as error:
-                    print(f"  Warning: could not archive {src.name}: {error}")
+        try:
+            archive_files([report_path, _installments_path(report_path), txt_path])
+        except Exception as error:
+            print(f"  Warning: could not archive {report_path.name}: {error}")
 
         clear_finalize_checkpoint()
         if beat:
             release_beat_lock(beat)
 
         total = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
-        paid_count = sum(1 for v in vouchers if v.get("payment"))
-        print(f"Posted: {report_path.name} — {paid_count} records, total {total}")
+        paid_count = sum(1 for v in vouchers if Decimal(v.get("payment", "0") or "0") > 0)
+        completed_count = len(completed_bill_nos)
+
+        print("\n" + "-" * 50)
+        print(f"Posted: {report_path.name}")
+        print(f"  Beat                 : {beat}")
+        print(f"  Vouchers in report   : {len(vouchers)}")
+        print(f"  Vouchers with payment: {paid_count}")
+        print(f"  Total collected      : {total}")
+        print(f"  Fully settled        : {completed_count}")
+        print("-" * 50)
+
+    prompt_continue()
 
 
 def run_coll_approve_start(current_user):
@@ -584,7 +633,17 @@ def run_coll_approve_submit(current_user):
 
         report_path = report_paths[idx]
         report_data = report_map[report_path]
+        report_data["vouchers"] = sorted(report_data["vouchers"], key=lambda v: bill_no_sort_key(v["bill_no"]))
         txt_path = report_path.with_suffix(".txt")
+
+        sel = report_data.get("selection", [])
+        beat = sel[0] if len(sel) > 0 else ""
+        salesman = sel[1] if len(sel) > 1 else ""
+        try:
+            write_collection_text(txt_path, [beat], [salesman], report_data["vouchers"],
+                                  stage="submit", status="submitted")
+        except Exception:
+            pass
 
         clear_screen()
         display_report_for_review(report_data, txt_path)
@@ -920,7 +979,7 @@ def run_add_vouchers_inline(current_user):
                 "bill_no": bill_no,
                 "date": inst_f["date"],
                 "amount": str(Decimal(inst_f["amount_str"]).quantize(Decimal("0.01"))),
-                "salesman": current_user.name,
+                "salesman": salesman,
                 "created_by": current_user.name,
                 "created_at": now_str,
             })
@@ -1184,9 +1243,8 @@ def run_post_new_vouchers(current_user):
     except Exception as e:
         print(f"Warning: failed to update staging JSON: {e}")
 
-    ARCHIVE_DIR.mkdir(exist_ok=True)
     try:
-        report_path.rename(ARCHIVE_DIR / report_path.name)
+        archive_files([report_path])
     except Exception as e:
         print(f"Warning: could not archive {report_path.name}: {e}")
 
