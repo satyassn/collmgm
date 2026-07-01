@@ -20,7 +20,7 @@ from coll_store import (
     _installments_path, _save_installments, _load_installments,
     _append_installments_csv, _update_vouchers_balance, _archive_completed,
     archive_files,
-    acquire_beat_lock, release_beat_lock,
+    acquire_beat_lock, release_beat_lock, cancel_staging_report,
     write_finalize_checkpoint, clear_finalize_checkpoint, read_finalize_checkpoint,
     verify_user, _load_pending_start_reports, _load_pending_submit_reports,
     read_csv_file, load_all_existing_bill_nos, load_addv_staged_bill_nos,
@@ -50,7 +50,7 @@ from coll_cli import (
     display_report_by_age, display_report_by_amount,
     display_voucher_detail,
     prompt_csv_file_path, prompt_voucher_fields, prompt_installments_for_voucher,
-    display_addv_summary, display_addv_report,
+    display_addv_summary, display_addv_report, prompt_pending_addv_choice,
 )
 
 
@@ -171,7 +171,7 @@ def run_coll_start(current_user):
             print("\n(Collection list is awaiting supervisor approval.)")
 
             while True:
-                choice = input("\nApprove (y) / Discard (d) / Back (b): ").strip().lower()
+                choice = input("\nApprove (y) / Cancel (c) / Back (b): ").strip().lower()
                 if choice == "b":
                     break  # back to beat selection
                 elif choice == "y":
@@ -192,17 +192,14 @@ def run_coll_start(current_user):
                     active_statuses = load_active_beat_statuses()
                     prompt_continue()
                     break
-                elif choice == "d":
-                    existing_path.unlink()
-                    if txt_path.exists():
-                        txt_path.unlink()
-                    release_beat_lock(beat)
+                elif choice == "c":
+                    cancel_staging_report(existing_path, beat)
                     active_statuses = load_active_beat_statuses()
-                    print("\nReport discarded.")
+                    print("\nCollection list cancelled.")
                     prompt_continue()
                     break
                 else:
-                    print("Please enter 'y', 'd', or 'b'.")
+                    print("Please enter 'y', 'c', or 'b'.")
 
             continue  # back to beat selection
 
@@ -239,37 +236,22 @@ def run_coll_start(current_user):
         clear_screen()
         print(txt_path.read_text(encoding="utf-8"))
 
-        go_back = False
         while True:
-            confirm = input("Keep this collection list? (y/n/b to go back): ").strip().lower()
-            if confirm in ("y", "yes"):
-                print("Collection list generated. Awaiting supervisor approval.")
-                active_statuses = load_active_beat_statuses()
+            confirm = input("Keep this collection list? (y/n): ").strip().lower()
+            if confirm in ("y", "yes", "n", "no"):
                 break
-            elif confirm in ("n", "no"):
-                json_path.unlink()
-                if txt_path.exists():
-                    txt_path.unlink()
-                release_beat_lock(beat)
-                active_statuses = load_active_beat_statuses()
-                print("Collection list discarded.")
-                break
-            elif confirm == "b":
-                json_path.unlink()
-                if txt_path.exists():
-                    txt_path.unlink()
-                release_beat_lock(beat)
-                active_statuses = load_active_beat_statuses()
-                go_back = True
-                break
-            else:
-                print("Please enter 'y', 'n', or 'b'.")
+            print("Please enter 'y' or 'n'.")
 
-        if go_back:
+        if confirm in ("n", "no"):
+            cancel_staging_report(json_path, beat)
+            active_statuses = load_active_beat_statuses()
+            print("Collection list cancelled.")
             clear_screen()
             continue  # back to beat selection
 
-        break  # kept or discarded — exit outer loop
+        print("Collection list generated. Awaiting supervisor approval.")
+        active_statuses = load_active_beat_statuses()
+        break  # exit outer loop
 
     prompt_continue()
 
@@ -356,6 +338,13 @@ def run_coll_submit(current_user):
             print("\nThis report has been submitted for supervisor review. Editing is not allowed.")
             prompt_continue()
             continue
+        if report_data.get("stages", {}).get("submit") == "returned":
+            txt_path = report_path.with_suffix(".txt")
+            clear_screen()
+            display_report_for_review(report_data, txt_path)
+            print("\nRETURN REQUESTED: This submission was returned by the supervisor for correction.")
+            print("Please review the payment amounts and resubmit.")
+            report_data.setdefault("stages", {})["submit"] = "inprogress"
 
         vouchers = sorted(report_data["vouchers"], key=lambda v: bill_no_sort_key(v["bill_no"]))
         selection_type = report_data.get("selection_type", "beat")
@@ -385,6 +374,23 @@ def run_coll_submit(current_user):
             if bookmark_bill_no in bill_nos:
                 start_idx = bill_nos.index(bookmark_bill_no)
                 print(f"  Resuming from bookmarked record: {bookmark_bill_no}")
+
+        while True:
+            pre_edit = input("\nEdit (e) / Cancel (c) / Back (b): ").strip().lower()
+            if pre_edit in ("e", ""):
+                break
+            if pre_edit == "c":
+                cancel_staging_report(report_path, selection[0] if selection else None)
+                print("Collection list cancelled.")
+                prompt_continue()
+                break
+            if pre_edit == "b":
+                break
+            print("Please enter 'e', 'c', or 'b'.")
+        if pre_edit == "c":
+            continue
+        if pre_edit == "b":
+            continue
 
         print(f"\nEditing report: {report_path.name}")
         vouchers, completed, quit_idx = interactive_payment_editor(vouchers, beats, salesmen, start_idx=start_idx)
@@ -426,7 +432,7 @@ def run_coll_submit(current_user):
                 break
             print("Please enter 'y', 'n', or 'b'.")
         if save_confirm in ("n", "no", "b"):
-            print(f"Collections discarded for {report_path.name}.")
+            print(f"Changes not saved for {report_path.name}.")
             continue
 
         try:
@@ -497,9 +503,26 @@ def run_coll_post(current_user):
         else:
             print(f"  (Text report not found. Vouchers: {len(vouchers)})")
 
-        confirm = input("Ready to post these collections? (y/n/b): ").strip().lower()
-        if confirm not in ["y", "yes"]:
-            print(f"Posting skipped for {report_path.name}.")
+        do_post = False
+        while True:
+            confirm = input("Post (y) / Return (r) / Back (b): ").strip().lower()
+            if confirm in ("y", "yes"):
+                do_post = True
+                break
+            if confirm == "r":
+                report_data.setdefault("stages", {})["submit"] = "submitted"
+                try:
+                    save_report_json(report_path, report_data)
+                    print("Returned to supervisor for re-approval.")
+                except Exception as error:
+                    print(f"Failed to return report: {error}")
+                prompt_continue()
+                break
+            if confirm == "b":
+                print(f"Posting skipped for {report_path.name}.")
+                break
+            print("Please enter 'y', 'r', or 'b'.")
+        if not do_post:
             continue
 
         write_finalize_checkpoint(report_path, 1)
@@ -576,22 +599,24 @@ def run_coll_approve_start(current_user):
         display_report_for_review(report_data, txt_path)
 
         while True:
-            confirm = input("\nApprove (y) / Discard (d) / Back (b): ").strip().lower()
+            confirm = input("\nApprove (y) / Return (r) / Cancel (c) / Back (b): ").strip().lower()
             if confirm == "b":
                 break
-            if confirm == "d":
+            if confirm == "r":
                 beat_name = report_data.get("selection", [None])[0]
-                report_path.unlink()
-                if txt_path.exists():
-                    txt_path.unlink()
-                if beat_name:
-                    release_beat_lock(beat_name)
-                print("Report discarded. It must be generated again by the salesman.")
+                cancel_staging_report(report_path, beat_name)
+                print("Collection list returned — it must be regenerated by the salesman.")
+                prompt_continue()
+                return
+            if confirm == "c":
+                beat_name = report_data.get("selection", [None])[0]
+                cancel_staging_report(report_path, beat_name)
+                print("Collection list cancelled.")
                 prompt_continue()
                 return
             if confirm in ("y", "yes"):
                 break
-            print("Please enter 'y', 'd', or 'b'.")
+            print("Please enter 'y', 'r', 'c', or 'b'.")
 
         if confirm == "b":
             continue
@@ -648,21 +673,29 @@ def run_coll_approve_submit(current_user):
         clear_screen()
         display_report_for_review(report_data, txt_path)
 
-        confirm = input("\nApprove these submitted collections? (y/n/b): ").strip().lower()
-        if confirm == "b":
-            continue
-        if confirm not in ("y", "yes"):
-            print("Approval skipped.")
-            prompt_continue()
-            return
-
-        report_data.setdefault("stages", {})["submit"] = "confirmed"
-        try:
-            save_report_json(report_path, report_data)
-            print(f"Collections approved: {report_path.name}")
-        except Exception as error:
-            print(f"Failed to approve collections: {error}")
-        prompt_continue()
+        while True:
+            confirm = input("\nApprove (y) / Return (r) / Back (b): ").strip().lower()
+            if confirm == "b":
+                break
+            if confirm == "r":
+                report_data.setdefault("stages", {})["submit"] = "returned"
+                try:
+                    save_report_json(report_path, report_data)
+                    print("Collections returned to salesman for correction.")
+                except Exception as error:
+                    print(f"Failed to return collections: {error}")
+                prompt_continue()
+                return
+            if confirm in ("y", "yes"):
+                report_data.setdefault("stages", {})["submit"] = "confirmed"
+                try:
+                    save_report_json(report_path, report_data)
+                    print(f"Collections approved: {report_path.name}")
+                except Exception as error:
+                    print(f"Failed to approve collections: {error}")
+                prompt_continue()
+                return
+            print("Please enter 'y', 'r', or 'b'.")
 
 
 def run_report_salesman_pending(current_user):
@@ -894,20 +927,53 @@ def run_add_vouchers_inline(current_user):
     print("Add Vouchers - Inline")
     print("-" * 50)
 
-    session_beat = select_from_list(beats, "beat")
-    if session_beat is None:
-        return
+    # Check for pending batches created by this user
+    my_pending = [(p, d) for p, d in load_addv_pending_confirm()
+                  if d.get("created_by") == current_user.name]
+
+    resume_path = None
+    resume_data = None
+    if my_pending:
+        idx, action = prompt_pending_addv_choice(my_pending)
+        if action == "back":
+            return
+        if action == "continue":
+            resume_path, resume_data = my_pending[idx]
+
+    # Beat selection — skipped when resuming (beat already fixed by existing batch)
+    if resume_data:
+        session_beat = resume_data["vouchers"][0]["beat"]
+    else:
+        session_beat = select_from_list(beats, "beat")
+        if session_beat is None:
+            return
 
     session_salesman = current_user.name if current_user.role == 'salesman' else None
     ask_salesman = session_salesman is None
 
-    existing_bill_nos = load_all_existing_bill_nos() | load_addv_staged_bill_nos()
+    # Exclude resumed batch's own bill_nos from dedup check to avoid false conflicts
+    resumed_bill_nos = {v["bill_no"] for v in resume_data["vouchers"]} if resume_data else set()
+    existing_bill_nos = load_all_existing_bill_nos() | (load_addv_staged_bill_nos() - resumed_bill_nos)
     valid_beats = set(beats)
     valid_salesmen = set(salesmen)
     session_bill_nos = set()
-    all_vouchers = []
-    all_installments = []
     now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    # Prepopulate from resumed batch, or start fresh
+    if resume_data:
+        all_vouchers = list(resume_data["vouchers"])
+        all_installments = list(resume_data["installments"])
+        session_bill_nos = {v["bill_no"] for v in all_vouchers}
+        clear_screen()
+        print("\n" + "-" * 50)
+        print("Add Vouchers - Inline")
+        print(f"  Resuming batch from {resume_data['created_at'][:10]} — {len(all_vouchers)} voucher(s) loaded.")
+        print("-" * 50)
+        display_addv_summary(all_vouchers, all_installments)
+        input("\nPress Enter to continue adding vouchers...")
+    else:
+        all_vouchers = []
+        all_installments = []
 
     while True:
         clear_screen()
@@ -1002,15 +1068,22 @@ def run_add_vouchers_inline(current_user):
         return
 
     ensure_staging_dir()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_user = sanitize_filename_component(current_user.name)
-    json_path = STAGING_DIR / f"addv{timestamp}-{safe_user}.json"
+    if resume_path:
+        json_path = resume_path
+        original_created_at = resume_data.get("created_at", now_str)
+        original_created_by = resume_data.get("created_by", current_user.name)
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_user = sanitize_filename_component(current_user.name)
+        json_path = STAGING_DIR / f"addv{timestamp}-{safe_user}.json"
+        original_created_at = now_str
+        original_created_by = current_user.name
 
     report_data = {
         "type": "add_vouchers",
         "mode": "inline",
-        "created_by": current_user.name,
-        "created_at": now_str,
+        "created_by": original_created_by,
+        "created_at": original_created_at,
         "stage": "added",
         "stages": {"add": "done", "confirm": "", "post": ""},
         "vouchers": all_vouchers,

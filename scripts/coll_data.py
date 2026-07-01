@@ -204,6 +204,8 @@ def load_active_beat_statuses():
             label = "submit approved"
         elif stages.get("submit") in ("submitted", "inprogress"):
             label = "submit in progress"
+        elif stages.get("submit") == "returned":
+            label = "return requested"
         elif stages.get("start") == "confirmed":
             label = "start approved"
         else:

@@ -1,4 +1,4 @@
-# Collection Pipeline — State Reference
+# Collection Workflow — State Reference
 
 Each collection report is a `coll*.json` file in `staging/` (or `archive/` once finalized).
 Its state is encoded entirely in the `stages` sub-dict — the canonical single source of truth.
@@ -8,33 +8,30 @@ Its state is encoded entirely in the `stages` sub-dict — the canonical single 
 ## State diagram
 
 ```
-[Salesman]       [Supervisor/Dist.]    [Salesman]    [Supervisor/Dist.]   [Distributor]
-     |                   |                   |                 |                  |
-  coll-start         confirm-start       coll-submit      confirm-submit      coll-finalize
-     |                   |                   |                 |                  |
-     v                   v                   v                 v                  v
+[Salesman]    [Supervisor]   [Salesman]     [Supervisor]   [Distributor]
+     |               |             |               |               |
+  coll-start   approve-start  coll-submit   approve-submit   coll-post
+     |               |             |               |               |
+     v               v             v               v               v
 
-  ┌─────────┐       ┌─────────┐       ┌──────────┐      ┌──────────┐       ┌──────────┐
-  │  START  │──────▶│  START  │──────▶│  SUBMIT  │─────▶│  SUBMIT  │──────▶│ FINALIZE │──▶ archived
-  │   new   │  (y)  │confirmed│       │inprogress│      │confirmed │       │confirmed │
-  └─────────┘       └─────────┘       └──────────┘      └──────────┘       └──────────┘
-                                            │
-                                     (all paid, submit)
-                                            │
-                                      ┌──────────┐
-                                      │  SUBMIT  │
-                                      │submitted │
-                                      └──────────┘
-                                            │
-                                   [Supervisor/Dist.]
-                                      confirm-submit
-                                            │
-                                            ▼
-                                      ┌──────────┐
-                                      │  SUBMIT  │
-                                      │confirmed │
-                                      └──────────┘
+┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+│  START   │──▶│  START   │──▶│  SUBMIT  │──▶│  SUBMIT  │──▶│   POST   │──▶ archived
+│   new    │   │confirmed │   │inprogress│   │confirmed │   │confirmed │
+└──────────┘   └──────────┘   └──────────┘   └──────────┘   └──────────┘
+  (cancel)      (r) or (c)      (cancel)           │ (r)          │ (r)
+  during gen    file deleted     pre-edit           │              │
+                                               ┌────▼─────┐       │
+                                               │  SUBMIT  │◀──────┘
+                                               │submitted │  submit="submitted"
+                                               └──────────┘
+                                                    │ (r)
+                                               ┌────▼─────┐
+                                               │  SUBMIT  │
+                                               │ returned │  salesman edits or cancels
+                                               └──────────┘
 ```
+
+**Return chain:** Distributor returns → `submit="submitted"` (supervisor queue) → Supervisor returns → `submit="returned"` (salesman queue) → Salesman cancels or re-edits and resubmits.
 
 ---
 
@@ -49,8 +46,8 @@ Its state is encoded entirely in the `stages` sub-dict — the canonical single 
 | Location  | `staging/`                         |
 | UI label  | `[awaiting approval]`              |
 
-**Actor:** Salesman, supervisor, or distributor via **coll-start**.  
-**Next:** Supervisor or distributor approves (`y`) → START / confirmed, or discards (`d`) → file deleted.
+**Actor:** Salesman, supervisor, or distributor via **Generate Collection List**.  
+**Next:** Supervisor approves (`y`) → START / confirmed; or Returns (`r`) → file deleted, salesman regenerates; or Cancels (`c`) → file deleted.
 
 ---
 
@@ -61,10 +58,10 @@ Its state is encoded entirely in the `stages` sub-dict — the canonical single 
 |-----------|------------------------------------|
 | `stages`  | `{"start": "confirmed"}`           |
 | Location  | `staging/`                         |
-| UI label  | `[list approved]`                  |
+| UI label  | `[start approved]`                 |
 
-**Actor:** Supervisor or distributor via **coll-start → y** or **coll-confirm-start**.  
-**Next:** Salesman opens **coll-submit** → SUBMIT / inprogress.
+**Actor:** Supervisor or distributor via **Approve Collection List → y**.  
+**Next:** Salesman opens **Submit Collections** → SUBMIT / inprogress.
 
 ---
 
@@ -77,8 +74,8 @@ Its state is encoded entirely in the `stages` sub-dict — the canonical single 
 | Location  | `staging/`                                         |
 | UI label  | `[submit in progress]`                             |
 
-**Actor:** Salesman saved bookmark via **coll-submit → quit with save**.  
-**Next:** Salesman reopens **coll-submit** to continue → SUBMIT / submitted.
+**Actor:** Salesman saved bookmark via **Submit Collections → quit with save**.  
+**Next:** Salesman reopens **Submit Collections** to continue → SUBMIT / submitted. Or Cancels (`c`) at pre-edit prompt → file deleted, beat released.
 
 ---
 
@@ -91,53 +88,72 @@ Its state is encoded entirely in the `stages` sub-dict — the canonical single 
 | Location  | `staging/`                                         |
 | UI label  | `[submit in progress]`                             |
 
-**Actor:** Salesman via **coll-submit → complete all → submit**.  
-**Next:** Supervisor or distributor confirms via **coll-confirm-submit** → SUBMIT / confirmed.
+**Actor:** Salesman via **Submit Collections → complete all → submit**.  
+**Next:** Supervisor approves via **Approve Collections → y** → SUBMIT / confirmed; or Returns (`r`) → SUBMIT / returned.
 
 ---
 
-### 5. SUBMIT / confirmed
-> Supervisor or distributor approved the payment submission. Ready for distributor to post.
+### 5. SUBMIT / returned
+> Supervisor returned the payment submission for correction. Salesman must revise and resubmit.
+
+| Field     | Value                                               |
+|-----------|-----------------------------------------------------|
+| `stages`  | `{"start": "confirmed", "submit": "returned"}`      |
+| Location  | `staging/`                                          |
+| UI label  | `[return requested]`                                |
+
+**Actor:** Supervisor via **Approve Collections → Return (r)**.  
+**Next:** Salesman reopens **Submit Collections** → sees "RETURN REQUESTED" notice → prior payments loaded as defaults → edits → resubmits → SUBMIT / submitted. Or Cancels (`c`) at pre-edit prompt → file deleted, beat released.
+
+---
+
+### 6. SUBMIT / confirmed
+> Supervisor approved the payment submission. Ready for distributor to post.
 
 | Field     | Value                                              |
 |-----------|----------------------------------------------------|
 | `stages`  | `{"start": "confirmed", "submit": "confirmed"}`    |
 | Location  | `staging/`                                         |
-| UI label  | `[collections approved]`                           |
+| UI label  | `[submit approved]`                                |
 
-**Actor:** Supervisor or distributor via **coll-confirm-submit**.  
-**Next:** Distributor posts via **coll-finalize** → FINALIZE / confirmed → archived.
+**Actor:** Supervisor or distributor via **Approve Collections → y**.  
+**Next:** Distributor posts via **Post Collections → y** → POST / confirmed → archived. Or Returns (`r`) → SUBMIT / submitted (supervisor re-reviews).
 
 ---
 
-### 6. FINALIZE / confirmed  *(terminal)*
+### 7. POST / confirmed  *(terminal)*
 > Payments written to `vouchers.csv` and `installments.csv`. File moved to `archive/`.
 
 | Field     | Value                                                                    |
 |-----------|--------------------------------------------------------------------------|
-| `stages`  | `{"start": "confirmed", "submit": "confirmed", "finalize": "confirmed"}` |
+| `stages`  | `{"start": "confirmed", "submit": "confirmed", "post": "confirmed"}` |
 | Location  | `archive/`  (moved from `staging/`)                                      |
 | UI label  | *(not shown — no longer in staging)*                                     |
 
-**Actor:** Distributor via **coll-finalize**.  
+**Actor:** Distributor via **Post Collections → y**.  
 **Next:** None. Completed vouchers with zero balance are moved to `completed_vouchers.csv`.
 
 ---
 
 ## RBAC per action
 
-| Action              | Salesman | Supervisor | Distributor |
-|---------------------|:--------:|:----------:|:-----------:|
-| coll-start          | ✓        | ✓          | ✓           |
-| coll-confirm-start  |          | ✓          | ✓           |
-| coll-submit         | ✓        | ✓          | ✓           |
-| coll-confirm-submit |          | ✓          | ✓           |
-| coll-finalize       |          |            | ✓           |
+| Action                    | Salesman | Supervisor | Distributor |
+|---------------------------|:--------:|:----------:|:-----------:|
+| Generate Collection List  | ✓        | ✓          | ✓           |
+| Approve Collection List   |          | ✓          | ✓           |
+| Return Collection List    |          | ✓          | ✓           |
+| Cancel Collection List    | ✓ (own)  | ✓          | ✓           |
+| Submit Collections        | ✓        | ✓          | ✓           |
+| Cancel Submission         | ✓ (own)  |            |             |
+| Approve Collections       |          | ✓          | ✓           |
+| Return Collections        |          | ✓          | ✓           |
+| Post Collections          |          |            | ✓           |
+| Return to Supervisor      |          |            | ✓           |
 
 ---
 
 ## Beat lock rule
 
 Only **one active staging report per beat** is allowed at any time.  
-A beat appears non-numbered in coll-start as long as its report is in states 1–5.  
-It becomes available again only after the report reaches state 6 (archived).
+A beat appears non-numbered in Generate Collection List as long as its report is in states 1–6.  
+It becomes available again only after the report reaches state 7 (archived) or is cancelled.

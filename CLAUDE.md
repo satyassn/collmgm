@@ -2,7 +2,7 @@
 
 ## Project snapshot
 
-`collmgm` is a Windows CLI collection-management tool backed entirely by CSV files. It is built iteratively; **beta0.1 is the current released state** — the three-stage collection pipeline is complete and working.
+`collmgm` is a Windows CLI collection-management tool backed entirely by CSV files. It is built iteratively; **beta0.1 is the current released state** — the three-stage collection workflow is complete and working.
 
 Run the app: `run.bat` from the project root (launches `scripts/collmenu.py`).
 
@@ -25,38 +25,39 @@ collmenu.py          ← entry point / menu loop
 | `coll_store.py` | All path constants, CSV/JSON reads/writes | print(), input(), import other coll_* modules |
 | `coll_data.py` | Load and query master data; build report structures | print(), input() |
 | `coll_cli.py` | All terminal I/O: prompts, display, editing | direct file I/O, business logic |
-| `coll_workflow.py` | Orchestrate steps; enforce pipeline guards | own file paths (use coll_store), own terminal I/O (use coll_cli) |
+| `coll_workflow.py` | Orchestrate steps; enforce workflow guards | own file paths (use coll_store), own terminal I/O (use coll_cli) |
 | `collmenu.py` | Menu loop only | business logic |
 
 The layering is strict: `coll_store` has no upstream deps; `coll_data` imports only from `coll_store`; `coll_cli` is standalone; `coll_workflow` imports all three.
 
 ---
 
-## Collection pipeline (beta0.1)
+## Collection workflow (beta0.1)
 
-Three sequential stages per beat:
+Five sequential steps per beat:
 
-1. **coll-start** (`run_coll_start`) — select beat + salesman → generate voucher list report → write `staging/collYYYYMMDD-<beat>-<salesman>.json` + `.txt`. Stage = `step1`, all `isconfirmed = false`.
-2. **coll-submit** (`run_coll_submit`) — pick a `step1`-confirmed report → enter payment amounts in edit mode → save payments to staging JSON. Advances stage to `step2`.
-3. **coll-finalize** (`run_coll_post`) — pick a `step2`-confirmed report → batch-update `data/vouchers.csv` balances + `data/installments.csv` → move report to `archive/`.
+1. **coll-start** (`run_coll_start`) — select beat + salesman → generate voucher list → write `staging/coll*.json` + `.txt`. `stages.start = "new"`.
+2. **coll-approve-start** (`run_coll_approve_start`) — supervisor approves the list → `stages.start = "confirmed"`. Supervisor may also Return (list deleted, salesman must regenerate) or Cancel.
+3. **coll-submit** (`run_coll_submit`) — salesman enters payments → `stages.submit = "inprogress"` (mid-session) or `"submitted"` (all vouchers completed). Salesman may Cancel before editing begins.
+4. **coll-approve-submit** (`run_coll_approve_submit`) — supervisor approves payments → `stages.submit = "confirmed"`. Supervisor may Return (→ `"returned"`, salesman must revise with prior payments intact).
+5. **coll-post** (`run_coll_post`) — distributor writes to `data/vouchers.csv` + `data/installments.csv` → report archived. Distributor may Return (→ `"submitted"`, supervisor re-approves).
 
-**Beat-level pipeline guard:** only one active staging report per beat is allowed. A second `coll-start` for the same beat is blocked until the existing report is finalized or removed.
+**Beat-level workflow guard:** only one active staging report per beat is allowed. A second `coll-start` for the same beat is blocked until the existing report is posted or cancelled.
 
 ### Report JSON schema (staging)
 
 ```json
 {
-  "beat": "beat1",
-  "salesmen": ["saleman1"],
+  "selection_type": "beat_salesman",
+  "selection": ["beat1", "salesman1"],
   "date": "2026-06-20",
-  "stage": "step1",
-  "confirmations": [
-    {"stage": "step1", "isconfirmed": false},
-    {"stage": "step2", "isconfirmed": false},
-    {"stage": "step3", "isconfirmed": false}
-  ],
+  "stages": {
+    "start":  "new | confirmed",
+    "submit": " | inprogress | submitted | returned | confirmed",
+    "post":   " | confirmed"
+  },
   "vouchers": [
-    {"bill_no": "...", "voucher_date": "...", "balance": "100.00", "payment": "", "beat": "beat1", "salesman": "saleman1"}
+    {"bill_no": "...", "date": "...", "balance": "100.00", "payment": "", "payment_date": "", "beat": "beat1", "salesman": "salesman1"}
   ]
 }
 ```
@@ -92,13 +93,16 @@ These rules apply to all **user-facing strings** — menu labels, screen headers
 |---|---|---|
 | **Collection List** | The working document generated at coll-start — the voucher list a salesman takes to the field | Menu labels, screen headers, TXT/HTML file headers |
 | **Collection Report** | Analytical/summary views only | Reports sub-menu screens |
-| **Approve** | Supervisor grants sign-off to advance a pipeline stage | Replaces "Confirm" for all supervisor gatekeeping actions |
+| **Approve** | Supervisor grants sign-off to advance a workflow stage | Replaces "Confirm" for all supervisor gatekeeping actions |
 | **Post** | Distributor writes approved data to master CSV files | Replaces "Finalize" for write-to-master actions |
+| **Return** | Approver sends a report one step back for correction | Approve Collection List, Approve Collections, Post Collections prompts |
+| **Cancel** | Abandon a collection list where no prior work is lost | Generation screen, Approve Collection List, Submit Collections (salesman pre-edit) |
 
 ### Role-action pattern
 
 ```
-Salesman generates / submits  →  Supervisor approves  →  Distributor posts
+Salesman generates / submits  →  Supervisor approves / returns  →  Distributor posts / returns
+Cancel: salesman at generation, supervisor/distributor at approve-list, salesman at pre-edit submit
 ```
 
 ### Style rules
@@ -134,7 +138,7 @@ Salesman generates / submits  →  Supervisor approves  →  Distributor posts
 |---|---|
 | `roadmap.md` | Current status and planned milestones |
 | `schema.md` | Canonical CSV schemas and validation rules |
-| `iteration2.md` | Detailed spec for the implemented pipeline |
+| `pipeline.md` | Collection workflow state reference (stages, RBAC, state diagram) |
 | `agent.md` | Agent behavior guidelines (iterative development rules) |
 | `scripts/coll_store.py` | All path constants and I/O primitives |
 | `scripts/coll_data.py` | Data loading and query functions |

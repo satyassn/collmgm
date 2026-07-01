@@ -238,6 +238,15 @@ def release_beat_lock(beat_name):
     path.unlink(missing_ok=True)
 
 
+def cancel_staging_report(report_path, beat_name):
+    """Delete all staging files for a report and release its beat lock."""
+    report_path.unlink(missing_ok=True)
+    report_path.with_suffix(".txt").unlink(missing_ok=True)
+    _installments_path(report_path).unlink(missing_ok=True)
+    if beat_name:
+        release_beat_lock(beat_name)
+
+
 def _checkpoint_path():
     return STAGING_DIR / ".finalize_checkpoint.json"
 

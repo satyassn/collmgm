@@ -827,3 +827,52 @@ def display_addv_report(report_data):
         f"Post={stages.get('post','pending')}"
     )
     display_addv_summary(report_data.get("vouchers", []), report_data.get("installments", []))
+
+
+def prompt_pending_addv_choice(batches):
+    """Show pending addv batches owned by the current user and ask what to do.
+
+    batches: list of (path, data) — already filtered to this user's pending batches.
+    Returns: (index, action) where action is "continue" | "new" | "back".
+             index is None when action is "new" or "back".
+    """
+    from decimal import Decimal
+    print("\n" + "-" * 50)
+    print("Pending Voucher Batches")
+    print("-" * 50)
+
+    if len(batches) == 1:
+        _, data = batches[0]
+        display_addv_report(data)
+        print()
+        while True:
+            choice = input("Continue this batch (c) / Start New (n) / Back (b): ").strip().lower()
+            if choice == "c":
+                return 0, "continue"
+            if choice == "n":
+                return None, "new"
+            if choice == "b":
+                return None, "back"
+            print("Please enter 'c', 'n', or 'b'.")
+    else:
+        print(f"\n  You have {len(batches)} pending batch(es):\n")
+        for i, (_, data) in enumerate(batches, 1):
+            vouchers = data.get("vouchers", [])
+            beat = vouchers[0]["beat"] if vouchers else "?"
+            total = sum(Decimal(v.get("amount", "0")) for v in vouchers)
+            date = data.get("created_at", "")[:10]
+            print(f"  {i}. {date}  |  beat: {beat}  |  {len(vouchers)} voucher(s)  |  total: {total}")
+        print()
+        while True:
+            raw = input(f"Select batch to continue (1-{len(batches)}) / New (n) / Back (b): ").strip().lower()
+            if raw == "n":
+                return None, "new"
+            if raw == "b":
+                return None, "back"
+            try:
+                idx = int(raw) - 1
+                if 0 <= idx < len(batches):
+                    return idx, "continue"
+            except ValueError:
+                pass
+            print(f"Please enter a number between 1 and {len(batches)}, 'n', or 'b'.")
