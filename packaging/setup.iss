@@ -15,13 +15,13 @@
 [Setup]
 AppId={{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}
 AppName={#MyAppName}
-AppVersion={#MyAppVersion}-{#MyAppRelease}-build{#MyAppBuild}
+AppVersion={#MyAppVersion}-{#MyAppRelease}-{#MyAppBuild}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={localappdata}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=dist
-OutputBaseFilename=CollMgm-{#MyAppRelease}-Build{#MyAppBuild}-Setup
+OutputBaseFilename=CollMgm-{#MyAppRelease}-{#MyAppBuild}-Setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
@@ -45,20 +45,13 @@ Source: "..\scripts\coll_workflow.py";   DestDir: "{app}\scripts"; Flags: ignore
 Source: "..\scripts\coll_data.py";       DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "..\scripts\coll_store.py";      DestDir: "{app}\scripts"; Flags: ignoreversion
 
-; Test data (pre-seeded CSVs)
-Source: "..\data\users.csv";                    DestDir: "{app}\data"; Flags: ignoreversion
-Source: "..\data\beats.csv";                    DestDir: "{app}\data"; Flags: ignoreversion
-Source: "..\data\vouchers.csv";                 DestDir: "{app}\data"; Flags: ignoreversion
-Source: "..\data\installments.csv";             DestDir: "{app}\data"; Flags: ignoreversion
-Source: "..\data\completed_vouchers.csv";       DestDir: "{app}\data"; Flags: ignoreversion
-Source: "..\data\completed_installments.csv";   DestDir: "{app}\data"; Flags: ignoreversion
-
 ; Launcher and guide
 Source: "..\run.bat";        DestDir: "{app}"; Flags: ignoreversion
 Source: "BETA_GUIDE.txt";    DestDir: "{app}"; Flags: ignoreversion isreadme
 
 [Dirs]
-; Create staging and archive dirs so the app can write to them immediately
+; Create data dirs so the app can write to them immediately; no files shipped — customer data is never touched on upgrade
+Name: "{app}\data"
 Name: "{app}\staging"
 Name: "{app}\archive"
 Name: "{app}\prints"

@@ -5,30 +5,35 @@ RELEASE    ?= alpha
 
 ISS        := packaging/setup.iss
 DIST       := packaging/dist
-BUILD_FILE := packaging/build_number.txt
 
 .DEFAULT_GOAL := help
 
 .PHONY: help build run clean
 
 help:
-	@echo "Usage: make [target] [RELEASE=alpha]"
+	@echo "Usage: make [target] [RELEASE=alpha] [STAMP=yyyymmddhhmmss]"
 	@echo
 	@echo "  build   Build the Windows installer EXE"
 	@echo "          RELEASE=alpha (default) -- release label (alpha, beta, ...)"
-	@echo "          Build number auto-increments from $(BUILD_FILE)"
-	@echo "          Output: $(DIST)/CollMgm-<release>-Build<N>-Setup.exe"
+	@echo "          STAMP=<stamp> -- override build stamp (default: current time)"
+	@echo "          Repo is tagged build/<release>-<stamp> after a successful build"
+	@echo "          Output: $(DIST)/CollMgm-<release>-<stamp>-Setup.exe"
 	@echo "          Requires: Inno Setup 6 and packaging/python/ populated"
 	@echo "  run     Launch the app (uses system Python)"
 	@echo "  clean   Delete $(DIST)/"
+	@echo
+	@echo "To rebuild an old release:"
+	@echo "  git checkout build/<release>-<stamp>"
+	@echo "  make build RELEASE=<release> STAMP=<stamp>"
 
 build:
 	@set -e; \
-	BUILD=$$(cat $(BUILD_FILE) 2>/dev/null || echo 0); \
-	BUILD=$$((BUILD + 1)); \
-	echo $$BUILD > $(BUILD_FILE); \
-	echo Building $(RELEASE) build $$BUILD...; \
-	MSYS_NO_PATHCONV=1 "$(ISCC)" /DMyAppRelease=$(RELEASE) /DMyAppBuild=$$BUILD "$(ISS)"
+	BUILD=$$([ -n "$(STAMP)" ] && echo "$(STAMP)" || date +%Y%m%d%H%M%S); \
+	echo Building $(RELEASE) $$BUILD...; \
+	MSYS_NO_PATHCONV=1 "$(ISCC)" /DMyAppRelease=$(RELEASE) /DMyAppBuild=$$BUILD "$(ISS)"; \
+	git tag "build/$(RELEASE)-$$BUILD" 2>/dev/null \
+	  && echo "Tagged: build/$(RELEASE)-$$BUILD" \
+	  || echo "Note: tag build/$(RELEASE)-$$BUILD already exists, skipping"
 
 run:
 	python -c "import sys; sys.path.insert(0, 'scripts'); import collmenu; collmenu.main()"
