@@ -2,7 +2,7 @@
 
 ## Project snapshot
 
-`collmgm` is a Windows CLI collection-management tool backed entirely by CSV files. It is built iteratively; **beta0.1 is the current released state** — the three-stage collection workflow is complete and working.
+`collmgm` is a Windows CLI collection-management tool backed entirely by CSV files. It is built iteratively; **alpha (`CollMgm-alpha-20260701230618`) is the current released state** — the three-stage collection workflow, user login, and RBAC are all complete and working.
 
 Run the app: `run.bat` from the project root (launches `scripts/collmenu.py`).
 
@@ -124,11 +124,15 @@ Cancel: salesman at generation, supervisor/distributor at approve-list, salesman
 
 ---
 
+## Completed milestones
+
+1. **beta0.1** — Three-stage collection workflow CLI (released).
+2. **Login + RBAC** — Login at startup, role-based gates for all workflow steps (released in alpha).
+
 ## Planned next milestones (see roadmap.md for detail)
 
-1. **Login + RBAC** — authenticate at startup, gate `coll-start`/`coll-submit` to salesmen and `coll-finalize` to supervisor/distributor. `current_user` parameter stubs already exist in `coll_data.py`.
-2. **REST API layer** — FastAPI façade over `coll_data`/`coll_store`; requires splitting `coll_workflow` into pure-logic functions (no `input()`/`print()`).
-3. **Schema enhancement + SQLite migration** — add `password_hash`, `beat` ownership, customer fields; migrate storage backend at API milestone. `coll_store.py` is the clean seam for the backend swap.
+1. **REST API layer** — FastAPI façade over `coll_data`/`coll_store`; requires splitting `coll_workflow` into pure-logic functions (no `input()`/`print()`).
+2. **Schema enhancement + SQLite migration** — add `beat` ownership, customer fields; migrate storage backend at API milestone. `coll_store.py` is the clean seam for the backend swap.
 
 ---
 
