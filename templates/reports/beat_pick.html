@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Pending by Beat — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Pending by Beat</h2>
+<ul class="pick-list">
+  {% for b in beats %}
+  <li><a href="/reports/beat/{{ b }}">{{ b }}</a></li>
+  {% endfor %}
+</ul>
+<a class="btn btn-secondary" href="/reports">Back</a>
+{% endblock %}

@@ -14,9 +14,11 @@ env/
 
 # Project data folders
 # data/
+data/collmgm.db
 staging/
 archive/
 packaging/python/
+packaging/nssm/
 #packaging/
 prints/
 

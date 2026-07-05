@@ -5,7 +5,6 @@ Reads master CSVs and staging JSON files. No print() or input() calls.
 Imports only from coll_store. current_user parameter is reserved for future RBAC.
 """
 
-import csv
 import json
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -13,6 +12,8 @@ from decimal import Decimal, InvalidOperation
 from coll_store import (
     DATA_DIR, STAGING_DIR, load_vouchers_raw, bill_no_sort_key,
     _load_pending_start_reports, _load_pending_submit_reports,
+    load_beats_raw, load_users_raw,
+    load_installments_for_bill, load_completed_voucher,
 )
 
 NUMOF_TOP_AGED_VOUCHERS = 10
@@ -20,52 +21,34 @@ NUMOF_TOP_AMOUNT_VOUCHERS = 10
 
 
 def load_beats(current_user=None):
-    """Return list of beat names from beats.csv.
+    """Return list of beat names from the beats table.
 
-    For salesman role, returns only beats assigned to that salesman in beats.csv.
+    For salesman role, returns only beats assigned to that salesman
+    (beats.salesman column).
     """
-    beats_file = DATA_DIR / "beats.csv"
-    if not beats_file.exists():
-        raise FileNotFoundError(f"Missing beats file: {beats_file}")
-
-    beats = []
-    with beats_file.open(newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            name = row.get("name", "").strip()
-            if not name:
-                continue
-            if current_user and current_user.role == 'salesman':
-                if row.get("salesman", "").strip() != current_user.name:
-                    continue
-            beats.append(name)
-
+    rows = load_beats_raw()
+    if current_user and current_user.role == 'salesman':
+        beats = [r["name"] for r in rows
+                 if r.get("name", "").strip() and r.get("salesman", "").strip() == current_user.name]
+    else:
+        beats = [r["name"] for r in rows if r.get("name", "").strip()]
     if not beats:
-        raise ValueError("No beats found in data/beats.csv.")
+        raise ValueError("No beats found in database.")
     return beats
 
 
 def load_salesmen(current_user=None):
-    """Return list of salesman names from users.csv.
+    """Return list of salesman names from the users table.
 
     For salesman role, returns only the current user's own name.
     """
     if current_user and current_user.role == 'salesman':
         return [current_user.name]
 
-    salesmen = []
-    users_file = DATA_DIR / "users.csv"
-    if not users_file.exists():
-        raise FileNotFoundError(f"Missing users file: {users_file}")
-
-    with users_file.open(newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            role = row.get("role", "").strip().lower()
-            name = row.get("name", "").strip()
-            if role == "salesman" and name:
-                salesmen.append(name)
-
+    rows = load_users_raw()
+    salesmen = [r["name"] for r in rows if r.get("role", "").strip().lower() == "salesman" and r.get("name", "").strip()]
     if not salesmen:
-        raise ValueError("No salesmen found in data/users.csv.")
+        raise ValueError("No salesmen found in database.")
     return salesmen
 
 
@@ -357,60 +340,22 @@ def query_pending_by_amount(limit, current_user=None):
     return top, len(pending)
 
 
-def _read_installments_for_bill(bill_no, inst_file):
-    """Read installment rows matching bill_no from a CSV file."""
-    if not inst_file.exists():
-        return []
-    rows = []
-    with inst_file.open(newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row.get("bill_no", "").strip() == bill_no:
-                rows.append(row)
-    return rows
-
-
 def search_voucher(bill_no):
     """Search active and completed vouchers by bill_no.
 
     Returns (voucher_dict, [installment_dicts], is_completed) or None if not found.
-    Installment dicts use flexible keys — callers should use .get() with fallbacks.
     """
     bill_no = bill_no.strip()
 
-    # Search active vouchers first
     for row in load_vouchers_raw():
         if row.get("bill_no", "").strip() == bill_no:
-            voucher = {
-                "bill_no": row.get("bill_no", "").strip(),
-                "date": row.get("date", "").strip(),
-                "amount": row.get("amount", "").strip(),
-                "balance": row.get("balance", "").strip(),
-                "beat": row.get("beat", "").strip(),
-                "salesman": row.get("salesman", "").strip(),
-            }
-            installments = _read_installments_for_bill(bill_no, DATA_DIR / "installments.csv")
-            return voucher, installments, False
+            voucher = {k: row.get(k, "").strip() for k in ("bill_no", "date", "amount", "balance", "beat", "salesman")}
+            return voucher, load_installments_for_bill(bill_no, completed=False), False
 
-    # Search completed vouchers
-    completed_file = DATA_DIR / "completed_vouchers.csv"
-    if completed_file.exists():
-        with completed_file.open(newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if row.get("bill_no", "").strip() == bill_no:
-                    voucher = {
-                        "bill_no": row.get("bill_no", "").strip(),
-                        "date": row.get("date", "").strip(),
-                        "amount": row.get("amount", "").strip(),
-                        "balance": row.get("balance", "").strip(),
-                        "beat": row.get("beat", "").strip(),
-                        "salesman": row.get("salesman", "").strip(),
-                    }
-                    installments = _read_installments_for_bill(
-                        bill_no, DATA_DIR / "completed_installments.csv"
-                    )
-                    return voucher, installments, True
+    row = load_completed_voucher(bill_no)
+    if row:
+        voucher = {k: row.get(k, "").strip() for k in ("bill_no", "date", "amount", "balance", "beat", "salesman")}
+        return voucher, load_installments_for_bill(bill_no, completed=True), True
 
     return None
 

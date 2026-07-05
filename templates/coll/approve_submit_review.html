@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Approve Collections — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Approve Collections</h2>
+<p class="meta-line"><strong>Beat:</strong> {{ beat }} &nbsp;|&nbsp; <strong>Salesman:</strong> {{ salesman }}</p>
+
+<div class="summary-box">
+  <span>{{ paid_count }} vouchers collected</span>
+  <span class="summary-total">Total: <strong>{{ total_collected }}</strong></span>
+</div>
+
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>Bill No</th>
+      <th>Voucher Date</th>
+      <th class="num">Balance</th>
+      <th class="num">Payment</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for v in vouchers %}
+    <tr{% if v.get("payment") %} class="has-payment"{% endif %}>
+      <td class="mono">{{ v.bill_no }}</td>
+      <td>{{ v.get("voucher_date","") }}</td>
+      <td class="num mono">{{ v.balance }}</td>
+      <td class="num mono{% if not v.get('payment') %} muted{% endif %}">{{ v.get("payment","") or "—" }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+  <tfoot>
+    <tr>
+      <td colspan="3"><strong>Total collected</strong></td>
+      <td class="num mono"><strong>{{ total_collected }}</strong></td>
+    </tr>
+  </tfoot>
+</table>
+
+<form method="post" action="/coll/approve-submit/{{ stem }}" class="action-row">
+  <button type="submit" name="action" value="approve" class="btn btn-primary">Approve</button>
+  <button type="submit" name="action" value="return" class="btn btn-warning"
+          onclick="return confirm('Return to salesman for revision?')">Return</button>
+  <a class="btn btn-secondary" href="/coll/approve-submit">Back</a>
+</form>
+{% endblock %}

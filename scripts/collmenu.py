@@ -6,7 +6,7 @@ Role-based menu items are driven by data/permissions.csv (loaded on each login).
 ACTION_REGISTRY maps action keys to display labels and workflow handlers.
 """
 
-from coll_store import load_permissions
+from coll_store import load_permissions, ensure_db
 from coll_cli import display_main_menu, get_menu_choice, build_role_menu
 from coll_workflow import (
     run_login,
@@ -35,6 +35,7 @@ ACTION_REGISTRY = [
 
 
 def main():
+    ensure_db()
     while True:
         current_user = run_login()
         permissions = load_permissions()

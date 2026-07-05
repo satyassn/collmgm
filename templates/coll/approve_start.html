@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Approve Collection List — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Approve Collection List</h2>
+
+{% if not reports %}
+  <p class="empty-state">No collection lists awaiting approval.</p>
+  <a class="btn btn-secondary" href="/menu">Back to Menu</a>
+{% else %}
+  <ul class="report-list">
+    {% for r in reports %}
+    <li class="report-item">
+      <span class="report-label">{{ r.label }}</span>
+      <span class="report-meta">{{ r.data.get("date", "") }}</span>
+      <a class="btn btn-sm btn-primary" href="/coll/approve-start/{{ r.stem }}">Review</a>
+    </li>
+    {% endfor %}
+  </ul>
+  <a class="btn btn-secondary" href="/menu">Back to Menu</a>
+{% endif %}
+{% endblock %}

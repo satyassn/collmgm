@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Oldest Vouchers — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Oldest Vouchers</h2>
+<p class="meta-line">Showing {{ vouchers|length }} oldest of {{ total_count }} pending vouchers</p>
+
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>Bill No</th>
+      <th>Date</th>
+      <th class="num">Age (days)</th>
+      <th class="num">Balance</th>
+      <th>Beat</th>
+      <th>Salesman</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for v in vouchers %}
+    <tr>
+      <td class="mono">{{ v.bill_no }}</td>
+      <td>{{ v.date }}</td>
+      <td class="num">{{ v.age }}</td>
+      <td class="num mono">{{ v.balance }}</td>
+      <td>{{ v.beat }}</td>
+      <td>{{ v.salesman }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<a class="btn btn-secondary" href="/reports">Back</a>
+{% endblock %}

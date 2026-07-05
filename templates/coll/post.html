@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Post Collections — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Post Collections</h2>
+
+{% if stale_checkpoint %}
+  <div class="alert alert-warn">
+    A previous post was interrupted at step {{ stale_checkpoint.get("step","?") }}.
+    Verify data before retrying. The affected report: <code>{{ stale_checkpoint.get("report","") }}</code>
+  </div>
+{% endif %}
+
+{% if not reports %}
+  <p class="empty-state">No approved collections ready to post.</p>
+  <a class="btn btn-secondary" href="/menu">Back to Menu</a>
+{% else %}
+  <ul class="report-list">
+    {% for stem, label, data in reports %}
+    <li class="report-item">
+      <span class="report-label">{{ label }}</span>
+      <span class="report-meta">{{ data.get("date","") }}</span>
+      <a class="btn btn-sm btn-primary" href="/coll/post/{{ stem }}">Review & Post</a>
+    </li>
+    {% endfor %}
+  </ul>
+  <a class="btn btn-secondary" href="/menu">Back to Menu</a>
+{% endif %}
+{% endblock %}

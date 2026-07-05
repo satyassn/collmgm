@@ -11,9 +11,11 @@ Run the app: `run.bat` from the project root (launches `scripts/collmenu.py`).
 ## Architecture
 
 ```
-collmenu.py          ← entry point / menu loop
-    └── coll_workflow.py   ← orchestration (no I/O side-effects, calls ui + store + data)
-            ├── coll_cli.py       ← all print()/input() calls live here
+collmenu.py          ← CLI entry point / menu loop
+    └── coll_workflow.py   ← CLI prompt/display loops (calls coll_cli + coll_orchestrate)
+coll_api.py           ← Web entry point (FastAPI routes; calls coll_orchestrate directly)
+    └── coll_orchestrate.py ← shared pure stage-transition logic (used by BOTH coll_workflow.py and coll_api.py)
+            ├── coll_cli.py       ← all print()/input() calls live here (coll_workflow only)
             ├── coll_data.py     ← query layer: reads CSVs + staging JSON, pure logic
             └── coll_store.py    ← persistence layer: paths, CSV/JSON reads and writes
 ```
@@ -24,11 +26,13 @@ collmenu.py          ← entry point / menu loop
 |---|---|---|
 | `coll_store.py` | All path constants, CSV/JSON reads/writes | print(), input(), import other coll_* modules |
 | `coll_data.py` | Load and query master data; build report structures | print(), input() |
+| `coll_orchestrate.py` | Shared, I/O-agnostic stage-transition logic for the 5-stage workflow (coll-start → coll-post), used by both `coll_workflow.py` and `coll_api.py` so the CLI and web app cannot drift | print(), input(), import `coll_cli` |
 | `coll_cli.py` | All terminal I/O: prompts, display, editing | direct file I/O, business logic |
-| `coll_workflow.py` | Orchestrate steps; enforce workflow guards | own file paths (use coll_store), own terminal I/O (use coll_cli) |
+| `coll_workflow.py` | CLI orchestration loops; enforce workflow guards | own file paths (use coll_store), own terminal I/O (use coll_cli), duplicate logic that belongs in `coll_orchestrate.py` |
+| `coll_api.py` | Web (FastAPI) routes; session/cookie auth, permission checks, template rendering | duplicate stage-transition logic (use `coll_orchestrate.py`) |
 | `collmenu.py` | Menu loop only | business logic |
 
-The layering is strict: `coll_store` has no upstream deps; `coll_data` imports only from `coll_store`; `coll_cli` is standalone; `coll_workflow` imports all three.
+The layering is strict: `coll_store` has no upstream deps; `coll_data` imports only from `coll_store`; `coll_cli` is standalone; `coll_orchestrate` imports only `coll_store`/`coll_data` (never `coll_cli`); `coll_workflow` and `coll_api` both import `coll_orchestrate` (plus `coll_data`/`coll_store` for queries) — `coll_workflow` additionally imports `coll_cli`.
 
 ---
 
@@ -131,8 +135,11 @@ Cancel: salesman at generation, supervisor/distributor at approve-list, salesman
 
 ## Planned next milestones (see roadmap.md for detail)
 
-1. **REST API layer** — FastAPI façade over `coll_data`/`coll_store`; requires splitting `coll_workflow` into pure-logic functions (no `input()`/`print()`).
-2. **Schema enhancement + SQLite migration** — add `beat` ownership, customer fields; migrate storage backend at API milestone. `coll_store.py` is the clean seam for the backend swap.
+**LAN Web App** — browser-based access over the local network, PWA home-screen icon, no client install. Three sub-milestones in order:
+
+1. **SQLite migration** — swap `coll_store.py` backend to SQLite using the existing schema unchanged. Required for concurrent LAN access. Schema enhancements deferred.
+2. **FastAPI + HTMX web UI** — refactor `coll_workflow.py` into pure logic; add `coll_api.py` (FastAPI, cookie auth); add `templates/` (Jinja2 + HTMX, mobile-responsive, role-based); PWA manifest + `zeroconf` for `collmgm.local` hostname.
+3. **Windows Service packaging** — NSSM wraps Uvicorn as auto-start service; firewall rule for LAN port; updated Inno Setup installer.
 
 ---
 

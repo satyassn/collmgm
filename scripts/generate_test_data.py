@@ -2,7 +2,11 @@
 """
 Test data generator for collmgm POC.
 
-Generates vouchers and installments.
+Generates vouchers and installments and writes them into the SQLite database
+(data/collmgm.db) via coll_store — the same backend the app reads from.
+Each run fully resets and regenerates the vouchers/installments/completed_*
+tables (users, beats, and permissions are left untouched).
+
 - Vouchers: For a given salesman generate 10-15 vouchers per beat per visit.
     Each beat repeats after BEATINTERVAL. Use --visits to control how many
     times each beat is visited (default 1, giving 10-15 vouchers per salesman/beat).
@@ -17,7 +21,7 @@ Usage:
   --months: Number of months to generate data for. Default: 6
   --visits: Max beat visits per salesman per beat. Default: 1
   --seed: Random seed for reproducible results. Default: 42
-  --preview: Print sample rows without writing to files.
+  --preview: Print sample rows without writing to the database.
   --help: Show this help message.
 
 Examples:
@@ -27,14 +31,13 @@ Examples:
   python scripts/generate_test_data.py --preview  # Print sample rows without writing
 """
 
-import csv
 import sys
 from datetime import datetime, timedelta
 import random
 from decimal import Decimal
 
-from coll_store import DATA_DIR
-from coll_data import load_beats, load_salesmen
+from coll_store import ensure_db, load_beats_raw, reset_test_data_tables, write_new_vouchers, write_new_installments
+from coll_data import load_salesmen
 
 BEATINTERVAL = 14  # days
 
@@ -47,7 +50,7 @@ Options:
   --months N          Number of months to generate. Default: 6
   --visits N          Max beat visits per salesman per beat. Default: 1
   --seed S            Random seed for reproducible results. Default: 42
-  --preview           Print sample rows without writing to files.
+  --preview           Print sample rows without writing to the database.
   -h, --help          Show this help message.
 
 Examples:
@@ -95,14 +98,8 @@ def parse_args():
 
 
 def _read_beats_with_salesman():
-    """Return dict[beat_name -> salesman] from beats.csv."""
-    beats_file = DATA_DIR / "beats.csv"
-    beats = {}
-    with beats_file.open(newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            beats[row['name']] = row.get('salesman', '')
-    return beats
+    """Return dict[beat_name -> salesman] from the beats table."""
+    return {row["name"]: row.get("salesman", "") for row in load_beats_raw()}
 
 
 def generate_data(start_date, end_date, beats_map, salesmen, max_visits=1):
@@ -182,6 +179,8 @@ def generate_data(start_date, end_date, beats_map, salesmen, max_visits=1):
 def main():
     start_date_str, months, max_visits, seed, preview = parse_args()
 
+    ensure_db()
+
     random.seed(seed)
     start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
     end_date = start_date + timedelta(days=int(30 * months))
@@ -232,28 +231,15 @@ def main():
         print(f'\nWould generate {len(vouchers)} vouchers, {len(installments)} installments (visits={max_visits})')
         return
 
-    # Write to CSV
-    vouchers_file = DATA_DIR / 'vouchers.csv'
-    with vouchers_file.open('w', newline='') as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=['bill_no', 'date', 'amount', 'balance', 'beat', 'salesman', 'created_by', 'created_at']
-        )
-        writer.writeheader()
-        writer.writerows(vouchers)
-
-    installments_file = DATA_DIR / 'installments.csv'
-    with installments_file.open('w', newline='') as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=['bill_no', 'date', 'amount', 'salesman', 'created_by', 'created_at']
-        )
-        writer.writeheader()
-        writer.writerows(installments)
+    # Full reset + regenerate, matching this script's long-standing semantics
+    # (previously: CSVs opened in 'w' mode; now: the equivalent DB tables).
+    reset_test_data_tables()
+    write_new_vouchers(vouchers)
+    write_new_installments(installments)
 
     print(f'Generated {len(vouchers)} vouchers and {len(installments)} installments (visits={max_visits})')
     print(f'  Date range: {start_date} to {end_date}')
-    print(f'  Wrote to {vouchers_file} and {installments_file}')
+    print('  Wrote to data/collmgm.db (vouchers, installments tables)')
 
 
 if __name__ == '__main__':

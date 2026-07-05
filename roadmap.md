@@ -29,51 +29,66 @@ Builds on beta0.1 and adds authenticated access with role-based workflow gates.
 
 ## Planned
 
-### REST API layer (for GUI / advanced CLI)
+### LAN Web App
 
-**Goal:** Expose the collection workflow as a REST API so a web GUI, mobile client, or a richer CLI (e.g. Textual/Rich TUI) can be built on top without re-implementing business logic.
+**Goal:** Browser-based access over the local network — no internet, no client install, works on desktop and mobile. Users get a home-screen icon (PWA) and a friendly hostname; the server runs as a Windows Service on the distributor's PC.
 
-**Design sketch:**
-- Add a thin HTTP layer (FastAPI recommended — minimal boilerplate, auto OpenAPI docs) over the existing `coll_data` / `coll_store` modules
-- The current architecture is already well-suited: `coll_data` and `coll_store` have no I/O side-effects and can be called directly from API handlers
-- `coll_workflow.py` will need to be split into pure-logic functions (no `input()`/`print()`) that both the CLI and the API can call
-- Suggested endpoints:
-  - `GET  /beats` — list beats with pending summary
-  - `GET  /reports` — list active staging reports and their stage/status
-  - `POST /collections/start` — create and confirm a start report for a beat
-  - `POST /collections/submit` — submit payment entries for a report
-  - `POST /collections/post` — post and archive a submitted report
-  - `GET  /reports/{id}/vouchers` — voucher list for a report
-- Authentication: session token or API key (reuses RBAC role definitions from alpha)
-- Stateless: staging files on disk remain the source of truth; API is a façade
+**Decided stack:**
 
-**Dependency:** RBAC is complete (alpha) — the API auth model should reuse the same role definitions.
+| Layer | Technology | Reason |
+|---|---|---|
+| Backend | FastAPI + Uvicorn | Minimal Python, auto OpenAPI docs, async-ready |
+| Frontend | Jinja2 templates + HTMX | Server-rendered HTML, no JS framework, mobile-responsive |
+| PWA | `manifest.json` + service worker | Home-screen icon on Android/iOS — no app store |
+| LAN hostname | `zeroconf` → `collmgm.local` | Friendly mDNS name avoids raw IP; iOS/Android browsers support it natively |
+| Database | SQLite (`sqlite3`, stdlib) | Concurrent multi-user writes; CSV cannot handle LAN concurrency |
+| Windows Service | NSSM wraps Uvicorn | Auto-starts on boot, no user login required |
+| Client | Chrome (Android) / Safari (iOS) | Zero install; "Add to Home Screen" once, tap icon forever |
 
-**Files affected:** new `api/` package or `scripts/coll_api.py`; `coll_workflow.py` refactored to separate pure logic from CLI I/O
+**First-time device setup (one-off per phone):**
+1. Open browser → `http://collmgm.local:8100`
+2. Browser menu → Add to Home Screen
+3. Tap the icon from now on
 
 ---
 
-### Schema Enhancement
+#### Sub-milestone 1 — SQLite migration
 
-**Goal:** Enrich the data model with fields needed for production use and decide whether CSV files remain the storage backend or are replaced by a database.
+Replaces CSV files with SQLite. `coll_store.py` is the only layer that changes; all code above it is unaffected.
 
-**Fields to add (candidate list — confirm before implementation):**
+- New `coll_store_sqlite.py` implementing the same interface as `coll_store.py`
+- One-time migration script: CSV → SQLite on first run, preserving the existing schema exactly
+- Staging reports remain as JSON files (no change to staging layer)
+- All existing tests still pass — store abstraction shields them
+- Schema enhancements (new fields on users, beats, vouchers, installments) are deferred to a later milestone
 
-| File | Candidate fields | Reason |
-|------|-----------------|--------|
-| `users.csv` | `beat` (assigned beat for salesmen), `active` | Beat ownership enforcement, soft-delete |
-| `beats.csv` | `cp` (collection point / zone), `salesman` (default assigned salesman) | Multi-CP support, beat→salesman mapping |
-| `vouchers.csv` | `customer_name`, `customer_id`, `party_code`, `due_date` | Customer traceability, overdue tracking |
-| `installments.csv` | `collection_date` (separate from voucher date), `collected_by`, `verified_by` | Audit trail, who collected vs who verified |
+**Files:** `scripts/coll_store_sqlite.py` (new), `scripts/migrate_csv_to_sqlite.py` (new), `schema.md` (updated), `generate_test_data.py` (updated)
 
-**Storage decision — CSV vs Database:**
+---
 
-| | CSV (keep) | SQLite / PostgreSQL |
-|--|-----------|---------------------|
-| Pros | Zero dependencies, human-readable, git-diffable, simple backup | Referential integrity, concurrent access, query flexibility, indexing |
-| Cons | No transactions, no foreign keys, full-file rewrites on update, fragile under concurrency | Adds a runtime dependency, harder to inspect raw data |
-| Best for | Single-user CLI POC, offline-first, small data | Multi-user, REST API, scale |
+#### Sub-milestone 2 — FastAPI backend + HTMX web UI
 
-**Recommendation:** Migrate to **SQLite** when the REST API milestone begins — it is file-based (no server), already ships with Python (`sqlite3`), supports transactions (critical for the post batch update), and the `coll_store.py` I/O layer provides a clean seam to swap backends without touching workflow or UI code. CSV can remain as an import/export format.
+Splits `coll_workflow.py` into pure logic and adds the web layer. CLI continues to work unchanged.
 
-**Files affected:** `coll_store.py` (backend swap), `schema.md` (updated field specs), `generate_test_data.py` (updated seed logic)
+- Refactor `coll_workflow.py`: strip all `input()`/`print()` into pure functions; `coll_cli.py` and the API both call the same functions
+- New `scripts/coll_api.py`: FastAPI app, cookie-based session auth, endpoints mirror the CLI workflow steps
+- New `templates/` directory: Jinja2 + HTMX screens for login, menu, all workflow steps, reports
+- Role-based UI: each role sees only their actions (salesman → submit, supervisor → approve, distributor → post)
+- PWA assets: `static/manifest.json`, `static/sw.js`, app icons
+- `zeroconf` broadcasts `collmgm.local` on LAN startup
+
+**Files:** `scripts/coll_api.py` (new), `templates/` (new), `static/` (new), `scripts/coll_workflow.py` (refactored)
+
+---
+
+#### Sub-milestone 3 — Windows Service packaging
+
+Extends the existing installer to register and manage the web server as a Windows Service.
+
+- Bundle NSSM in the installer
+- Installer registers `collmgm-server` service: `nssm install collmgm-server uvicorn scripts.coll_api:app --host 0.0.0.0 --port 8100`
+- Adds Windows Firewall inbound rule for port 8100 (LAN only)
+- Installer upgrade-safe: service is stopped before upgrade, restarted after
+- Updated Inno Setup script
+
+**Files:** `installer/collmgm.iss` (updated), `installer/nssm.exe` (bundled)

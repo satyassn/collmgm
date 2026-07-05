@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#1a56db">
+  <link rel="manifest" href="/static/manifest.json">
+  <link rel="stylesheet" href="/static/style.css">
+  <title>Login — CollMgm</title>
+</head>
+<body class="login-body">
+  <div class="login-card">
+    <h1 class="login-title">CollMgm</h1>
+    {% if error %}
+      <p class="alert alert-error">{{ error }}</p>
+    {% endif %}
+    <form method="post" action="/login">
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" autocomplete="username"
+             autocapitalize="off" autofocus required>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <button type="submit" class="btn btn-primary btn-full">Sign in</button>
+    </form>
+  </div>
+</body>
+</html>

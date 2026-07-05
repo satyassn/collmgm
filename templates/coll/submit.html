@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Submit Collections — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Submit Collections</h2>
+
+{% if not reports %}
+  <p class="empty-state">No approved collection lists to submit.</p>
+  <a class="btn btn-secondary" href="/menu">Back to Menu</a>
+{% else %}
+  <ul class="report-list">
+    {% for r in reports %}
+    <li class="report-item">
+      <span class="report-label">{{ r.label }}</span>
+      <span class="report-meta">
+        {% set stage_submit = r.data.get("stages", {}).get("submit","") %}
+        {% if stage_submit == "returned" %}
+          <span class="badge badge-warn">Returned</span>
+        {% elif stage_submit == "inprogress" %}
+          <span class="badge badge-info">In Progress</span>
+        {% endif %}
+      </span>
+      <a class="btn btn-sm btn-primary" href="/coll/submit/{{ r.stem }}">Enter Payments</a>
+    </li>
+    {% endfor %}
+  </ul>
+  <a class="btn btn-secondary" href="/menu">Back to Menu</a>
+{% endif %}
+{% endblock %}
