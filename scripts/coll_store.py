@@ -388,6 +388,35 @@ def load_all_existing_bill_nos():
     return {r["bill_no"] for r in rows}
 
 
+def load_vouchers_by_bill_nos(bill_nos):
+    """Return dict[bill_no -> voucher row dict] for the given bill_nos.
+
+    Queries the vouchers table in chunks of 500 to stay under SQLite's
+    parameter limit. Missing bill_nos are simply absent from the result;
+    returns {} when the DB file is missing, so callers report every
+    voucher as not found.
+    """
+    unique = sorted({b for b in bill_nos if b})
+    if not unique or not _db_path().exists():
+        return {}
+    result = {}
+    conn = get_db()
+    try:
+        for i in range(0, len(unique), 500):
+            chunk = unique[i:i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                "SELECT bill_no, date, amount, balance, beat, salesman"
+                f" FROM vouchers WHERE bill_no IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for r in rows:
+                result[r["bill_no"]] = dict(r)
+    finally:
+        conn.close()
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Master data writes (SQLite)
 # ---------------------------------------------------------------------------

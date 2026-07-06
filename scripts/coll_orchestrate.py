@@ -17,7 +17,7 @@ from typing import Literal, NamedTuple, Optional
 from coll_data import _find_any_active_beat_report
 from coll_store import (
     STAGING_DIR,
-    parse_decimal,
+    parse_decimal, load_vouchers_by_bill_nos,
     save_report_json, load_report_json, write_collection_text, bill_no_sort_key,
     ensure_staging_dir, sanitize_filename_component,
     acquire_beat_lock, release_beat_lock, cancel_staging_report,
@@ -39,8 +39,10 @@ class StageError(ValueError):
 
 
 class ValidationError(ValueError):
-    """A report carries payment data that fails validation (non-numeric,
-    negative, or exceeding the voucher balance).
+    """A report fails validation against current master data: malformed
+    voucher entries, payments that are non-numeric/negative/exceeding the
+    voucher's current master balance, vouchers missing from master, or
+    beat/salesman mismatches.
 
     Raised at approval so bad data staged by an older/unvalidated client is
     stopped at the supervisor gate instead of flowing on toward the master
@@ -83,9 +85,10 @@ def apply_submit_approval(report_path, report_data, action: Literal["approve", "
     'approve' -> stages.submit = 'confirmed' (ready to post).
     'return'  -> stages.submit = 'returned' (salesman must revise).
     Requires stages.submit == 'submitted' (StageError otherwise). Approving
-    also re-validates every payment (ValidationError otherwise) so bad data
-    staged by an unvalidated client stops at the supervisor gate — 'return'
-    is deliberately exempt, since returning is the remedy for bad data.
+    also re-validates the whole report against current master data
+    (ValidationError otherwise) so bad or stale staged data stops at the
+    supervisor gate — 'return' is deliberately exempt, since returning is
+    the remedy for bad data.
     Persists report_data via save_report_json; raises on I/O failure —
     caller decides how to surface it (print vs error.html).
     """
@@ -93,10 +96,10 @@ def apply_submit_approval(report_path, report_data, action: Literal["approve", "
     _require_stage(report_data, stages.get("submit") == "submitted",
                    "approved" if action == "approve" else "returned")
     if action == "approve":
-        errors = validate_report_payments(report_data.get("vouchers", []))
+        errors = validate_staged_report(report_data)
         if errors:
             raise ValidationError(
-                "Cannot approve — invalid payments: " + "; ".join(errors)
+                "Cannot approve — report failed validation: " + "; ".join(errors)
                 + ". Return the report to the salesman for correction.")
     report_data.setdefault("stages", {})["submit"] = "confirmed" if action == "approve" else "returned"
     save_report_json(report_path, report_data)
@@ -275,19 +278,66 @@ def record_submit_payments(report_path, report_data, vouchers, submit_for_review
     return report_data
 
 
-def validate_report_payments(vouchers):
-    """Run validate_payment over every voucher in a report.
+def validate_staged_report(report_data):
+    """Cross-check a staged coll report against CURRENT master data.
 
-    Returns a list of 'bill_no: reason' strings (empty when all payments are
-    valid). Used as a defense-in-depth re-check at approve and post time —
-    entry-time validation can be bypassed by an older client or by data
-    staged before validation existed.
+    Returns a list of error strings (empty = valid). Defense against a
+    hand-edited or stale staging JSON: the staged voucher list must be a
+    list of dicts each carrying a non-empty bill_no with balance/payment
+    keys; every voucher must still exist in the master vouchers table;
+    staged beat/salesman must match both the master row and the report
+    selection; each payment must validate against the master row's
+    CURRENT balance — not the staged copy of the balance; payment_date,
+    when set, must be ISO YYYY-MM-DD and not in the future. A master
+    balance that fails to parse is itself an error (never skipped).
+    Used at approve and post time — entry-time validation can be bypassed
+    by an older client or by data staged before validation existed.
     """
+    vouchers = report_data.get("vouchers")
+    if not isinstance(vouchers, list):
+        return ["report: 'vouchers' is not a list"]
+
     errors = []
-    for v in vouchers:
-        _, reason = validate_payment(v.get("payment"), v.get("balance"))
+    well_formed = []
+    for idx, v in enumerate(vouchers, start=1):
+        if (not isinstance(v, dict) or not isinstance(v.get("bill_no"), str)
+                or not v["bill_no"].strip() or "balance" not in v or "payment" not in v):
+            errors.append(f"entry {idx}: malformed voucher")
+        else:
+            well_formed.append(v)
+
+    seen = set()
+    for v in well_formed:
+        if v["bill_no"] in seen:
+            errors.append(f"{v['bill_no']}: appears more than once in the report")
+        seen.add(v["bill_no"])
+
+    sel = report_data.get("selection", [])
+    check_selection = report_data.get("selection_type") == "beat_salesman" and len(sel) >= 2
+    master = load_vouchers_by_bill_nos([v["bill_no"] for v in well_formed])
+    today = datetime.now().date()
+
+    for v in well_formed:
+        bill_no = v["bill_no"]
+        row = master.get(bill_no)
+        if row is None:
+            errors.append(f"{bill_no}: not found in master vouchers (deleted or already settled)")
+            continue
+        if check_selection:
+            expected = (sel[0], sel[1])
+            if ((v.get("beat"), v.get("salesman")) != expected
+                    or (row["beat"], row["salesman"]) != expected):
+                errors.append(f"{bill_no}: beat/salesman mismatch with master")
+        _, reason = validate_payment(v.get("payment"), row["balance"])
         if reason:
-            errors.append(f"{v.get('bill_no', '?')}: {reason}")
+            errors.append(f"{bill_no}: {reason}")
+        payment_date = (v.get("payment_date") or "").strip()
+        if payment_date:
+            try:
+                if datetime.strptime(payment_date, "%Y-%m-%d").date() > today:
+                    errors.append(f"{bill_no}: payment date '{payment_date}' is in the future")
+            except ValueError:
+                errors.append(f"{bill_no}: invalid payment date '{payment_date}'")
     return errors
 
 
@@ -385,10 +435,10 @@ def _post_claimed_report(report_path, posted_by):
                            "Report is not approved for posting — supervisor approval is required first.",
                            None, [], Decimal("0"), 0)
 
-    payment_errors = validate_report_payments(report_data.get("vouchers", []))
-    if payment_errors:
+    validation_errors = validate_staged_report(report_data)
+    if validation_errors:
         return PostOutcome(False, None,
-                           "Cannot post — invalid payments: " + "; ".join(payment_errors)
+                           "Cannot post — report failed validation: " + "; ".join(validation_errors)
                            + ". Return the report for correction.",
                            None, [], Decimal("0"), 0)
 
