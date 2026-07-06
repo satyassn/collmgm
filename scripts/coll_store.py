@@ -33,6 +33,20 @@ _PRINT_PAGE_HEIGHT = 66
 _PRINT_FILE_HEADER_LINES = 3
 
 
+def parse_decimal(value, default=Decimal("0")):
+    """Lenient Decimal parse for report/display totals.
+
+    Returns `default` for None/empty/non-numeric/NaN/Infinity input so a
+    report screen or text sidecar still renders when bad data predates
+    validation. Never use on a write path — write paths must raise.
+    """
+    try:
+        d = Decimal(str(value or "").strip() or "0")
+        return d if d.is_finite() else default
+    except (InvalidOperation, ValueError):
+        return default
+
+
 # ---------------------------------------------------------------------------
 # SQLite helpers
 # ---------------------------------------------------------------------------
@@ -51,70 +65,104 @@ def get_db():
     return conn
 
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS users (
-    name          TEXT PRIMARY KEY,
-    role          TEXT NOT NULL,
+# Schema v1 (PRAGMA user_version 1). NOT NULL on TEXT primary keys is not
+# redundant — SQLite allows NULL in non-INTEGER PRIMARY KEY columns unless it
+# is declared. Money columns stay TEXT (exact Decimal strings); the GLOB
+# CHECK enforces the app's written format — non-empty, digits and dots only —
+# which rejects '', 'nan', 'Infinity', negatives, and exponent forms.
+# Numeric well-formedness and magnitude remain Python's job (CAST-based
+# checks are useless here: CAST('nan' AS NUMERIC) is 0 in SQLite).
+# The FK on installments.bill_no is enforced because get_db() sets
+# PRAGMA foreign_keys=ON. The completed_* tables get no FK: they are
+# read-only history and interrupted historical posts can have left
+# legitimate orphans there.
+_TABLE_DDL_V1 = {
+    "users": """
+    name          TEXT PRIMARY KEY NOT NULL CHECK (name <> ''),
+    role          TEXT NOT NULL CHECK (role IN ('distributor','supervisor','salesman','system')),
     password_hash TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS beats (
-    name     TEXT PRIMARY KEY,
+""",
+    "beats": """
+    name     TEXT PRIMARY KEY NOT NULL CHECK (name <> ''),
     salesman TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS permissions (
+""",
+    "permissions": """
     role       TEXT NOT NULL,
     action_key TEXT NOT NULL,
     PRIMARY KEY (role, action_key)
-);
-CREATE TABLE IF NOT EXISTS vouchers (
-    bill_no    TEXT PRIMARY KEY,
-    date       TEXT NOT NULL,
-    amount     TEXT NOT NULL,
-    balance    TEXT NOT NULL,
-    beat       TEXT NOT NULL,
-    salesman   TEXT NOT NULL,
+""",
+    "vouchers": """
+    bill_no    TEXT PRIMARY KEY NOT NULL CHECK (bill_no <> ''),
+    date       TEXT NOT NULL CHECK (date <> ''),
+    amount     TEXT NOT NULL CHECK (amount <> '' AND amount NOT GLOB '*[^0-9.]*'),
+    balance    TEXT NOT NULL CHECK (balance <> '' AND balance NOT GLOB '*[^0-9.]*'),
+    beat       TEXT NOT NULL CHECK (beat <> ''),
+    salesman   TEXT NOT NULL CHECK (salesman <> ''),
     created_by TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS installments (
+""",
+    "installments": """
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    bill_no    TEXT NOT NULL,
-    date       TEXT NOT NULL,
-    amount     TEXT NOT NULL,
-    salesman   TEXT NOT NULL,
-    created_by TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT '',
-    UNIQUE(bill_no, date)
-);
-CREATE TABLE IF NOT EXISTS completed_vouchers (
-    bill_no    TEXT PRIMARY KEY,
-    date       TEXT NOT NULL,
-    amount     TEXT NOT NULL,
-    balance    TEXT NOT NULL,
-    beat       TEXT NOT NULL,
-    salesman   TEXT NOT NULL,
+    bill_no    TEXT NOT NULL CHECK (bill_no <> '') REFERENCES vouchers(bill_no),
+    date       TEXT NOT NULL CHECK (date <> ''),
+    amount     TEXT NOT NULL CHECK (amount <> '' AND amount NOT GLOB '*[^0-9.]*'),
+    salesman   TEXT NOT NULL CHECK (salesman <> ''),
     created_by TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS completed_installments (
+""",
+    "completed_vouchers": """
+    bill_no    TEXT PRIMARY KEY NOT NULL CHECK (bill_no <> ''),
+    date       TEXT NOT NULL CHECK (date <> ''),
+    amount     TEXT NOT NULL CHECK (amount <> '' AND amount NOT GLOB '*[^0-9.]*'),
+    balance    TEXT NOT NULL CHECK (balance <> '' AND balance NOT GLOB '*[^0-9.]*'),
+    beat       TEXT NOT NULL CHECK (beat <> ''),
+    salesman   TEXT NOT NULL CHECK (salesman <> ''),
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT ''
+""",
+    "completed_installments": """
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    bill_no    TEXT NOT NULL,
-    date       TEXT NOT NULL,
-    amount     TEXT NOT NULL,
-    salesman   TEXT NOT NULL,
+    bill_no    TEXT NOT NULL CHECK (bill_no <> ''),
+    date       TEXT NOT NULL CHECK (date <> ''),
+    amount     TEXT NOT NULL CHECK (amount <> '' AND amount NOT GLOB '*[^0-9.]*'),
+    salesman   TEXT NOT NULL CHECK (salesman <> ''),
     created_by TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT ''
-);
-"""
+""",
+}
+
+_TABLE_COPY_COLUMNS = {
+    "users": ["name", "role", "password_hash"],
+    "beats": ["name", "salesman"],
+    "permissions": ["role", "action_key"],
+    "vouchers": ["bill_no", "date", "amount", "balance", "beat", "salesman",
+                 "created_by", "created_at"],
+    "installments": ["id", "bill_no", "date", "amount", "salesman",
+                     "created_by", "created_at"],
+    "completed_vouchers": ["bill_no", "date", "amount", "balance", "beat", "salesman",
+                           "created_by", "created_at"],
+    "completed_installments": ["id", "bill_no", "date", "amount", "salesman",
+                               "created_by", "created_at"],
+}
+
+_SCHEMA = "".join(
+    f"CREATE TABLE IF NOT EXISTS {table} ({body});\n"
+    for table, body in _TABLE_DDL_V1.items()
+)
+
+
+class MigrationError(ValueError):
+    """Existing rows violate the new schema constraints; the migration
+    refuses to run until they are repaired manually."""
 
 
 def init_db():
     """Create all tables in the DB (idempotent). Creates the DB file if absent.
 
-    Also applies one-time additive migrations for DBs created before a given
-    column/table existed (beats.salesman, permissions), backfilling from the
-    matching CSV so an older collmgm.db catches up the moment it's reopened
-    by newer code.
+    Also applies one-time migrations for DBs created before a given
+    column/table/constraint existed: additive backfills (beats.salesman,
+    permissions) and the v1 constraint rebuild (_migrate_schema_v1).
+    Raises MigrationError when existing rows violate the v1 constraints.
     """
     conn = get_db()
     try:
@@ -123,8 +171,107 @@ def init_db():
         _backfill_beats_salesman(conn)
         _backfill_permissions(conn)
         conn.commit()
+        if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
+            _migrate_schema_v1(conn)
     finally:
         conn.close()
+
+
+def _repair_interrupted_archive_orphans(conn):
+    """Move installments whose voucher already reached completed_vouchers to
+    completed_installments — debris from a historical post that was
+    interrupted between archiving the voucher and its installments."""
+    where = ("bill_no NOT IN (SELECT bill_no FROM vouchers)"
+             " AND bill_no IN (SELECT bill_no FROM completed_vouchers)")
+    conn.execute(
+        "INSERT INTO completed_installments"
+        " (bill_no, date, amount, salesman, created_by, created_at)"
+        f" SELECT bill_no, date, amount, salesman, created_by, created_at"
+        f" FROM installments WHERE {where}")
+    conn.execute(f"DELETE FROM installments WHERE {where}")
+
+
+def _scan_v1_violations(conn):
+    """Return [(table, identifier, reason)] for rows the v1 constraints
+    would reject. Read-only."""
+    violations = []
+
+    for r in conn.execute(
+            "SELECT name, role FROM users WHERE name IS NULL OR name = ''"
+            " OR role IS NULL"
+            " OR role NOT IN ('distributor','supervisor','salesman','system')"):
+        violations.append(("users", r["name"] or "<empty>", f"invalid role {r['role']!r}"))
+
+    for r in conn.execute("SELECT name FROM beats WHERE name IS NULL OR name = ''"):
+        violations.append(("beats", "<empty>", "empty name"))
+
+    voucher_required = ("bill_no", "date", "beat", "salesman")
+    installment_required = ("bill_no", "date", "salesman")
+    checks = [
+        ("vouchers", voucher_required, ("amount", "balance")),
+        ("completed_vouchers", voucher_required, ("amount", "balance")),
+        ("installments", installment_required, ("amount",)),
+        ("completed_installments", installment_required, ("amount",)),
+    ]
+    for table, required, money in checks:
+        empty = " OR ".join(f"{c} IS NULL OR {c} = ''" for c in required)
+        for r in conn.execute(f"SELECT bill_no FROM {table} WHERE {empty}"):
+            violations.append((table, r["bill_no"] or "<empty>", "empty required field"))
+        for col in money:
+            for r in conn.execute(
+                    f"SELECT bill_no, {col} FROM {table}"
+                    f" WHERE {col} IS NULL OR {col} = '' OR {col} GLOB '*[^0-9.]*'"):
+                violations.append((table, r["bill_no"] or "<empty>",
+                                   f"non-numeric {col} {r[col]!r}"))
+
+    for r in conn.execute(
+            "SELECT DISTINCT bill_no FROM installments"
+            " WHERE bill_no NOT IN (SELECT bill_no FROM vouchers)"):
+        violations.append(("installments", r["bill_no"] or "<empty>",
+                           "no matching voucher"))
+
+    return violations
+
+
+def _migrate_schema_v1(conn):
+    """Rebuild every table with the v1 constraints and stamp
+    PRAGMA user_version = 1.
+
+    SQLite cannot ALTER TABLE ADD CONSTRAINT, so each table is rebuilt in
+    one transaction: CREATE {t}_v1 -> copy rows -> DROP {t} -> RENAME.
+    Refuses (MigrationError, everything rolled back) while any existing row
+    would violate the new constraints, listing the offending rows so the
+    operator can repair data/collmgm.db and restart.
+    """
+    _repair_interrupted_archive_orphans(conn)
+    violations = _scan_v1_violations(conn)
+    if violations:
+        conn.rollback()  # undo the orphan repair — the DB stays untouched
+        listed = "; ".join(f"{t}[{ident}]: {reason}" for t, ident, reason in violations[:20])
+        more = f" (+{len(violations) - 20} more)" if len(violations) > 20 else ""
+        raise MigrationError(
+            "Cannot upgrade the database schema — existing rows violate the new"
+            f" constraints: {listed}{more}."
+            " Fix these rows in data/collmgm.db and restart.")
+    conn.commit()
+
+    # foreign_keys can only change outside a transaction; restore it after.
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        with conn:
+            for table, body in _TABLE_DDL_V1.items():
+                cols = ", ".join(_TABLE_COPY_COLUMNS[table])
+                conn.execute(f"DROP TABLE IF EXISTS {table}_v1")
+                conn.execute(f"CREATE TABLE {table}_v1 ({body})")
+                conn.execute(f"INSERT INTO {table}_v1 ({cols}) SELECT {cols} FROM {table}")
+                conn.execute(f"DROP TABLE {table}")
+                conn.execute(f"ALTER TABLE {table}_v1 RENAME TO {table}")
+            if conn.execute("PRAGMA foreign_key_check").fetchall():
+                raise MigrationError(
+                    "Foreign key check failed after the schema rebuild — migration rolled back.")
+            conn.execute("PRAGMA user_version = 1")
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
 
 
 def _backfill_beats_salesman(conn):
@@ -374,126 +521,189 @@ def load_all_existing_bill_nos():
     return {r["bill_no"] for r in rows}
 
 
+def load_vouchers_by_bill_nos(bill_nos):
+    """Return dict[bill_no -> voucher row dict] for the given bill_nos.
+
+    Queries the vouchers table in chunks of 500 to stay under SQLite's
+    parameter limit. Missing bill_nos are simply absent from the result;
+    returns {} when the DB file is missing, so callers report every
+    voucher as not found.
+    """
+    unique = sorted({b for b in bill_nos if b})
+    if not unique or not _db_path().exists():
+        return {}
+    result = {}
+    conn = get_db()
+    try:
+        for i in range(0, len(unique), 500):
+            chunk = unique[i:i + 500]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                "SELECT bill_no, date, amount, balance, beat, salesman"
+                f" FROM vouchers WHERE bill_no IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            for r in rows:
+                result[r["bill_no"]] = dict(r)
+    finally:
+        conn.close()
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Master data writes (SQLite)
 # ---------------------------------------------------------------------------
 
-def _append_installments_csv(vouchers, created_by="app"):
-    """Write new installment rows to the installments table (dedup on bill_no + date).
+def _parse_payment_strict(voucher):
+    """Return the voucher's payment as a finite Decimal, or None when empty.
+
+    Raises ValueError on unparseable/non-finite payments — post write paths
+    must abort before touching the master tables, never skip silently.
+    """
+    payment = (voucher.get("payment") or "").strip()
+    if not payment:
+        return None
+    try:
+        amount = Decimal(payment)
+        if not amount.is_finite():
+            raise InvalidOperation
+    except (ValueError, InvalidOperation):
+        raise ValueError(
+            f"invalid payment for {voucher.get('bill_no', '?')}: {payment!r}")
+    return amount
+
+
+def _append_installments(conn, vouchers, created_by="app"):
+    """Insert one installment row per paying voucher on an open connection.
 
     created_by is the audit identity of the user performing the post —
-    callers should pass the logged-in user's name.
+    callers should pass the logged-in user's name. Raises ValueError on an
+    unparseable payment so the enclosing transaction rolls back.
     """
     today = datetime.now().strftime("%Y-%m-%d")
     created_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    conn = get_db()
-    try:
-        with conn:
-            for v in vouchers:
-                payment = (v.get("payment") or "").strip()
-                if not payment:
-                    continue
-                try:
-                    amount = Decimal(payment)
-                except (ValueError, InvalidOperation):
-                    print(f"Warning: skipping invalid payment for {v.get('bill_no')}: {payment!r}")
-                    continue
-                if amount <= 0:
-                    continue
-                collection_date = (v.get("payment_date") or "").strip() or today
-                conn.execute(
-                    "INSERT OR IGNORE INTO installments"
-                    " (bill_no, date, amount, salesman, created_by, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    (v["bill_no"], collection_date, payment, v["salesman"], created_by, created_at),
-                )
-    finally:
-        conn.close()
+    for v in vouchers:
+        amount = _parse_payment_strict(v)
+        if amount is None or amount <= 0:
+            continue
+        collection_date = (v.get("payment_date") or "").strip() or today
+        conn.execute(
+            "INSERT INTO installments"
+            " (bill_no, date, amount, salesman, created_by, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (v["bill_no"], collection_date, str(amount), v["salesman"], created_by, created_at),
+        )
 
 
-def _update_vouchers_balance(vouchers):
-    """Update balances in the vouchers table. Returns list of bill_nos that reached zero."""
-    payment_map = {
-        v["bill_no"]: Decimal(v["payment"])
-        for v in vouchers
-        if v.get("payment")
-    }
+def _update_vouchers_balance(conn, vouchers):
+    """Deduct payments from voucher balances on an open connection.
+
+    Returns list of bill_nos that reached zero. Raises ValueError on an
+    unparseable payment, a voucher missing from master, or a corrupt stored
+    balance — the whole payment_map is parsed before the first UPDATE so a
+    bad row aborts the enclosing transaction rather than half-applying.
+    """
+    payment_map = {}
+    for v in vouchers:
+        amount = _parse_payment_strict(v)
+        if amount is not None:
+            payment_map[v["bill_no"]] = amount
     if not payment_map:
         return []
 
-    if not _db_path().exists():
-        raise FileNotFoundError(f"Database not found: {_db_path()}")
-
     completed_bill_nos = []
-    conn = get_db()
-    try:
-        with conn:
-            for bill_no, payment in payment_map.items():
-                row = conn.execute(
-                    "SELECT balance FROM vouchers WHERE bill_no = ?", (bill_no,)
-                ).fetchone()
-                if row is None:
-                    continue
-                try:
-                    old_balance = Decimal(row["balance"])
-                    new_balance = max(Decimal("0"), old_balance - payment)
-                    conn.execute(
-                        "UPDATE vouchers SET balance = ? WHERE bill_no = ?",
-                        (str(new_balance.quantize(Decimal("0.01"))), bill_no),
-                    )
-                    if new_balance == Decimal("0"):
-                        completed_bill_nos.append(bill_no)
-                except (ValueError, InvalidOperation):
-                    print(f"Warning: bill_no {bill_no} — invalid balance; skipping")
-    finally:
-        conn.close()
+    for bill_no, payment in payment_map.items():
+        row = conn.execute(
+            "SELECT balance FROM vouchers WHERE bill_no = ?", (bill_no,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"voucher {bill_no} not found in master — posting aborted")
+        try:
+            old_balance = Decimal(row["balance"])
+            if not old_balance.is_finite():
+                raise InvalidOperation
+        except (ValueError, InvalidOperation):
+            raise ValueError(
+                f"voucher {bill_no} has an invalid stored balance {row['balance']!r}")
+        new_balance = max(Decimal("0"), old_balance - payment)
+        conn.execute(
+            "UPDATE vouchers SET balance = ? WHERE bill_no = ?",
+            (str(new_balance.quantize(Decimal("0.01"))), bill_no),
+        )
+        if new_balance == Decimal("0"):
+            completed_bill_nos.append(bill_no)
     return completed_bill_nos
 
 
-def _archive_completed(bill_nos):
-    """Move completed vouchers and their installments to completed_* tables."""
+def _archive_completed(conn, bill_nos):
+    """Move completed vouchers and their installments to completed_* tables
+    on an open connection."""
     if not bill_nos:
         return
     bill_list = list(bill_nos)
     ph = ",".join("?" * len(bill_list))
+    rows = conn.execute(
+        f"SELECT bill_no, date, amount, balance, beat, salesman, created_by, created_at"
+        f" FROM vouchers WHERE bill_no IN ({ph})",
+        bill_list,
+    ).fetchall()
+    for r in rows:
+        conn.execute(
+            "INSERT OR IGNORE INTO completed_vouchers"
+            " (bill_no, date, amount, balance, beat, salesman, created_by, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (r["bill_no"], r["date"], r["amount"], r["balance"],
+             r["beat"], r["salesman"], r["created_by"], r["created_at"]),
+        )
+
+    inst_rows = conn.execute(
+        f"SELECT bill_no, date, amount, salesman, created_by, created_at"
+        f" FROM installments WHERE bill_no IN ({ph})",
+        bill_list,
+    ).fetchall()
+    for r in inst_rows:
+        conn.execute(
+            "INSERT INTO completed_installments"
+            " (bill_no, date, amount, salesman, created_by, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (r["bill_no"], r["date"], r["amount"],
+             r["salesman"], r["created_by"], r["created_at"]),
+        )
+    # Installments reference vouchers via FK, so they must go first.
+    conn.execute(f"DELETE FROM installments WHERE bill_no IN ({ph})", bill_list)
+    conn.execute(f"DELETE FROM vouchers WHERE bill_no IN ({ph})", bill_list)
+
+
+def apply_post_to_db(vouchers, created_by="app"):
+    """All DB writes for posting one report in a single transaction:
+    insert installments, deduct voucher balances, archive fully-settled
+    vouchers. Returns the list of bill_nos that reached zero balance.
+    Raises on any error, rolling back so no partial write persists.
+    """
+    if not _db_path().exists():
+        raise FileNotFoundError(f"Database not found: {_db_path()}")
     conn = get_db()
     try:
         with conn:
-            rows = conn.execute(
-                f"SELECT bill_no, date, amount, balance, beat, salesman, created_by, created_at"
-                f" FROM vouchers WHERE bill_no IN ({ph})",
-                bill_list,
-            ).fetchall()
-            for r in rows:
-                conn.execute(
-                    "INSERT OR IGNORE INTO completed_vouchers"
-                    " (bill_no, date, amount, balance, beat, salesman, created_by, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (r["bill_no"], r["date"], r["amount"], r["balance"],
-                     r["beat"], r["salesman"], r["created_by"], r["created_at"]),
-                )
-            conn.execute(f"DELETE FROM vouchers WHERE bill_no IN ({ph})", bill_list)
-
-            inst_rows = conn.execute(
-                f"SELECT bill_no, date, amount, salesman, created_by, created_at"
-                f" FROM installments WHERE bill_no IN ({ph})",
-                bill_list,
-            ).fetchall()
-            for r in inst_rows:
-                conn.execute(
-                    "INSERT INTO completed_installments"
-                    " (bill_no, date, amount, salesman, created_by, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    (r["bill_no"], r["date"], r["amount"],
-                     r["salesman"], r["created_by"], r["created_at"]),
-                )
-            conn.execute(f"DELETE FROM installments WHERE bill_no IN ({ph})", bill_list)
+            # Balances first: its existence check raises a clearer error for
+            # a missing voucher than the installments FK would, and fully
+            # settled vouchers are only archived (deleted) afterwards, so the
+            # FK is satisfied when the installment rows are inserted.
+            completed = _update_vouchers_balance(conn, vouchers)
+            _append_installments(conn, vouchers, created_by)
+            if completed:
+                _archive_completed(conn, completed)
+        return completed
     finally:
         conn.close()
 
 
 def write_new_vouchers(vouchers):
-    """Insert new vouchers into the vouchers table."""
+    """Insert new vouchers into the vouchers table.
+
+    INSERT OR IGNORE also silently skips rows violating the schema CHECK/FK
+    constraints — callers must pre-validate via coll_data.validate_addv_batch
+    / validate_single_voucher."""
     conn = get_db()
     try:
         with conn:
@@ -511,7 +721,10 @@ def write_new_vouchers(vouchers):
 
 
 def write_new_installments(installments):
-    """Insert new installments into the installments table."""
+    """Insert new installments into the installments table.
+
+    INSERT OR IGNORE also silently skips rows violating the schema CHECK/FK
+    constraints — callers must pre-validate via coll_data.validate_addv_batch."""
     if not installments:
         return
     conn = get_db()
@@ -647,8 +860,8 @@ def write_collection_text(path, beats, salesmen, vouchers, stage=None, status=No
 
     lines.append(separator)
     total_vouchers = len(vouchers)
-    total_balance = sum(Decimal(v.get("balance", "0") or "0") for v in vouchers)
-    total_payments = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
+    total_balance = sum(parse_decimal(v.get("balance")) for v in vouchers)
+    total_payments = sum(parse_decimal(v.get("payment")) for v in vouchers)
     lines.append(f"Total vouchers: {total_vouchers}")
     lines.append(f"Sum of balances: {total_balance}")
     if total_payments > 0:
@@ -828,7 +1041,7 @@ def _build_print_column(report_data, bal_width, coll_width):
 
     vouchers = report_data.get("vouchers", [])
     total_vouchers = len(vouchers)
-    total_bal = sum(Decimal(v.get("balance", "0") or "0") for v in vouchers)
+    total_bal = sum(parse_decimal(v.get("balance")) for v in vouchers)
     summary = f"#:{total_vouchers}  Bal:{total_bal}"
 
     lines = [
@@ -894,8 +1107,8 @@ def _build_html_column(report_data):
 
     vouchers = report_data.get("vouchers", [])
     total_vouchers = len(vouchers)
-    total_bal = sum(Decimal(v.get("balance", "0") or "0") for v in vouchers)
-    total_coll = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
+    total_bal = sum(parse_decimal(v.get("balance")) for v in vouchers)
+    total_coll = sum(parse_decimal(v.get("payment")) for v in vouchers)
 
     rows_html = "".join(
         f"<tr><td>{v['bill_no'][-7:]}</td>"

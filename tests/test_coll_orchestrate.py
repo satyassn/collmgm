@@ -67,6 +67,43 @@ class OrchestrateTestCase(unittest.TestCase):
         return self._write_json(Path("staging") / name, data)
 
 
+class DbTestCase(OrchestrateTestCase):
+    """Adds a real SQLite DB (needed wherever staged reports are re-validated
+    against master data, and by post_confirmed_report's DB writes)."""
+
+    def setUp(self):
+        super().setUp()
+        (self.tmp / "data").mkdir()
+        self._db_patches = [patch.object(coll_store, "DATA_DIR", self.tmp / "data")]
+        for p in self._db_patches:
+            p.start()
+        coll_store.init_db()
+
+    def tearDown(self):
+        for p in self._db_patches:
+            p.stop()
+        super().tearDown()
+
+    def _insert_voucher(self, bill_no="1", balance="100.00", beat="beat1", salesman="sm1"):
+        conn = coll_store.get_db()
+        try:
+            conn.execute(
+                "INSERT INTO vouchers (bill_no, date, amount, balance, beat, salesman, created_by, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (bill_no, "2026-01-01", "100.00", balance, beat, salesman, "app", "t"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _query(self, sql, params=()):
+        conn = coll_store.get_db()
+        try:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+        finally:
+            conn.close()
+
+
 class TestPrepareSubmitReview(OrchestrateTestCase):
     def test_sorts_vouchers_by_bill_no(self):
         report_path = self._write_json("coll1.json", self._report())
@@ -94,7 +131,14 @@ class TestPrepareSubmitReview(OrchestrateTestCase):
         self.assertEqual([v["bill_no"] for v in result["vouchers"]], ["10", "20"])
 
 
-class TestApplySubmitApproval(OrchestrateTestCase):
+class TestApplySubmitApproval(DbTestCase):
+    def setUp(self):
+        super().setUp()
+        # Master rows matching the _report() fixture — approval now
+        # cross-checks every staged voucher against current master data.
+        self._insert_voucher(bill_no="20", balance="50.00")
+        self._insert_voucher(bill_no="10", balance="100.00")
+
     def test_approve_sets_confirmed_and_persists(self):
         data = self._report()
         report_path = self._write_json("coll1.json", data)
@@ -355,41 +399,7 @@ class TestRecordSubmitPayments(OrchestrateTestCase):
         self.assertFalse(report_path.with_suffix(".txt").exists())
 
 
-class PostTestCase(OrchestrateTestCase):
-    """Adds a real SQLite DB (needed by post_confirmed_report's DB writes)."""
-
-    def setUp(self):
-        super().setUp()
-        (self.tmp / "data").mkdir()
-        self._db_patches = [patch.object(coll_store, "DATA_DIR", self.tmp / "data")]
-        for p in self._db_patches:
-            p.start()
-        coll_store.init_db()
-
-    def tearDown(self):
-        for p in self._db_patches:
-            p.stop()
-        super().tearDown()
-
-    def _insert_voucher(self, bill_no="1", balance="100.00", beat="beat1", salesman="sm1"):
-        conn = coll_store.get_db()
-        try:
-            conn.execute(
-                "INSERT INTO vouchers (bill_no, date, amount, balance, beat, salesman, created_by, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (bill_no, "2026-01-01", "100.00", balance, beat, salesman, "app", "t"),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-    def _query(self, sql, params=()):
-        conn = coll_store.get_db()
-        try:
-            return [dict(r) for r in conn.execute(sql, params).fetchall()]
-        finally:
-            conn.close()
-
+class PostTestCase(DbTestCase):
     def _post_report(self, bill_no="1", payment="100.00", beat="beat1", salesman="sm1"):
         return {
             "stages": {"start": "confirmed", "submit": "confirmed", "post": ""},
@@ -437,20 +447,62 @@ class TestPostConfirmedReport(PostTestCase):
         self.assertEqual(len(remaining), 1)
         self.assertEqual(remaining[0]["balance"], "60.00")
 
-    def test_failure_during_balance_update_leaves_checkpoint(self):
+    def test_db_failure_rolls_back_and_clears_checkpoint(self):
         self._insert_voucher(balance="100.00")
         data = self._post_report(payment="100.00")
         report_path = self._write_staging_json("coll1.json", data)
 
-        with patch.object(coll_orchestrate, "_update_vouchers_balance", side_effect=RuntimeError("boom")):
+        with patch.object(coll_orchestrate, "apply_post_to_db", side_effect=RuntimeError("boom")):
             outcome = coll_orchestrate.post_confirmed_report(report_path)
 
         self.assertFalse(outcome.ok)
-        self.assertEqual(outcome.step_failed, 2)
-        self.assertEqual(outcome.error, "boom")
-        # Checkpoint left in place for manual recovery; staging file untouched.
-        self.assertIsNotNone(coll_store.read_finalize_checkpoint())
+        self.assertEqual(outcome.step_failed, 1)
+        self.assertIn("boom", outcome.error)
+        self.assertIn("no changes were written", outcome.error)
+        # DB rolled back — checkpoint cleared, staging file untouched.
+        self.assertIsNone(coll_store.read_finalize_checkpoint())
         self.assertTrue(report_path.exists())
+
+    def test_partial_failure_rolls_back_all_db_writes(self):
+        # Two-voucher report; the second voucher vanishes from master after
+        # approval (validation is patched out to simulate the race) — the
+        # first voucher's installment and balance change must roll back too.
+        self._insert_voucher(bill_no="1", balance="100.00")
+        data = self._post_report(payment="40.00")
+        data["vouchers"].append({"bill_no": "2", "balance": "100.00", "payment": "10.00",
+                                 "payment_date": "2026-02-01", "beat": "beat1",
+                                 "salesman": "sm1"})
+        report_path = self._write_staging_json("coll1.json", data)
+
+        with patch.object(coll_orchestrate, "validate_staged_report", return_value=[]):
+            outcome = coll_orchestrate.post_confirmed_report(report_path)
+
+        self.assertFalse(outcome.ok)
+        self.assertIn("2 not found in master", outcome.error)
+        self.assertIn("no changes were written", outcome.error)
+        self.assertEqual(self._query("SELECT * FROM installments"), [])
+        rows = self._query("SELECT balance FROM vouchers WHERE bill_no = '1'")
+        self.assertEqual(rows[0]["balance"], "100.00")
+        self.assertIsNone(coll_store.read_finalize_checkpoint())
+
+    def test_stale_checkpoint_at_db_commit_blocks_repost(self):
+        # A checkpoint at step >= 4 for this report means a previous post
+        # reached the DB but never finished — a blind retry would double-post.
+        self._insert_voucher(balance="100.00")
+        data = self._post_report(payment="40.00")
+        report_path = self._write_staging_json("coll1.json", data)
+        coll_store.write_finalize_checkpoint(report_path, 4)
+
+        outcome = coll_orchestrate.post_confirmed_report(report_path)
+
+        self.assertFalse(outcome.ok)
+        self.assertIn("reached the database", outcome.error)
+        self.assertEqual(self._query("SELECT * FROM installments"), [])
+
+        # A different report's checkpoint does not block this one.
+        coll_store.write_finalize_checkpoint(self.tmp / "staging" / "other.json", 4)
+        outcome = coll_orchestrate.post_confirmed_report(report_path)
+        self.assertTrue(outcome.ok, outcome.error)
 
     def test_failure_saving_json_after_db_writes_succeed(self):
         # The riskiest edge case: DB already updated, but the staging JSON
@@ -542,7 +594,7 @@ class TestPostStageGuards(PostTestCase):
         outcome = coll_orchestrate.post_confirmed_report(report_path)
 
         self.assertFalse(outcome.ok)
-        self.assertIn("invalid payments", outcome.error)
+        self.assertIn("failed validation", outcome.error)
         self.assertIn("exceeds balance", outcome.error)
         rows = self._query("SELECT balance FROM vouchers WHERE bill_no = '1'")
         self.assertEqual(rows[0]["balance"], "100.00")
@@ -568,7 +620,7 @@ class TestPostStageGuards(PostTestCase):
         data = self._post_report(payment="100.00")
         report_path = self._write_staging_json("coll1.json", data)
 
-        with patch.object(coll_orchestrate, "_update_vouchers_balance", side_effect=RuntimeError("boom")):
+        with patch.object(coll_orchestrate, "apply_post_to_db", side_effect=RuntimeError("boom")):
             outcome = coll_orchestrate.post_confirmed_report(report_path)
         self.assertFalse(outcome.ok)
         self.assertTrue(coll_store.acquire_post_claim(report_path))
@@ -635,6 +687,100 @@ class TestRecordSubmitPaymentsStageGuard(OrchestrateTestCase):
             report_path.unlink()
 
 
+class TestValidateStagedReport(DbTestCase):
+    def _staged(self, **overrides):
+        data = self._report()
+        data.update(overrides)
+        return data
+
+    def setUp(self):
+        super().setUp()
+        self._insert_voucher(bill_no="20", balance="50.00")
+        self._insert_voucher(bill_no="10", balance="100.00")
+
+    def test_valid_report_passes(self):
+        self.assertEqual(coll_orchestrate.validate_staged_report(self._staged()), [])
+
+    def test_vouchers_not_a_list(self):
+        errors = coll_orchestrate.validate_staged_report(self._staged(vouchers={"a": 1}))
+        self.assertEqual(errors, ["report: 'vouchers' is not a list"])
+
+    def test_malformed_entries_reported(self):
+        data = self._staged()
+        data["vouchers"].append("junk")
+        data["vouchers"].append({"balance": "10", "payment": ""})   # no bill_no
+        data["vouchers"].append({"bill_no": "20", "payment": ""})   # no balance key
+        errors = coll_orchestrate.validate_staged_report(data)
+        self.assertEqual(sum("malformed voucher" in e for e in errors), 3)
+
+    def test_voucher_missing_from_master(self):
+        data = self._staged()
+        data["vouchers"].append({"bill_no": "999", "balance": "10.00", "payment": "",
+                                 "beat": "beat1", "salesman": "sm1"})
+        errors = coll_orchestrate.validate_staged_report(data)
+        self.assertTrue(any("999: not found in master" in e for e in errors))
+
+    def test_payment_validated_against_master_balance_not_staged_copy(self):
+        # Staged balance inflated to 500 — a tampered file must not allow a
+        # payment beyond the voucher's CURRENT master balance (50.00).
+        data = self._staged()
+        data["vouchers"][0]["balance"] = "500.00"
+        data["vouchers"][0]["payment"] = "60.00"
+        errors = coll_orchestrate.validate_staged_report(data)
+        self.assertTrue(any("20: exceeds balance (50.00)" in e for e in errors))
+
+    def test_staged_beat_salesman_mismatch(self):
+        data = self._staged()
+        data["vouchers"][0]["salesman"] = "sm2"
+        errors = coll_orchestrate.validate_staged_report(data)
+        self.assertTrue(any("20: beat/salesman mismatch" in e for e in errors))
+
+    def test_master_beat_salesman_mismatch(self):
+        self._insert_voucher(bill_no="30", balance="10.00", beat="beat2", salesman="sm1")
+        data = self._staged()
+        data["vouchers"].append({"bill_no": "30", "balance": "10.00", "payment": "",
+                                 "beat": "beat1", "salesman": "sm1"})
+        errors = coll_orchestrate.validate_staged_report(data)
+        self.assertTrue(any("30: beat/salesman mismatch" in e for e in errors))
+
+    def test_duplicate_bill_no_in_report(self):
+        data = self._staged()
+        data["vouchers"].append(dict(data["vouchers"][0]))
+        errors = coll_orchestrate.validate_staged_report(data)
+        self.assertTrue(any("appears more than once" in e for e in errors))
+
+    def test_future_and_garbage_payment_dates(self):
+        data = self._staged()
+        data["vouchers"][0]["payment_date"] = "2999-01-01"
+        data["vouchers"][1]["payment_date"] = "not-a-date"
+        errors = coll_orchestrate.validate_staged_report(data)
+        self.assertTrue(any("payment date '2999-01-01' is in the future" in e for e in errors))
+        self.assertTrue(any("invalid payment date 'not-a-date'" in e for e in errors))
+
+    def test_corrupt_master_balance_is_an_error(self):
+        # '1.2.3' passes the schema's GLOB check (digits and dots only) but
+        # is not a parseable Decimal.
+        conn = coll_store.get_db()
+        try:
+            conn.execute("UPDATE vouchers SET balance = '1.2.3' WHERE bill_no = '20'")
+            conn.commit()
+        finally:
+            conn.close()
+        errors = coll_orchestrate.validate_staged_report(self._staged())
+        self.assertTrue(any("20: stored balance is invalid" in e for e in errors))
+
+    def test_empty_db_reports_all_missing(self):
+        # DB file exists but has no vouchers.
+        conn = coll_store.get_db()
+        try:
+            conn.execute("DELETE FROM vouchers")
+            conn.commit()
+        finally:
+            conn.close()
+        errors = coll_orchestrate.validate_staged_report(self._staged())
+        self.assertEqual(sum("not found in master" in e for e in errors), 2)
+
+
 class TestValidatePayment(unittest.TestCase):
     def test_empty_stays_empty(self):
         self.assertEqual(coll_orchestrate.validate_payment("", "50.00"), ("", None))
@@ -662,8 +808,11 @@ class TestValidatePayment(unittest.TestCase):
         self.assertIsNone(normalized)
         self.assertIn("exceeds balance", reason)
 
-    def test_unparseable_balance_skips_balance_check(self):
-        self.assertEqual(coll_orchestrate.validate_payment("10", "garbage"), ("10.00", None))
+    def test_unparseable_balance_rejects_payment(self):
+        for bad_balance in ("garbage", "NaN", "Infinity", "-Infinity"):
+            normalized, reason = coll_orchestrate.validate_payment("10", bad_balance)
+            self.assertIsNone(normalized, bad_balance)
+            self.assertIn("stored balance is invalid", reason)
 
 
 if __name__ == "__main__":

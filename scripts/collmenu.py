@@ -6,8 +6,10 @@ Role-based menu items are driven by data/permissions.csv (loaded on each login).
 ACTION_REGISTRY maps action keys to display labels and workflow handlers.
 """
 
-from coll_store import load_permissions, ensure_db
-from coll_cli import display_main_menu, get_menu_choice, build_role_menu
+import sys
+
+from coll_store import load_permissions, ensure_db, MigrationError
+from coll_cli import display_main_menu, get_menu_choice, build_role_menu, InputCancelled
 from coll_workflow import (
     run_login,
     run_coll_start, run_coll_approve_start,
@@ -35,22 +37,39 @@ ACTION_REGISTRY = [
 
 
 def main():
-    ensure_db()
+    try:
+        ensure_db()
+    except MigrationError as error:
+        print(f"\nDatabase migration failed:\n{error}\n")
+        sys.exit(1)
     while True:
-        current_user = run_login()
+        try:
+            current_user = run_login()
+        except InputCancelled:
+            print("\nGoodbye!\n")
+            sys.exit(0)
         permissions = load_permissions()
         menu = build_role_menu(current_user, permissions, ACTION_REGISTRY)
         labels = [label for label, _ in menu]
 
         while True:
             display_main_menu(labels, current_user)
-            choice = get_menu_choice(len(labels) + 1)
+            try:
+                choice = get_menu_choice(len(labels) + 1)
+            except InputCancelled:
+                print("\nGoodbye!\n")
+                sys.exit(0)
 
             if choice == len(labels) + 1:
                 break
 
             _, fn = menu[choice - 1]
-            fn(current_user)
+            try:
+                fn(current_user)
+            except InputCancelled:
+                # Ctrl+C mid-workflow: unsaved work is discarded, same as
+                # the existing quit-without-save path.
+                print("\n(Cancelled — returning to menu.)")
 
 
 if __name__ == "__main__":

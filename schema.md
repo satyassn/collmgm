@@ -86,7 +86,7 @@ TL;DR: Define a proof-of-concept data schema, validation rules, and operational 
 - Field-level: required fields present, types correct, lengths within sane limits.
 - Referential: `beat` must exist in `beats.csv`; installment `bill_no` must refer to an existing voucher `bill_no` in `data` or staging during merge.
 - Business logic: `installment.amount` must not exceed the voucher balance at merge time. `balance` is derived and stored on the voucher for easier lookup.
-- Date windows: optionally enforce `date` values are valid and not in the future if desired.
+- Date windows: `date` values must be valid ISO `YYYY-MM-DD` and not in the future (enforced at add-vouchers validation and at coll approve/post).
 
 **Iteration 1 Scope**
 - Focus: schema confirmation and test-data generation only.

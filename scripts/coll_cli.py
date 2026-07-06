@@ -1,7 +1,7 @@
 """
 Terminal UI layer for collection management.
 
-All print() and input() calls live here.
+All print() and read_input() calls live here.
 No file paths, no CSV/JSON access, no imports from other coll_* modules.
 """
 
@@ -10,12 +10,34 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 
+class InputCancelled(Exception):
+    """User aborted input (Ctrl+C) or the input stream ended (EOF)."""
+
+
+def read_input(prompt=""):
+    """input() that converts EOFError/KeyboardInterrupt into InputCancelled,
+    so callers unwind cleanly instead of crashing with a traceback."""
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        raise InputCancelled() from None
+
+
 def clear_screen():
     os.system("cls" if os.name == "nt" else "clear")
 
 
 def _sum_decimal_field(items, field, default="0"):
-    return sum(Decimal(v.get(field, default) or default) for v in items)
+    total = Decimal("0")
+    for v in items:
+        try:
+            d = Decimal(v.get(field, default) or default)
+        except (ValueError, InvalidOperation):
+            continue
+        if d.is_finite():
+            total += d
+    return total
 
 
 def _format_decimal(d):
@@ -32,10 +54,10 @@ def prompt_login():
     print("=" * 50)
     print("  0. Exit")
     print("=" * 50)
-    name = input("Username (0 to exit): ").strip()
+    name = read_input("Username (0 to exit): ").strip()
     if name == "0":
         return None
-    password = input("Password: ").strip()
+    password = read_input("Password: ").strip()
     return name, password
 
 
@@ -60,7 +82,7 @@ def build_role_menu(current_user, permissions, action_registry):
 def get_menu_choice(max_choice=5):
     while True:
         try:
-            choice = input(f"Enter your choice (1-{max_choice}): ").strip()
+            choice = read_input(f"Enter your choice (1-{max_choice}): ").strip()
             choice_num = int(choice)
             if 1 <= choice_num <= max_choice:
                 return choice_num
@@ -88,7 +110,7 @@ def get_reports_submenu_choice(current_role='distributor'):
     print("-" * 50)
     while True:
         try:
-            choice = input(f"Enter your choice (0-{len(options)}): ").strip()
+            choice = read_input(f"Enter your choice (0-{len(options)}): ").strip()
             if choice.lower() == "b":
                 return "back"
             n = int(choice)
@@ -115,7 +137,7 @@ def select_from_list(items, label, allow_multiple=False):
     )
 
     while True:
-        choice = input(prompt).strip()
+        choice = read_input(prompt).strip()
         if choice.lower() == "b":
             return None
         if allow_multiple and choice.lower() == "all":
@@ -137,7 +159,9 @@ def select_from_list(items, label, allow_multiple=False):
                 except ValueError:
                     selections = None
                     break
-                if start > end:
+                # Bounds-check BEFORE expanding: a range like 1-999999999
+                # must not materialise a huge list just to be rejected.
+                if start > end or start < 1 or end > len(items):
                     selections = None
                     break
                 selections.extend(range(start, end + 1))
@@ -174,7 +198,7 @@ def select_beat_with_summary(beats, summary, active_statuses=None, show_salesman
     active_statuses: dict[beat -> status_label] from load_active_beat_statuses().
     """
     if not beats:
-        input("No beats found. Press Enter to go back: ")
+        read_input("No beats found. Press Enter to go back: ")
         return None
     sorted_beats = sorted(beats)
     print("\nSelect a beat:\n")
@@ -201,7 +225,7 @@ def select_beat_with_summary(beats, summary, active_statuses=None, show_salesman
     print()
 
     while True:
-        choice = input(f"Enter the number of the beat (1-{len(sorted_beats)}) or 'b': ").strip()
+        choice = read_input(f"Enter the number of the beat (1-{len(sorted_beats)}) or 'b': ").strip()
         if choice.lower() == "b":
             return None
         try:
@@ -234,7 +258,7 @@ def select_salesman_with_counts(salesmen_counts):
     print("   b. Back")
     print()
     while True:
-        choice = input(f"Enter the number of the salesman (1-{len(salesmen_counts)}) or 'b': ").strip()
+        choice = read_input(f"Enter the number of the salesman (1-{len(salesmen_counts)}) or 'b': ").strip()
         if choice.lower() == "b":
             return None
         try:
@@ -254,13 +278,13 @@ def paginate_text(text, page_size=20):
         for line in lines[start:start + page_size]:
             print(line)
         if page_num < total_pages:
-            choice = input(f"--- page {page_num}/{total_pages} --- Enter to continue, 'b' to skip --- ").strip().lower()
+            choice = read_input(f"--- page {page_num}/{total_pages} --- Enter to continue, 'b' to skip --- ").strip().lower()
             if choice == "b":
                 return
 
 
 def prompt_continue():
-    while input("\nEnter 'b' to go back: ").strip().lower() != "b":
+    while read_input("\nEnter 'b' to go back: ").strip().lower() != "b":
         pass
 
 
@@ -278,7 +302,7 @@ def prompt_report_selection(reports, labels=None, show_print=False):
         print("  P. Print reports")
 
     while True:
-        choice = input(f"Enter report number (1-{len(reports)}, b to go back): ").strip()
+        choice = read_input(f"Enter report number (1-{len(reports)}, b to go back): ").strip()
         if choice.lower() == "b":
             return None
         if show_print and choice.lower() == "p":
@@ -346,7 +370,13 @@ def get_payment_input(voucher, current_idx, total_records, total_payments_so_far
 
     Returns tuple: (payment_amount_str, action) where action is 'next', 'prev', 'skip', 'quit'
     """
-    balance = Decimal(voucher.get("balance", "0") or "0")
+    try:
+        balance = Decimal(voucher.get("balance", "0") or "0")
+        if not balance.is_finite():
+            raise InvalidOperation
+    except (ValueError, InvalidOperation):
+        balance = Decimal("0")
+        print("Warning: stored balance is invalid — only 0 can be entered; return this report for correction.")
     current_payment = voucher.get("payment", "")
 
     print(f"\nRecord {current_idx + 1}/{total_records}")
@@ -359,7 +389,7 @@ def get_payment_input(voucher, current_idx, total_records, total_payments_so_far
     prompt = f"Payment amount (or command) [{default}]: "
 
     while True:
-        value = input(prompt).strip().lower()
+        value = read_input(prompt).strip().lower()
 
         if value == "n":
             return current_payment, "next"
@@ -374,6 +404,8 @@ def get_payment_input(voucher, current_idx, total_records, total_payments_so_far
         else:
             try:
                 payment = Decimal(value)
+                if not payment.is_finite():
+                    raise InvalidOperation
                 if payment < 0:
                     print("Payment must be zero or positive.")
                     continue
@@ -425,7 +457,7 @@ def display_salesman_beat_summary(salesman, grouped_by_beat):
     print("=" * 60)
 
     while True:
-        choice = input(f"\nSelect beat (1-{len(beats)}) or 'b' to go back: ").strip().lower()
+        choice = read_input(f"\nSelect beat (1-{len(beats)}) or 'b' to go back: ").strip().lower()
         if choice == "b":
             return None
         try:
@@ -643,7 +675,7 @@ def display_confirm_stage_reports(reports, labels, stage_label):
         print(f"  {i}. {label}")
     print("  b. Back")
     while True:
-        choice = input(f"Enter report number (1-{len(labels)}, b to go back): ").strip()
+        choice = read_input(f"Enter report number (1-{len(labels)}, b to go back): ").strip()
         if choice.lower() == "b":
             return None
         try:
@@ -694,7 +726,7 @@ def interactive_payment_editor(vouchers, beats, salesmen, start_idx=0):
         elif action == "skip":
             current_idx += 1
         elif action == "quit":
-            confirm = input("\nDo you want to save changes? (y/n/b): ").strip().lower()
+            confirm = read_input("\nDo you want to save changes? (y/n/b): ").strip().lower()
             if confirm == "y":
                 return vouchers, False, current_idx
             elif confirm in ("n", "b"):
@@ -709,7 +741,7 @@ def interactive_payment_editor(vouchers, beats, salesmen, start_idx=0):
 
 def prompt_csv_file_path(label):
     """Prompt for a CSV file path. Returns path string (may be empty to skip), or None to cancel."""
-    value = input(f"\nPath to {label} CSV (Enter to skip, 'b' to cancel): ").strip()
+    value = read_input(f"\nPath to {label} CSV (Enter to skip, 'b' to cancel): ").strip()
     if value.lower() == "b":
         return None
     return value
@@ -725,12 +757,12 @@ def prompt_voucher_fields(salesmen=None):
     today = datetime.now().strftime("%Y-%m-%d")
     print("\n-- New Voucher --")
 
-    bill_no = input("Bill No ('b' or Enter when done): ").strip()
+    bill_no = read_input("Bill No ('b' or Enter when done): ").strip()
     if not bill_no or bill_no.lower() == "b":
         return None
 
-    date_str = input(f"Date [YYYY-MM-DD, Enter for {today}]: ").strip() or today
-    amount_str = input("Amount: ").strip()
+    date_str = read_input(f"Date [YYYY-MM-DD, Enter for {today}]: ").strip() or today
+    amount_str = read_input("Amount: ").strip()
 
     salesman = None
     if salesmen is not None:
@@ -750,10 +782,10 @@ def prompt_installments_for_voucher(bill_no):
     today = datetime.now().strftime("%Y-%m-%d")
     print("  Installments — enter amount, 'b' or empty to finish:")
     while True:
-        amount_str = input("  Amount: ").strip()
+        amount_str = read_input("  Amount: ").strip()
         if not amount_str or amount_str.lower() == "b":
             break
-        date_str = input(f"  Date [Enter for {today}]: ").strip() or today
+        date_str = read_input(f"  Date [Enter for {today}]: ").strip() or today
         installments.append({"bill_no": bill_no, "date": date_str, "amount_str": amount_str})
     return installments
 
@@ -846,7 +878,7 @@ def prompt_pending_addv_choice(batches):
         display_addv_report(data)
         print()
         while True:
-            choice = input("Continue this batch (c) / Start New (n) / Back (b): ").strip().lower()
+            choice = read_input("Continue this batch (c) / Start New (n) / Back (b): ").strip().lower()
             if choice == "c":
                 return 0, "continue"
             if choice == "n":
@@ -864,7 +896,7 @@ def prompt_pending_addv_choice(batches):
             print(f"  {i}. {date}  |  beat: {beat}  |  {len(vouchers)} voucher(s)  |  total: {total}")
         print()
         while True:
-            raw = input(f"Select batch to continue (1-{len(batches)}) / New (n) / Back (b): ").strip().lower()
+            raw = read_input(f"Select batch to continue (1-{len(batches)}) / New (n) / Back (b): ").strip().lower()
             if raw == "n":
                 return None, "new"
             if raw == "b":
