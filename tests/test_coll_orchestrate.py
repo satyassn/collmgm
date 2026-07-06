@@ -111,12 +111,24 @@ class TestApplySubmitApproval(OrchestrateTestCase):
         persisted = json.loads(report_path.read_text(encoding="utf-8"))
         self.assertEqual(persisted["stages"]["submit"], "returned")
 
-    def test_missing_stages_key_is_created(self):
+    def test_missing_stages_key_is_rejected(self):
+        # A report with no stages block is not in the 'submitted' stage, so
+        # approving it must fail the stage guard rather than invent the key.
         data = self._report()
         del data["stages"]
         report_path = self._write_json("coll1.json", data)
-        coll_orchestrate.apply_submit_approval(report_path, data, "approve")
-        self.assertEqual(data["stages"]["submit"], "confirmed")
+        with self.assertRaises(coll_orchestrate.StageError):
+            coll_orchestrate.apply_submit_approval(report_path, data, "approve")
+
+    def test_wrong_stage_is_rejected(self):
+        for submit_stage in ("", "inprogress", "returned", "confirmed"):
+            data = self._report(stage_submit=submit_stage)
+            report_path = self._write_json("coll1.json", data)
+            with self.assertRaises(coll_orchestrate.StageError):
+                coll_orchestrate.apply_submit_approval(report_path, data, "approve")
+            # Nothing persisted — the file still holds the original stage.
+            persisted = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["stages"]["submit"], submit_stage)
 
 
 class TestCheckActiveBeatReport(OrchestrateTestCase):
@@ -367,13 +379,16 @@ class TestPostConfirmedReport(PostTestCase):
         data = self._post_report(payment="100.00")
         report_path = self._write_staging_json("coll1.json", data)
 
-        outcome = coll_orchestrate.post_confirmed_report(report_path, data)
+        outcome = coll_orchestrate.post_confirmed_report(report_path)
 
         self.assertTrue(outcome.ok, outcome.error)
         self.assertEqual(outcome.completed_bill_nos, ["1"])
         self.assertEqual(outcome.total_collected, coll_orchestrate.Decimal("100.00"))
         self.assertEqual(outcome.paid_count, 1)
-        self.assertEqual(data["stages"]["post"], "confirmed")
+        # post_confirmed_report re-reads the report inside its claim, so the
+        # confirmed stage lands in the (archived) file, not the caller's dict.
+        archived = json.loads((self.tmp / "archive" / "coll1.json").read_text(encoding="utf-8"))
+        self.assertEqual(archived["stages"]["post"], "confirmed")
         self.assertEqual(self._query("SELECT * FROM vouchers WHERE bill_no = '1'"), [])
         completed = self._query("SELECT * FROM completed_vouchers WHERE bill_no = '1'")
         self.assertEqual(len(completed), 1)
@@ -387,7 +402,7 @@ class TestPostConfirmedReport(PostTestCase):
         data = self._post_report(payment="40.00")
         report_path = self._write_staging_json("coll1.json", data)
 
-        outcome = coll_orchestrate.post_confirmed_report(report_path, data)
+        outcome = coll_orchestrate.post_confirmed_report(report_path)
 
         self.assertTrue(outcome.ok, outcome.error)
         self.assertEqual(outcome.completed_bill_nos, [])
@@ -401,7 +416,7 @@ class TestPostConfirmedReport(PostTestCase):
         report_path = self._write_staging_json("coll1.json", data)
 
         with patch.object(coll_orchestrate, "_update_vouchers_balance", side_effect=RuntimeError("boom")):
-            outcome = coll_orchestrate.post_confirmed_report(report_path, data)
+            outcome = coll_orchestrate.post_confirmed_report(report_path)
 
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.step_failed, 2)
@@ -418,7 +433,7 @@ class TestPostConfirmedReport(PostTestCase):
         report_path = self._write_staging_json("coll1.json", data)
 
         with patch.object(coll_orchestrate, "save_report_json", side_effect=RuntimeError("disk full")):
-            outcome = coll_orchestrate.post_confirmed_report(report_path, data)
+            outcome = coll_orchestrate.post_confirmed_report(report_path)
 
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.step_failed, 5)
@@ -433,7 +448,7 @@ class TestPostConfirmedReport(PostTestCase):
         report_path = self._write_staging_json("coll1.json", data)
 
         with patch.object(coll_orchestrate, "archive_files", side_effect=RuntimeError("locked")):
-            outcome = coll_orchestrate.post_confirmed_report(report_path, data)
+            outcome = coll_orchestrate.post_confirmed_report(report_path)
 
         self.assertTrue(outcome.ok)
         self.assertEqual(outcome.archive_warning, "locked")
@@ -445,10 +460,63 @@ class TestPostConfirmedReport(PostTestCase):
         data = self._post_report(payment="100.00")
         report_path = self._write_staging_json("coll1.json", data)
 
-        outcome = coll_orchestrate.post_confirmed_report(report_path, data)
+        outcome = coll_orchestrate.post_confirmed_report(report_path)
 
         self.assertTrue(outcome.ok)
         self.assertTrue(coll_store.acquire_beat_lock("beat1"))
+
+
+class TestPostStageGuards(PostTestCase):
+    def test_unapproved_report_is_not_posted(self):
+        self._insert_voucher(balance="100.00")
+        for submit_stage in ("", "inprogress", "submitted", "returned"):
+            data = self._post_report(payment="40.00")
+            data["stages"]["submit"] = submit_stage
+            report_path = self._write_staging_json("coll1.json", data)
+
+            outcome = coll_orchestrate.post_confirmed_report(report_path)
+
+            self.assertFalse(outcome.ok)
+            self.assertIn("not approved for posting", outcome.error)
+            self.assertIsNone(outcome.step_failed)
+            # No DB writes happened: balance untouched, no installments.
+            rows = self._query("SELECT balance FROM vouchers WHERE bill_no = '1'")
+            self.assertEqual(rows[0]["balance"], "100.00")
+            self.assertEqual(self._query("SELECT * FROM installments"), [])
+            report_path.unlink()
+
+    def test_concurrent_post_claim_fails_fast(self):
+        self._insert_voucher(balance="100.00")
+        data = self._post_report(payment="40.00")
+        report_path = self._write_staging_json("coll1.json", data)
+
+        # Simulate another session mid-post: the claim is held.
+        self.assertTrue(coll_store.acquire_post_claim(report_path))
+        outcome = coll_orchestrate.post_confirmed_report(report_path)
+        self.assertFalse(outcome.ok)
+        self.assertIn("already being posted", outcome.error)
+        rows = self._query("SELECT balance FROM vouchers WHERE bill_no = '1'")
+        self.assertEqual(rows[0]["balance"], "100.00")
+
+        # Once released, the same report posts normally — exactly once.
+        coll_store.release_post_claim(report_path)
+        outcome = coll_orchestrate.post_confirmed_report(report_path)
+        self.assertTrue(outcome.ok, outcome.error)
+        rows = self._query("SELECT balance FROM vouchers WHERE bill_no = '1'")
+        self.assertEqual(rows[0]["balance"], "60.00")
+
+    def test_claim_released_after_failed_post(self):
+        # A failure inside the sequence must not leave the claim behind,
+        # or the retry the checkpoint message asks for would be impossible.
+        self._insert_voucher(balance="100.00")
+        data = self._post_report(payment="100.00")
+        report_path = self._write_staging_json("coll1.json", data)
+
+        with patch.object(coll_orchestrate, "_update_vouchers_balance", side_effect=RuntimeError("boom")):
+            outcome = coll_orchestrate.post_confirmed_report(report_path)
+        self.assertFalse(outcome.ok)
+        self.assertTrue(coll_store.acquire_post_claim(report_path))
+        coll_store.release_post_claim(report_path)
 
 
 class TestReturnPostStage(PostTestCase):
@@ -459,6 +527,87 @@ class TestReturnPostStage(PostTestCase):
         self.assertEqual(result["stages"]["submit"], "submitted")
         persisted = json.loads(report_path.read_text(encoding="utf-8"))
         self.assertEqual(persisted["stages"]["submit"], "submitted")
+
+    def test_rejects_report_not_awaiting_post(self):
+        data = self._post_report()
+        data["stages"]["submit"] = "submitted"
+        report_path = self._write_staging_json("coll1.json", data)
+        with self.assertRaises(coll_orchestrate.StageError):
+            coll_orchestrate.return_post_stage(report_path, data)
+
+
+class TestApplyStartApprovalStageGuard(OrchestrateTestCase):
+    def test_rejects_non_new_report(self):
+        for action in ("approve", "return", "cancel"):
+            data = self._report(stage_submit="submitted")  # start=confirmed
+            report_path = self._write_staging_json("coll1.json", data)
+            with self.assertRaises(coll_orchestrate.StageError):
+                coll_orchestrate.apply_start_approval(report_path, data, action)
+            # In particular: cancel must NOT delete a report in the submit pipeline.
+            self.assertTrue(report_path.exists())
+            report_path.unlink()
+
+
+class TestRecordSubmitPaymentsStageGuard(OrchestrateTestCase):
+    def test_rejects_already_submitted_report(self):
+        for submit_stage in ("submitted", "confirmed"):
+            data = self._report(stage_submit=submit_stage)
+            report_path = self._write_staging_json("coll1.json", data)
+            with self.assertRaises(coll_orchestrate.StageError):
+                coll_orchestrate.record_submit_payments(report_path, data, data["vouchers"],
+                                                        submit_for_review=False)
+            # No installments sidecar written for the rejected save.
+            sidecar = report_path.parent / f"{report_path.stem}-installments.json"
+            self.assertFalse(sidecar.exists())
+            report_path.unlink()
+
+    def test_rejects_unapproved_start(self):
+        data = self._report(stage_submit="")
+        data["stages"]["start"] = "new"
+        report_path = self._write_staging_json("coll1.json", data)
+        with self.assertRaises(coll_orchestrate.StageError):
+            coll_orchestrate.record_submit_payments(report_path, data, data["vouchers"],
+                                                    submit_for_review=False)
+
+    def test_allows_resume_stages(self):
+        for submit_stage in ("", "inprogress", "returned"):
+            data = self._report(stage_submit=submit_stage)
+            report_path = self._write_staging_json("coll1.json", data)
+            result = coll_orchestrate.record_submit_payments(report_path, data, data["vouchers"],
+                                                             submit_for_review=False)
+            self.assertEqual(result["stages"]["submit"], "inprogress")
+            report_path.unlink()
+
+
+class TestValidatePayment(unittest.TestCase):
+    def test_empty_stays_empty(self):
+        self.assertEqual(coll_orchestrate.validate_payment("", "50.00"), ("", None))
+        self.assertEqual(coll_orchestrate.validate_payment("   ", "50.00"), ("", None))
+        self.assertEqual(coll_orchestrate.validate_payment(None, "50.00"), ("", None))
+
+    def test_valid_amount_is_quantized(self):
+        self.assertEqual(coll_orchestrate.validate_payment("10", "50.00"), ("10.00", None))
+        self.assertEqual(coll_orchestrate.validate_payment(" 10.5 ", "50.00"), ("10.50", None))
+        self.assertEqual(coll_orchestrate.validate_payment("50.00", "50.00"), ("50.00", None))
+
+    def test_rejects_non_numbers(self):
+        for bad in ("abc", "10x", "NaN", "Infinity", "-Infinity"):
+            normalized, reason = coll_orchestrate.validate_payment(bad, "50.00")
+            self.assertIsNone(normalized, bad)
+            self.assertEqual(reason, "not a number")
+
+    def test_rejects_negative(self):
+        normalized, reason = coll_orchestrate.validate_payment("-5", "50.00")
+        self.assertIsNone(normalized)
+        self.assertEqual(reason, "cannot be negative")
+
+    def test_rejects_over_balance(self):
+        normalized, reason = coll_orchestrate.validate_payment("50.01", "50.00")
+        self.assertIsNone(normalized)
+        self.assertIn("exceeds balance", reason)
+
+    def test_unparseable_balance_skips_balance_check(self):
+        self.assertEqual(coll_orchestrate.validate_payment("10", "garbage"), ("10.00", None))
 
 
 if __name__ == "__main__":

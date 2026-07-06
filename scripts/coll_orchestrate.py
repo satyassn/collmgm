@@ -10,21 +10,41 @@ constraint already enforced on coll_data.
 """
 
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Literal, NamedTuple, Optional
 
 from coll_data import _find_any_active_beat_report
 from coll_store import (
     STAGING_DIR,
-    save_report_json, write_collection_text, bill_no_sort_key,
+    save_report_json, load_report_json, write_collection_text, bill_no_sort_key,
     ensure_staging_dir, sanitize_filename_component,
     acquire_beat_lock, release_beat_lock, cancel_staging_report,
+    acquire_post_claim, release_post_claim,
     _save_installments, _installments_path,
     _append_installments_csv, _update_vouchers_balance, _archive_completed,
     archive_files,
     write_finalize_checkpoint, clear_finalize_checkpoint, read_finalize_checkpoint,
 )
+
+
+class StageError(ValueError):
+    """A transition was applied to a report that is not in the required stage.
+
+    Raised by the transition functions below so both UIs reject requests that
+    arrive after the report has already moved on — a stale page, a double
+    click, or a hand-crafted request that skipped the stage's listing screen.
+    """
+
+
+def _require_stage(report_data, ok, action_desc):
+    if not ok:
+        s = report_data.get("stages", {})
+        raise StageError(
+            f"Report cannot be {action_desc} in its current stage "
+            f"(start={s.get('start') or '-'}, submit={s.get('submit') or '-'}, "
+            f"post={s.get('post') or '-'})."
+        )
 
 
 def prepare_submit_review(report_path, report_data):
@@ -51,9 +71,13 @@ def apply_submit_approval(report_path, report_data, action: Literal["approve", "
 
     'approve' -> stages.submit = 'confirmed' (ready to post).
     'return'  -> stages.submit = 'returned' (salesman must revise).
+    Requires stages.submit == 'submitted' (StageError otherwise).
     Persists report_data via save_report_json; raises on I/O failure —
     caller decides how to surface it (print vs error.html).
     """
+    stages = report_data.get("stages", {})
+    _require_stage(report_data, stages.get("submit") == "submitted",
+                   "approved" if action == "approve" else "returned")
     report_data.setdefault("stages", {})["submit"] = "confirmed" if action == "approve" else "returned"
     save_report_json(report_path, report_data)
     return report_data
@@ -155,12 +179,18 @@ def approve_start_stage(report_path, report_data):
 def apply_start_approval(report_path, report_data, action: Literal["approve", "return", "cancel"]):
     """Approve, return, or cancel a start-stage (pending-approval) report.
 
+    Requires stages.start == 'new' (StageError otherwise) — once a list is
+    approved or in the submit pipeline it can no longer be approved again,
+    returned, or cancelled here.
+
     'return' and 'cancel' are the same store operation today (delete staging
     + release the beat lock) — kept as two literal values only because the
     two call sites (coll-approve-start vs. coll-start's inline handling of an
     already-pending report) use different wording for the same action, not
     because the state machine actually diverges.
     """
+    _require_stage(report_data, report_data.get("stages", {}).get("start") == "new",
+                   {"approve": "approved", "return": "returned", "cancel": "cancelled"}[action])
     if action == "approve":
         return approve_start_stage(report_path, report_data)
     beat_name = report_data.get("selection", [None])[0]
@@ -204,8 +234,17 @@ def record_submit_payments(report_path, report_data, vouchers, submit_for_review
                                 sidecar (skipped if `vouchers` is empty, matching
                                 the more defensive of the two pre-unification
                                 implementations — see approve_start_stage).
-    Raises on I/O failure — caller decides how to surface it.
+    Requires an approved report not already submitted/approved: stages.start ==
+    'confirmed' and stages.submit not in ('submitted', 'confirmed') — the same
+    filter _load_confirmed_start_reports applies to build the submit listing.
+    Raises StageError otherwise, on I/O failure the underlying OSError —
+    caller decides how to surface it.
     """
+    stages = report_data.get("stages", {})
+    _require_stage(report_data,
+                   stages.get("start") == "confirmed"
+                   and stages.get("submit") not in ("submitted", "confirmed"),
+                   "edited")
     _save_installments(report_path, vouchers, bookmark_bill_no=bookmark_bill_no)
     report_data.setdefault("stages", {})["submit"] = "submitted" if submit_for_review else "inprogress"
     report_data["vouchers"] = vouchers
@@ -214,6 +253,37 @@ def record_submit_payments(report_path, report_data, vouchers, submit_for_review
         write_collection_text(report_path.with_suffix(".txt"), beats or [], salesmen or [],
                               vouchers, stage="submit", status="submitted")
     return report_data
+
+
+def validate_payment(raw, balance):
+    """Validate one payment entry against a voucher balance.
+
+    Returns (normalized, None) on success — empty stays empty, amounts come
+    back quantized to 2dp — or (None, reason) on rejection. Mirrors the CLI's
+    interactive payment-editor rules in coll_cli: a finite number, not
+    negative, at most the outstanding balance.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return "", None
+    try:
+        amount = Decimal(raw)
+        if not amount.is_finite():
+            raise InvalidOperation
+    except InvalidOperation:
+        return None, "not a number"
+    if amount < 0:
+        return None, "cannot be negative"
+    try:
+        balance_dec = Decimal(balance or "0")
+    except InvalidOperation:
+        balance_dec = None
+    if balance_dec is not None and amount > balance_dec:
+        return None, f"exceeds balance ({balance})"
+    try:
+        return str(amount.quantize(Decimal("0.01"))), None
+    except InvalidOperation:
+        return None, "not a number"
 
 
 # ---------------------------------------------------------------------------
@@ -230,8 +300,13 @@ class PostOutcome(NamedTuple):
     paid_count: int
 
 
-def post_confirmed_report(report_path, report_data):
+def post_confirmed_report(report_path):
     """Checkpointed write-to-DB sequence for a submit-confirmed report.
+
+    Single-flight: an atomic claim file makes a concurrent post of the same
+    report fail fast instead of deducting balances twice, and report_data is
+    re-read from disk inside the claim so the stage check (stages.submit ==
+    'confirmed', not yet posted) cannot race a concurrent approve/return.
 
     Steps (checkpointed via write_finalize_checkpoint so a crash mid-sequence
     can be diagnosed): append installments -> update voucher balances ->
@@ -242,8 +317,31 @@ def post_confirmed_report(report_path, report_data):
     the existing at-least-once semantics both UIs already relied on) and the
     returned PostOutcome has ok=False with step_failed/error set. Does not
     raise — both UIs need to render a message either way, so the outcome is
-    always a normal return value rather than an exception.
+    always a normal return value rather than an exception. Claim and stage
+    failures come back the same way, with step_failed=None.
     """
+    if not acquire_post_claim(report_path):
+        return PostOutcome(False, None,
+                           "This report is already being posted by another session.",
+                           None, [], Decimal("0"), 0)
+    try:
+        return _post_claimed_report(report_path)
+    finally:
+        release_post_claim(report_path)
+
+
+def _post_claimed_report(report_path):
+    try:
+        report_data = load_report_json(report_path)
+    except Exception as error:
+        return PostOutcome(False, None, f"Could not read report: {error}",
+                           None, [], Decimal("0"), 0)
+    stages = report_data.get("stages", {}) if isinstance(report_data, dict) else {}
+    if stages.get("submit") != "confirmed" or stages.get("post") == "confirmed":
+        return PostOutcome(False, None,
+                           "Report is not approved for posting — supervisor approval is required first.",
+                           None, [], Decimal("0"), 0)
+
     vouchers = sorted(report_data["vouchers"], key=lambda v: bill_no_sort_key(v["bill_no"]))
     report_data["vouchers"] = vouchers
     beat = report_data.get("selection", [None])[0]
@@ -286,7 +384,14 @@ def post_confirmed_report(report_path, report_data):
 
 
 def return_post_stage(report_path, report_data):
-    """Send a submit-confirmed report back to the supervisor for re-approval."""
+    """Send a submit-confirmed report back to the supervisor for re-approval.
+
+    Requires stages.submit == 'confirmed' and not yet posted (StageError otherwise).
+    """
+    stages = report_data.get("stages", {})
+    _require_stage(report_data,
+                   stages.get("submit") == "confirmed" and stages.get("post") != "confirmed",
+                   "returned")
     report_data.setdefault("stages", {})["submit"] = "submitted"
     save_report_json(report_path, report_data)
     return report_data

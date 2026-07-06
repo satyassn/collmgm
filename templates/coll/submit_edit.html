@@ -5,6 +5,10 @@
 <p class="meta-line"><strong>Beat:</strong> {{ beat }} &nbsp;|&nbsp; <strong>Salesman:</strong> {{ salesman }}</p>
 <p class="hint">Enter collected amounts below. Leave blank for no payment. Submit when done.</p>
 
+{% if error %}
+  <p class="alert alert-error">{{ error }}</p>
+{% endif %}
+
 <div class="summary-box">
   <span id="payment-count">{{ paid_count }} vouchers collected</span>
   <span class="summary-total">Total: <strong id="payment-total">{{ total_collected }}</strong></span>

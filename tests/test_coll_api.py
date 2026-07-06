@@ -524,5 +524,175 @@ class TestReportsScopedToSalesman(ApiTestCase):
         self.assertNotIn("You can only view your own pending collections.", body)
 
 
+# ---------------------------------------------------------------------------
+# Report stems must be confined to STAGING_DIR — no path traversal via the
+# {stem} path parameter or the report_stem form field.
+# ---------------------------------------------------------------------------
+
+class TestStemPathTraversal(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self._add_user("smA", "salesman", "pwA")
+        self._add_user("sup", "supervisor", "pwS")
+        # A well-formed report sitting OUTSIDE staging: even a target the
+        # handler would otherwise accept must be rejected purely on the stem.
+        self.secret = self.tmp / "data" / "secret.json"
+        self.secret.write_text(json.dumps({
+            "selection_type": "beat_salesman",
+            "selection": ["beatA", "smA"],
+            "stages": {"start": "new", "submit": "", "post": ""},
+            "vouchers": [],
+        }), encoding="utf-8")
+
+    def test_form_stem_with_separators_cannot_delete_outside_staging(self):
+        opener = self._login("smA", "pwA")
+        for stem in ("../data/secret", "..\\data\\secret", "../../etc/passwd"):
+            status, body = self._post(opener, "/coll/start/confirm",
+                                      {"action": "cancel", "report_stem": stem})
+            self.assertEqual(status, 200)
+            self.assertIn("Report not found.", body)
+        self.assertTrue(self.secret.exists())
+
+    def test_path_param_with_encoded_backslash_is_rejected(self):
+        opener = self._login("sup", "pwS")
+        status, body = self._get(opener, "/coll/approve-start/..%5Cdata%5Csecret")
+        self.assertEqual(status, 200)
+        self.assertIn("Report not found.", body)
+
+
+# ---------------------------------------------------------------------------
+# Stage guards on the POST transition endpoints — a request that arrives for
+# a report in the wrong stage (stale page, forged URL) must be rejected.
+# ---------------------------------------------------------------------------
+
+class TestStageGuardEndpoints(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self._add_user("smA", "salesman", "pwA")
+        self._add_user("sup", "supervisor", "pwS")
+        self._add_user("dist", "distributor", "pwD")
+        self._add_beat("beatA", "smA")
+        self._add_voucher("900", "beatA", "smA", balance="50.00")
+        self.stem = "coll20260101-beat_salesman-beatA_smA"
+
+    def _report_with_payment(self, submit, payment="20.00"):
+        return self._write_staging_report(
+            self.stem, "beatA", "smA", start="confirmed", submit=submit,
+            vouchers=[{"bill_no": "900", "date": "2026-01-01", "balance": "50.00",
+                       "payment": payment, "payment_date": "2026-01-01",
+                       "beat": "beatA", "salesman": "smA"}],
+        )
+
+    def _voucher_balance(self):
+        conn = coll_store.get_db()
+        try:
+            row = conn.execute("SELECT balance FROM vouchers WHERE bill_no = '900'").fetchone()
+            return row["balance"] if row else None
+        finally:
+            conn.close()
+
+    def test_unapproved_report_cannot_be_posted(self):
+        self._report_with_payment(submit="submitted")
+        opener = self._login("dist", "pwD")
+        status, body = self._post(opener, f"/coll/post/{self.stem}", {"action": "post"})
+        self.assertEqual(status, 200)
+        self.assertIn("not approved for posting", body)
+        self.assertEqual(self._voucher_balance(), "50.00")
+
+    def test_second_post_of_same_report_is_rejected(self):
+        path = self._report_with_payment(submit="confirmed")
+        opener = self._login("dist", "pwD")
+
+        # Another session holds the posting claim -> fail fast, no deduction.
+        self.assertTrue(coll_store.acquire_post_claim(path))
+        status, body = self._post(opener, f"/coll/post/{self.stem}", {"action": "post"})
+        self.assertIn("already being posted", body)
+        self.assertEqual(self._voucher_balance(), "50.00")
+        coll_store.release_post_claim(path)
+
+        # Normal post succeeds exactly once...
+        status, body = self._post(opener, f"/coll/post/{self.stem}", {"action": "post"})
+        self.assertIn("Posted.", body)
+        self.assertEqual(self._voucher_balance(), "30.00")
+
+        # ...and a repeat click finds the report archived, not re-postable.
+        status, body = self._post(opener, f"/coll/post/{self.stem}", {"action": "post"})
+        self.assertIn("Report not found.", body)
+        self.assertEqual(self._voucher_balance(), "30.00")
+
+    def test_salesman_cannot_edit_payments_after_submitting(self):
+        path = self._report_with_payment(submit="submitted")
+        opener = self._login("smA", "pwA")
+        status, body = self._post(opener, f"/coll/submit/{self.stem}",
+                                  {"action": "save", "pay_900": "1.00"})
+        self.assertEqual(status, 200)
+        self.assertIn("cannot be edited", body)
+        sidecar = path.parent / f"{path.stem}-installments.json"
+        self.assertFalse(sidecar.exists())
+
+    def test_supervisor_cannot_cancel_report_in_submit_pipeline(self):
+        path = self._report_with_payment(submit="submitted")
+        opener = self._login("sup", "pwS")
+        status, body = self._post(opener, f"/coll/approve-start/{self.stem}",
+                                  {"action": "cancel"})
+        self.assertEqual(status, 200)
+        self.assertIn("cannot be cancelled", body)
+        self.assertTrue(path.exists())
+
+    def test_approve_submit_requires_submitted_stage(self):
+        self._report_with_payment(submit="confirmed")
+        opener = self._login("sup", "pwS")
+        status, body = self._post(opener, f"/coll/approve-submit/{self.stem}",
+                                  {"action": "approve"})
+        self.assertEqual(status, 200)
+        self.assertIn("cannot be approved", body)
+
+
+# ---------------------------------------------------------------------------
+# POST /coll/submit/{stem} must validate payments server-side — the
+# type="number" input is advisory, not a boundary.
+# ---------------------------------------------------------------------------
+
+class TestSubmitPaymentValidation(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self._add_user("smA", "salesman", "pwA")
+        self.stem = "coll20260101-beat_salesman-beatA_smA"
+        self.path = self._write_staging_report(
+            self.stem, "beatA", "smA", start="confirmed", submit="",
+            vouchers=[{"bill_no": "900", "date": "2026-01-01", "balance": "50.00",
+                       "payment": "", "payment_date": "", "beat": "beatA", "salesman": "smA"}],
+        )
+        self.sidecar = self.path.parent / f"{self.path.stem}-installments.json"
+        self.opener = self._login("smA", "pwA")
+
+    def _save(self, payment):
+        return self._post(self.opener, f"/coll/submit/{self.stem}",
+                          {"action": "save", "pay_900": payment})
+
+    def test_non_numeric_payment_rejected_and_nothing_saved(self):
+        status, body = self._save("abc")
+        self.assertEqual(status, 200)
+        self.assertIn("Nothing saved", body)
+        self.assertIn("not a number", body)
+        self.assertFalse(self.sidecar.exists())
+
+    def test_negative_payment_rejected(self):
+        status, body = self._save("-5")
+        self.assertIn("cannot be negative", body)
+        self.assertFalse(self.sidecar.exists())
+
+    def test_payment_over_balance_rejected(self):
+        status, body = self._save("60")
+        self.assertIn("exceeds balance", body)
+        self.assertFalse(self.sidecar.exists())
+
+    def test_valid_payment_saved_quantized(self):
+        status, body = self._save("20")
+        self.assertIn("Progress saved.", body)
+        saved = json.loads(self.sidecar.read_text(encoding="utf-8"))
+        self.assertEqual(saved["900"]["payment"], "20.00")
+
+
 if __name__ == "__main__":
     unittest.main()
