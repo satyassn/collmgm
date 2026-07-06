@@ -45,7 +45,7 @@ from coll_data import (
     load_addv_pending_confirm_by_beat,
 )
 from coll_cli import (
-    prompt_login, clear_screen,
+    read_input, prompt_login, clear_screen,
     select_from_list, select_beat_with_summary, select_salesman_with_counts,
     prompt_continue, prompt_report_selection,
     interactive_payment_editor,
@@ -71,7 +71,7 @@ def run_login():
         if user:
             return user
         print("\nInvalid username or password. Please try again.")
-        input("Press Enter to retry...")
+        read_input("Press Enter to retry...")
 
 
 def _report_label(report_data, fallback_name):
@@ -171,7 +171,7 @@ def run_coll_start(current_user):
             print("\n(Collection list is awaiting supervisor approval.)")
 
             while True:
-                choice = input("\nApprove (y) / Cancel (c) / Back (b): ").strip().lower()
+                choice = read_input("\nApprove (y) / Cancel (c) / Back (b): ").strip().lower()
                 if choice == "b":
                     break  # back to beat selection
                 action = "approve" if choice == "y" else "cancel" if choice == "c" else None
@@ -207,7 +207,7 @@ def run_coll_start(current_user):
         print(txt_path.read_text(encoding="utf-8"))
 
         while True:
-            confirm = input("Keep this collection list? (y/n): ").strip().lower()
+            confirm = read_input("Keep this collection list? (y/n): ").strip().lower()
             if confirm in ("y", "yes", "n", "no"):
                 break
             print("Please enter 'y' or 'n'.")
@@ -228,7 +228,7 @@ def run_coll_start(current_user):
 
 def _prompt_submit_for_review(report_path, report_data, vouchers, beats, salesmen):
     """Ask whether to submit a report for supervisor review and apply the result."""
-    submit_confirm = input("Submit this report for supervisor review? (y/n/b): ").strip().lower()
+    submit_confirm = read_input("Submit this report for supervisor review? (y/n/b): ").strip().lower()
     if submit_confirm not in ("y", "yes"):
         print(f"Collections saved. Submission deferred for {report_path.name}.")
         return
@@ -342,7 +342,7 @@ def run_coll_submit(current_user):
                 print(f"  Resuming from bookmarked record: {bookmark_bill_no}")
 
         while True:
-            pre_edit = input("\nEdit (e) / Cancel (c) / Back (b): ").strip().lower()
+            pre_edit = read_input("\nEdit (e) / Cancel (c) / Back (b): ").strip().lower()
             if pre_edit in ("e", ""):
                 break
             if pre_edit == "c":
@@ -381,7 +381,7 @@ def run_coll_submit(current_user):
             continue
 
         while True:
-            save_confirm = input("\nSave these collections? (y/n/b): ").strip().lower()
+            save_confirm = read_input("\nSave these collections? (y/n/b): ").strip().lower()
             if save_confirm in ("y", "yes", "n", "no", "b"):
                 break
             print("Please enter 'y', 'n', or 'b'.")
@@ -456,7 +456,7 @@ def run_coll_post(current_user):
 
         do_post = False
         while True:
-            confirm = input("Post (y) / Return (r) / Back (b): ").strip().lower()
+            confirm = read_input("Post (y) / Return (r) / Back (b): ").strip().lower()
             if confirm in ("y", "yes"):
                 do_post = True
                 break
@@ -523,7 +523,7 @@ def run_coll_approve_start(current_user):
         display_report_for_review(report_data, txt_path)
 
         while True:
-            confirm = input("\nApprove (y) / Return (r) / Cancel (c) / Back (b): ").strip().lower()
+            confirm = read_input("\nApprove (y) / Return (r) / Cancel (c) / Back (b): ").strip().lower()
             if confirm == "b":
                 break
             if confirm in ("r", "c"):
@@ -580,7 +580,7 @@ def run_coll_approve_submit(current_user):
         display_report_for_review(report_data, txt_path)
 
         while True:
-            confirm = input("\nApprove (y) / Return (r) / Back (b): ").strip().lower()
+            confirm = read_input("\nApprove (y) / Return (r) / Back (b): ").strip().lower()
             if confirm == "b":
                 break
             action = "approve" if confirm in ("y", "yes") else "return" if confirm == "r" else None
@@ -629,7 +629,7 @@ def run_report_salesman_pending(current_user):
         if beat is None:
             return
         display_salesman_beat_vouchers(salesman, beat, grouped[beat])
-        while input("\nEnter 'b' to go back: ").strip().lower() != "b":
+        while read_input("\nEnter 'b' to go back: ").strip().lower() != "b":
             pass
 
 
@@ -686,7 +686,7 @@ def run_voucher_search():
     print("\n" + "-" * 50)
     print("Report: Search Voucher")
     print("-" * 50)
-    bill_no = input("Enter bill number: ").strip()
+    bill_no = read_input("Enter bill number: ").strip()
     if not bill_no:
         prompt_continue()
         return
@@ -737,7 +737,7 @@ def _run_add_vouchers_supervisor_menu(current_user):
         print("2. Approve new vouchers")
         print("0. Back")
         print("=" * 50)
-        choice = input("Enter choice (0-2): ").strip()
+        choice = read_input("Enter choice (0-2): ").strip()
         if choice in ("0", "b", ""):
             return
         elif choice == "1":
@@ -770,7 +770,7 @@ def run_confirm_addv_by_beat(current_user):
             print(f"  {i:2}. {b:<{beat_w}}   {count} voucher(s)")
         print("   b. Back")
 
-        choice = input(f"\nSelect beat (1-{len(beats_sorted)}, b to go back): ").strip().lower()
+        choice = read_input(f"\nSelect beat (1-{len(beats_sorted)}, b to go back): ").strip().lower()
         if choice == "b":
             return
         try:
@@ -788,7 +788,7 @@ def run_confirm_addv_by_beat(current_user):
         print("-" * 50)
         display_addv_summary(beat_data["vouchers"], beat_data["installments"])
 
-        confirm = input("\nApprove these new vouchers? (y/n/b): ").strip().lower()
+        confirm = read_input("\nApprove these new vouchers? (y/n/b): ").strip().lower()
         if confirm == "b":
             continue
         if confirm not in ("y", "yes"):
@@ -872,7 +872,7 @@ def run_add_vouchers_inline(current_user):
         print(f"  Resuming batch from {resume_data['created_at'][:10]} — {len(all_vouchers)} voucher(s) loaded.")
         print("-" * 50)
         display_addv_summary(all_vouchers, all_installments)
-        input("\nPress Enter to continue adding vouchers...")
+        read_input("\nPress Enter to continue adding vouchers...")
     else:
         all_vouchers = []
         all_installments = []
@@ -905,7 +905,7 @@ def run_add_vouchers_inline(current_user):
         if errs:
             for e in errs:
                 print(f"  Error: {e}")
-            input("\nPress Enter to continue...")
+            read_input("\nPress Enter to continue...")
             continue
 
         inst_fields = prompt_installments_for_voucher(fields["bill_no"])
@@ -926,7 +926,7 @@ def run_add_vouchers_inline(current_user):
 
         if inst_sum > amount:
             print(f"  Error: total installments ({inst_sum}) exceed amount ({amount}). Voucher not added.")
-            input("\nPress Enter to continue...")
+            read_input("\nPress Enter to continue...")
             continue
 
         balance = (amount - inst_sum).quantize(Decimal("0.01"))
@@ -963,7 +963,7 @@ def run_add_vouchers_inline(current_user):
     print(f"\n{len(all_vouchers)} voucher(s) ready to stage:")
     display_addv_summary(all_vouchers, all_installments)
 
-    ans = input("\nSave to staging? (y/n): ").strip().lower()
+    ans = read_input("\nSave to staging? (y/n): ").strip().lower()
     if ans not in ("y", "yes"):
         print("Discarded.")
         prompt_continue()
@@ -1085,7 +1085,7 @@ def run_import_vouchers(current_user):
     print(f"\n{len(vouchers)} voucher(s) validated OK:")
     display_addv_summary(vouchers, installments)
 
-    ans = input("\nSave to staging? (y/n): ").strip().lower()
+    ans = read_input("\nSave to staging? (y/n): ").strip().lower()
     if ans not in ("y", "yes"):
         print("Import cancelled.")
         prompt_continue()
@@ -1145,7 +1145,7 @@ def run_approve_new_vouchers(current_user):
         clear_screen()
         display_addv_report(report_data)
 
-        confirm = input("\nApprove these new vouchers? (y/n/b): ").strip().lower()
+        confirm = read_input("\nApprove these new vouchers? (y/n/b): ").strip().lower()
         if confirm == "b":
             continue
         if confirm not in ("y", "yes"):
@@ -1194,7 +1194,7 @@ def run_post_new_vouchers(current_user):
     clear_screen()
     display_addv_report(report_data)
 
-    confirm = input("\nPost and write to data files? (y/n/b): ").strip().lower()
+    confirm = read_input("\nPost and write to data files? (y/n/b): ").strip().lower()
     if confirm not in ("y", "yes"):
         print("Posting cancelled.")
         prompt_continue()
