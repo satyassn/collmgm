@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Generate Collection List — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Generate Collection List</h2>
+<p class="step-label">Select salesman for <strong>{{ beat }}</strong></p>
+
+<form method="post" action="/coll/start/generate">
+  <input type="hidden" name="beat" value="{{ beat }}">
+  <div class="form-group">
+    <label for="salesman">Salesman</label>
+    <select id="salesman" name="salesman" required>
+      <option value="">— choose —</option>
+      {% for sm in salesmen %}
+        <option value="{{ sm }}">{{ sm }} ({{ counts.get(sm, 0) }} vouchers)</option>
+      {% endfor %}
+    </select>
+  </div>
+  <button type="submit" class="btn btn-primary">Generate</button>
+  <a class="btn btn-secondary" href="/coll/start">Back</a>
+</form>
+{% endblock %}

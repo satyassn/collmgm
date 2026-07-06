@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Highest Balance — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Highest Balance</h2>
+<p class="meta-line">Showing {{ vouchers|length }} highest of {{ total_count }} pending vouchers</p>
+
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>Bill No</th>
+      <th>Date</th>
+      <th class="num">Balance</th>
+      <th>Beat</th>
+      <th>Salesman</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for v in vouchers %}
+    <tr>
+      <td class="mono">{{ v.bill_no }}</td>
+      <td>{{ v.date }}</td>
+      <td class="num mono">{{ v.balance }}</td>
+      <td>{{ v.beat }}</td>
+      <td>{{ v.salesman }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<a class="btn btn-secondary" href="/reports">Back</a>
+{% endblock %}

@@ -11,6 +11,17 @@ TL;DR: Define a proof-of-concept data schema, validation rules, and operational 
   - `data/` — canonical CSV files: `users.csv`, `beats.csv`, `vouchers.csv`, `installments.csv`.
   - `staging/` — mirrored CSVs where Salesmen write: `vouchers.csv`, `installments.csv`.
 
+> **SQLite note:** Master data (`users`, `beats`, `vouchers`, `installments`,
+> `completed_vouchers`, `completed_installments`) now lives in
+> `data/collmgm.db`, migrated from these CSVs on first run (see
+> `coll_store.py`). The CSV schemas below remain the source of truth for
+> field names/types. Two early exceptions to the "schema enhancements
+> deferred" roadmap milestone, made explicitly at user request: the SQLite
+> `beats` table also carries a `salesman` column (the beat→salesman mapping
+> that `beats.csv` has always had), and a `permissions` table (mirroring
+> `permissions.csv`'s `role,action_key` columns) was added since permissions
+> are also now DB-backed like the other master data.
+
 - CSV conventions (applies to all files):
   - Delimiter: comma `,`.
   - Header row required; UTF-8 encoded.

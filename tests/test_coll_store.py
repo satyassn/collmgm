@@ -2,13 +2,10 @@
 Unit tests for scripts/coll_store.py
 
 Run:  python -m unittest discover -s tests -v
-  or: python -m pytest tests/ -v   (if pytest is available)
 """
 
-import csv
 import json
 import sys
-import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
@@ -20,11 +17,12 @@ import coll_store
 
 
 # ---------------------------------------------------------------------------
-# Base class: fresh temp dir + coll_store path patches per test
+# Base class: fresh temp dir + patched path constants + initialised SQLite DB
 # ---------------------------------------------------------------------------
 
 class StoreTestCase(unittest.TestCase):
     def setUp(self):
+        import tempfile
         self._tmpdir = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmpdir.name)
         (self.tmp / "data").mkdir()
@@ -39,10 +37,38 @@ class StoreTestCase(unittest.TestCase):
         for p in self._patches:
             p.start()
 
+        # Fresh SQLite DB in the temp data dir (DATA_DIR is already patched)
+        coll_store.init_db()
+
     def tearDown(self):
         for p in self._patches:
             p.stop()
         self._tmpdir.cleanup()
+
+    # ------------------------------------------------------------------
+    # DB helpers
+    # ------------------------------------------------------------------
+
+    def _insert_rows(self, table, rows):
+        conn = coll_store.get_db()
+        try:
+            for row in rows:
+                cols = list(row.keys())
+                ph   = ", ".join("?" * len(cols))
+                conn.execute(
+                    f"INSERT OR REPLACE INTO {table} ({', '.join(cols)}) VALUES ({ph})",
+                    [row[c] for c in cols],
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _query(self, sql, params=()):
+        conn = coll_store.get_db()
+        try:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+        finally:
+            conn.close()
 
     def _write_staging_json(self, name, data):
         path = self.tmp / "staging" / name
@@ -50,13 +76,18 @@ class StoreTestCase(unittest.TestCase):
             json.dump(data, f)
         return path
 
-    def _write_csv(self, subdir, name, fieldnames, rows):
-        path = self.tmp / subdir / name
-        with path.open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
-            w.writerows(rows)
-        return path
+    # ------------------------------------------------------------------
+    # Voucher / installment row factories
+    # ------------------------------------------------------------------
+
+    def _v_row(self, bill_no, balance="100.00", beat="b1", salesman="s1"):
+        return {"bill_no": bill_no, "date": "2026-01-01", "amount": "100.00",
+                "balance": balance, "beat": beat, "salesman": salesman,
+                "created_by": "app", "created_at": "t"}
+
+    def _i_row(self, bill_no, date="2026-01-01", amount="10.00", salesman="s1"):
+        return {"bill_no": bill_no, "date": date, "amount": amount,
+                "salesman": salesman, "created_by": "app", "created_at": "t"}
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +133,6 @@ class TestPasswordHashing(unittest.TestCase):
     def test_different_hashes_for_same_password(self):
         h1 = coll_store.hash_password("abc")
         h2 = coll_store.hash_password("abc")
-        # different salts → different stored hashes
         self.assertNotEqual(h1, h2)
         self.assertTrue(coll_store._verify_password(h1, "abc"))
         self.assertTrue(coll_store._verify_password(h2, "abc"))
@@ -113,54 +143,36 @@ class TestPasswordHashing(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class TestVerifyUser(StoreTestCase):
-    def _make_users_csv(self, rows):
-        path = self.tmp / "data" / "users.csv"
-        with path.open("w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["name", "role", "password_hash"])
-            w.writeheader()
-            w.writerows(rows)
+    def _add_user(self, name, role, password):
+        self._insert_rows("users", [{"name": name, "role": role,
+                                      "password_hash": coll_store.hash_password(password)}])
 
     def test_valid_salesman(self):
-        self._make_users_csv([
-            {"name": "alice", "role": "salesman",
-             "password_hash": coll_store.hash_password("pw1")},
-        ])
+        self._add_user("alice", "salesman", "pw1")
         user = coll_store.verify_user("alice", "pw1")
         self.assertIsNotNone(user)
         self.assertEqual(user.name, "alice")
         self.assertEqual(user.role, "salesman")
 
     def test_wrong_password_returns_none(self):
-        self._make_users_csv([
-            {"name": "bob", "role": "supervisor",
-             "password_hash": coll_store.hash_password("correct")},
-        ])
+        self._add_user("bob", "supervisor", "correct")
         self.assertIsNone(coll_store.verify_user("bob", "wrong"))
 
     def test_unknown_user_returns_none(self):
-        self._make_users_csv([
-            {"name": "carol", "role": "salesman",
-             "password_hash": coll_store.hash_password("x")},
-        ])
+        self._add_user("carol", "salesman", "x")
         self.assertIsNone(coll_store.verify_user("nobody", "x"))
 
     def test_system_role_excluded(self):
-        self._make_users_csv([
-            {"name": "sys", "role": "system",
-             "password_hash": coll_store.hash_password("pw")},
-        ])
+        self._add_user("sys", "system", "pw")
         self.assertIsNone(coll_store.verify_user("sys", "pw"))
 
     def test_distributor_role_accepted(self):
-        self._make_users_csv([
-            {"name": "dan", "role": "distributor",
-             "password_hash": coll_store.hash_password("dp")},
-        ])
+        self._add_user("dan", "distributor", "dp")
         user = coll_store.verify_user("dan", "dp")
         self.assertIsNotNone(user)
         self.assertEqual(user.role, "distributor")
 
-    def test_missing_users_file_returns_none(self):
+    def test_empty_users_table_returns_none(self):
         self.assertIsNone(coll_store.verify_user("any", "any"))
 
 
@@ -175,8 +187,7 @@ class TestLoadPendingStartReports(StoreTestCase):
 
     def test_start_new_included(self):
         self._write_staging_json("coll_new.json", self._report({"start": "new"}))
-        results = coll_store._load_pending_start_reports()
-        self.assertEqual(len(results), 1)
+        self.assertEqual(len(coll_store._load_pending_start_reports()), 1)
 
     def test_start_confirmed_excluded(self):
         self._write_staging_json("coll_conf.json", self._report({"start": "confirmed"}))
@@ -196,7 +207,6 @@ class TestLoadPendingStartReports(StoreTestCase):
         self.assertEqual(coll_store._load_pending_start_reports(), [])
 
     def test_addv_files_ignored(self):
-        # addv* files must not be returned
         path = self.tmp / "staging" / "addv20260620-user.json"
         with path.open("w") as f:
             json.dump({"stages": {"start": "new"}}, f)
@@ -242,7 +252,7 @@ class TestLoadPendingSubmitReports(StoreTestCase):
 
 
 # ---------------------------------------------------------------------------
-# _save_installments / _load_installments  (2-tuple, no __status__)
+# _save_installments / _load_installments  (sidecar JSON — unchanged)
 # ---------------------------------------------------------------------------
 
 class TestInstallmentsSidecar(StoreTestCase):
@@ -312,53 +322,45 @@ class TestInstallmentsSidecar(StoreTestCase):
 
 
 # ---------------------------------------------------------------------------
-# _append_installments_csv  (dedup on bill_no + date)
+# _append_installments_csv  (now writes to SQLite installments table)
 # ---------------------------------------------------------------------------
 
 class TestAppendInstallmentsCSV(StoreTestCase):
-    _FIELDS = ["bill_no", "date", "amount", "salesman", "created_by", "created_at"]
-
     def _vouchers(self, *bill_payments):
         return [{"bill_no": bn, "payment": pay, "salesman": "sm1"}
                 for bn, pay in bill_payments]
 
     def _read_installments(self):
-        path = self.tmp / "data" / "installments.csv"
-        if not path.exists():
-            return []
-        with path.open(newline="", encoding="utf-8") as f:
-            return list(csv.DictReader(f))
+        return self._query("SELECT * FROM installments")
 
-    def test_creates_file_with_header(self):
+    def test_inserts_row_to_db(self):
         coll_store._append_installments_csv(self._vouchers(("B001", "100.00")))
         rows = self._read_installments()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["bill_no"], "B001")
 
-    def test_appends_to_existing_file(self):
-        self._write_csv("data", "installments.csv", self._FIELDS,
-                        [{"bill_no": "B000", "date": "2026-01-01", "amount": "50.00",
-                          "salesman": "sm0", "created_by": "app", "created_at": "t"}])
+    def test_appends_to_existing_rows(self):
+        self._insert_rows("installments",
+                          [self._i_row("B000", date="2026-01-01", amount="50.00")])
         coll_store._append_installments_csv(self._vouchers(("B001", "10.00")))
         rows = self._read_installments()
         self.assertEqual(len(rows), 2)
 
     def test_duplicate_bill_no_and_date_skipped(self):
-        from unittest.mock import patch as mp
         from datetime import datetime as _dt
         today = _dt.now().strftime("%Y-%m-%d")
-        self._write_csv("data", "installments.csv", self._FIELDS,
-                        [{"bill_no": "B001", "date": today, "amount": "10.00",
-                          "salesman": "sm1", "created_by": "app", "created_at": "t"}])
+        self._insert_rows("installments",
+                          [self._i_row("B001", date=today, amount="10.00")])
         coll_store._append_installments_csv(self._vouchers(("B001", "10.00")))
         rows = self._read_installments()
         self.assertEqual(len(rows), 1)
 
     def test_same_bill_different_date_allowed(self):
-        self._write_csv("data", "installments.csv", self._FIELDS,
-                        [{"bill_no": "B001", "date": "2026-01-01", "amount": "10.00",
-                          "salesman": "sm1", "created_by": "app", "created_at": "t"}])
-        coll_store._append_installments_csv(self._vouchers(("B001", "20.00")))
+        self._insert_rows("installments",
+                          [self._i_row("B001", date="2026-01-01", amount="10.00")])
+        vouchers = [{"bill_no": "B001", "payment": "20.00", "salesman": "sm1",
+                     "payment_date": "2026-06-20"}]
+        coll_store._append_installments_csv(vouchers)
         rows = self._read_installments()
         self.assertEqual(len(rows), 2)
 
@@ -372,9 +374,9 @@ class TestAppendInstallmentsCSV(StoreTestCase):
         coll_store._append_installments_csv([{"bill_no": "B1", "payment": "", "salesman": "s"}])
         self.assertEqual(self._read_installments(), [])
 
-    def test_no_rows_no_file_created(self):
+    def test_no_rows_nothing_inserted(self):
         coll_store._append_installments_csv([])
-        self.assertFalse((self.tmp / "data" / "installments.csv").exists())
+        self.assertEqual(self._read_installments(), [])
 
     def test_uses_voucher_payment_date_not_today(self):
         vouchers = [{"bill_no": "B001", "payment": "10.00", "salesman": "sm1",
@@ -391,9 +393,8 @@ class TestAppendInstallmentsCSV(StoreTestCase):
         self.assertEqual(rows[0]["date"], today)
 
     def test_dedup_keyed_on_per_voucher_date(self):
-        self._write_csv("data", "installments.csv", self._FIELDS,
-                        [{"bill_no": "B001", "date": "2026-06-20", "amount": "10.00",
-                          "salesman": "sm1", "created_by": "app", "created_at": "t"}])
+        self._insert_rows("installments",
+                          [self._i_row("B001", date="2026-06-20", amount="10.00")])
         vouchers = [{"bill_no": "B001", "payment": "10.00", "salesman": "sm1",
                      "payment_date": "2026-06-20"}]
         coll_store._append_installments_csv(vouchers)
@@ -402,107 +403,54 @@ class TestAppendInstallmentsCSV(StoreTestCase):
 
 
 # ---------------------------------------------------------------------------
-# _update_vouchers_balance  (atomic write, lock, zero detection)
+# _update_vouchers_balance
 # ---------------------------------------------------------------------------
 
 class TestUpdateVouchersBalance(StoreTestCase):
-    _V_FIELDS = ["bill_no", "date", "amount", "balance", "beat", "salesman",
-                 "created_by", "created_at"]
-
-    def _make_vouchers_csv(self, rows):
-        self._write_csv("data", "vouchers.csv", self._V_FIELDS, rows)
+    def _make_vouchers(self, rows):
+        self._insert_rows("vouchers", rows)
 
     def _read_vouchers(self):
-        path = self.tmp / "data" / "vouchers.csv"
-        with path.open(newline="", encoding="utf-8") as f:
-            return list(csv.DictReader(f))
+        return self._query("SELECT * FROM vouchers")
 
     def test_balance_reduced_by_payment(self):
-        self._make_vouchers_csv([
-            {"bill_no": "B001", "date": "2026-01-01", "amount": "500.00",
-             "balance": "500.00", "beat": "b1", "salesman": "s1",
-             "created_by": "app", "created_at": "t"},
-        ])
-        vouchers = [{"bill_no": "B001", "payment": "200.00"}]
-        coll_store._update_vouchers_balance(vouchers)
+        self._make_vouchers([self._v_row("B001", balance="500.00")])
+        coll_store._update_vouchers_balance([{"bill_no": "B001", "payment": "200.00"}])
         rows = self._read_vouchers()
         self.assertEqual(rows[0]["balance"], "300.00")
 
     def test_balance_floored_at_zero(self):
-        self._make_vouchers_csv([
-            {"bill_no": "B001", "date": "2026-01-01", "amount": "100.00",
-             "balance": "50.00", "beat": "b1", "salesman": "s1",
-             "created_by": "app", "created_at": "t"},
-        ])
-        vouchers = [{"bill_no": "B001", "payment": "200.00"}]
-        coll_store._update_vouchers_balance(vouchers)
+        self._make_vouchers([self._v_row("B001", balance="50.00")])
+        coll_store._update_vouchers_balance([{"bill_no": "B001", "payment": "200.00"}])
         self.assertEqual(self._read_vouchers()[0]["balance"], "0.00")
 
     def test_zero_balance_returned_as_completed(self):
-        self._make_vouchers_csv([
-            {"bill_no": "B001", "date": "2026-01-01", "amount": "100.00",
-             "balance": "100.00", "beat": "b1", "salesman": "s1",
-             "created_by": "app", "created_at": "t"},
-        ])
+        self._make_vouchers([self._v_row("B001", balance="100.00")])
         completed = coll_store._update_vouchers_balance([{"bill_no": "B001", "payment": "100.00"}])
         self.assertIn("B001", completed)
 
     def test_partial_payment_not_in_completed(self):
-        self._make_vouchers_csv([
-            {"bill_no": "B001", "date": "2026-01-01", "amount": "100.00",
-             "balance": "100.00", "beat": "b1", "salesman": "s1",
-             "created_by": "app", "created_at": "t"},
-        ])
+        self._make_vouchers([self._v_row("B001", balance="100.00")])
         completed = coll_store._update_vouchers_balance([{"bill_no": "B001", "payment": "50.00"}])
         self.assertEqual(completed, [])
 
-    def test_no_tmp_file_left_after_success(self):
-        self._make_vouchers_csv([
-            {"bill_no": "B1", "date": "d", "amount": "10", "balance": "10",
-             "beat": "b", "salesman": "s", "created_by": "a", "created_at": "t"},
-        ])
-        coll_store._update_vouchers_balance([{"bill_no": "B1", "payment": "5"}])
-        self.assertFalse((self.tmp / "data" / "vouchers.tmp").exists())
-
-    def test_lock_file_cleaned_up_after_success(self):
-        self._make_vouchers_csv([
-            {"bill_no": "B1", "date": "d", "amount": "10", "balance": "10",
-             "beat": "b", "salesman": "s", "created_by": "a", "created_at": "t"},
-        ])
-        coll_store._update_vouchers_balance([{"bill_no": "B1", "payment": "5"}])
-        self.assertFalse((self.tmp / "data" / ".vouchers.lock").exists())
-
-    def test_existing_lock_raises_runtime_error(self):
-        self._make_vouchers_csv([
-            {"bill_no": "B1", "date": "d", "amount": "10", "balance": "10",
-             "beat": "b", "salesman": "s", "created_by": "a", "created_at": "t"},
-        ])
-        (self.tmp / "data" / ".vouchers.lock").touch()
-        with self.assertRaises(RuntimeError):
-            coll_store._update_vouchers_balance([{"bill_no": "B1", "payment": "5"}])
-
-    def test_missing_vouchers_csv_raises(self):
+    def test_missing_db_raises(self):
+        # Remove the DB so the function can detect it's missing
+        coll_store._db_path().unlink()
         with self.assertRaises(FileNotFoundError):
             coll_store._update_vouchers_balance([{"bill_no": "B1", "payment": "5"}])
 
     def test_empty_payment_map_returns_empty_list(self):
-        self._make_vouchers_csv([
-            {"bill_no": "B1", "date": "d", "amount": "10", "balance": "10",
-             "beat": "b", "salesman": "s", "created_by": "a", "created_at": "t"},
-        ])
+        self._make_vouchers([self._v_row("B1")])
         result = coll_store._update_vouchers_balance([{"bill_no": "B1", "payment": ""}])
         self.assertEqual(result, [])
 
     def test_unrelated_vouchers_untouched(self):
-        self._make_vouchers_csv([
-            {"bill_no": "B001", "date": "d", "amount": "100", "balance": "100",
-             "beat": "b", "salesman": "s", "created_by": "a", "created_at": "t"},
-            {"bill_no": "B002", "date": "d", "amount": "200", "balance": "200",
-             "beat": "b", "salesman": "s", "created_by": "a", "created_at": "t"},
-        ])
+        self._make_vouchers([self._v_row("B001", balance="100.00"),
+                              self._v_row("B002", balance="200.00")])
         coll_store._update_vouchers_balance([{"bill_no": "B001", "payment": "50"}])
         rows = {r["bill_no"]: r for r in self._read_vouchers()}
-        self.assertEqual(rows["B002"]["balance"], "200")
+        self.assertEqual(rows["B002"]["balance"], "200.00")
 
 
 # ---------------------------------------------------------------------------
@@ -527,7 +475,6 @@ class TestBeatLock(StoreTestCase):
         self.assertTrue(coll_store.acquire_beat_lock("beat1"))
 
     def test_release_without_lock_is_safe(self):
-        # Should not raise even if lock doesn't exist
         coll_store.release_beat_lock("nonexistent_beat")
 
     def test_lock_file_exists_after_acquire(self):
@@ -574,27 +521,19 @@ class TestFinalizeCheckpoint(StoreTestCase):
 # ---------------------------------------------------------------------------
 
 class TestLoadVouchersRaw(StoreTestCase):
-    _FIELDS = ["bill_no", "date", "amount", "balance", "beat", "salesman",
-               "created_by", "created_at"]
-
     def test_reads_rows(self):
-        self._write_csv("data", "vouchers.csv", self._FIELDS,
-                        [{"bill_no": "B001", "date": "2026-01-01", "amount": "100",
-                          "balance": "100", "beat": "b1", "salesman": "s1",
-                          "created_by": "app", "created_at": "t"}])
+        self._insert_rows("vouchers", [self._v_row("B001")])
         rows = coll_store.load_vouchers_raw()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["bill_no"], "B001")
 
-    def test_missing_file_raises(self):
+    def test_missing_db_raises(self):
+        coll_store._db_path().unlink()
         with self.assertRaises(FileNotFoundError):
             coll_store.load_vouchers_raw()
 
     def test_returns_all_rows(self):
-        data = [{"bill_no": f"B{i:03}", "date": "2026-01-01", "amount": "10",
-                 "balance": "10", "beat": "b1", "salesman": "s1",
-                 "created_by": "app", "created_at": "t"} for i in range(5)]
-        self._write_csv("data", "vouchers.csv", self._FIELDS, data)
+        self._insert_rows("vouchers", [self._v_row(f"B{i:03}") for i in range(5)])
         self.assertEqual(len(coll_store.load_vouchers_raw()), 5)
 
 
@@ -603,67 +542,38 @@ class TestLoadVouchersRaw(StoreTestCase):
 # ---------------------------------------------------------------------------
 
 class TestArchiveCompleted(StoreTestCase):
-    _V_FIELDS = ["bill_no", "date", "amount", "balance", "beat", "salesman",
-                 "created_by", "created_at"]
-    _I_FIELDS = ["bill_no", "date", "amount", "salesman", "created_by", "created_at"]
-
-    def _setup_data(self, vouchers, installments=None):
-        self._write_csv("data", "vouchers.csv", self._V_FIELDS, vouchers)
-        if installments:
-            self._write_csv("data", "installments.csv", self._I_FIELDS, installments)
-
-    def _read_csv(self, subdir, name, fields):
-        path = self.tmp / subdir / name
-        if not path.exists():
-            return []
-        with path.open(newline="", encoding="utf-8") as f:
-            return list(csv.DictReader(f))
-
-    def _row(self, bn, balance="0.00"):
-        return {"bill_no": bn, "date": "2026-01-01", "amount": "100",
-                "balance": balance, "beat": "b1", "salesman": "s1",
-                "created_by": "app", "created_at": "t"}
-
     def test_completed_voucher_moved(self):
-        self._setup_data([self._row("B001"), self._row("B002", "50.00")])
+        self._insert_rows("vouchers", [self._v_row("B001"), self._v_row("B002", balance="50.00")])
         coll_store._archive_completed(["B001"])
-        remaining = self._read_csv("data", "vouchers.csv", self._V_FIELDS)
-        completed = self._read_csv("data", "completed_vouchers.csv", self._V_FIELDS)
-        self.assertEqual(len(remaining), 1)
-        self.assertEqual(remaining[0]["bill_no"], "B002")
-        self.assertEqual(len(completed), 1)
-        self.assertEqual(completed[0]["bill_no"], "B001")
+        remaining  = self._query("SELECT bill_no FROM vouchers")
+        completed  = self._query("SELECT bill_no FROM completed_vouchers")
+        self.assertEqual([r["bill_no"] for r in remaining], ["B002"])
+        self.assertEqual([r["bill_no"] for r in completed], ["B001"])
 
     def test_non_completed_voucher_stays(self):
-        self._setup_data([self._row("B001"), self._row("B002")])
+        self._insert_rows("vouchers", [self._v_row("B001"), self._v_row("B002")])
         coll_store._archive_completed(["B001"])
-        remaining = self._read_csv("data", "vouchers.csv", self._V_FIELDS)
+        remaining = self._query("SELECT bill_no FROM vouchers")
         self.assertTrue(any(r["bill_no"] == "B002" for r in remaining))
 
     def test_installments_archived_too(self):
-        self._setup_data(
-            [self._row("B001")],
-            [{"bill_no": "B001", "date": "2026-01-01", "amount": "100",
-              "salesman": "s1", "created_by": "app", "created_at": "t"}]
-        )
+        self._insert_rows("vouchers",      [self._v_row("B001")])
+        self._insert_rows("installments",  [self._i_row("B001")])
         coll_store._archive_completed(["B001"])
-        inst = self._read_csv("data", "installments.csv", self._I_FIELDS)
-        comp_inst = self._read_csv("data", "completed_installments.csv", self._I_FIELDS)
-        self.assertEqual(inst, [])
-        self.assertEqual(len(comp_inst), 1)
+        self.assertEqual(self._query("SELECT * FROM installments"), [])
+        self.assertEqual(len(self._query("SELECT * FROM completed_installments")), 1)
 
     def test_empty_bill_nos_is_noop(self):
-        self._setup_data([self._row("B001")])
+        self._insert_rows("vouchers", [self._v_row("B001")])
         coll_store._archive_completed([])
-        self.assertEqual(len(self._read_csv("data", "vouchers.csv", self._V_FIELDS)), 1)
-        self.assertFalse((self.tmp / "data" / "completed_vouchers.csv").exists())
+        self.assertEqual(len(self._query("SELECT * FROM vouchers")), 1)
+        self.assertEqual(self._query("SELECT * FROM completed_vouchers"), [])
 
     def test_appends_to_existing_completed(self):
-        self._setup_data([self._row("B002")])
-        # Pre-existing completed
-        self._write_csv("data", "completed_vouchers.csv", self._V_FIELDS, [self._row("B001")])
+        self._insert_rows("vouchers",           [self._v_row("B002")])
+        self._insert_rows("completed_vouchers", [self._v_row("B001")])
         coll_store._archive_completed(["B002"])
-        completed = self._read_csv("data", "completed_vouchers.csv", self._V_FIELDS)
+        completed = self._query("SELECT bill_no FROM completed_vouchers")
         self.assertEqual(len(completed), 2)
 
 

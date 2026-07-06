@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}Submit Collections — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Submit Collections</h2>
+<p class="meta-line"><strong>Beat:</strong> {{ beat }} &nbsp;|&nbsp; <strong>Salesman:</strong> {{ salesman }}</p>
+<p class="hint">Enter collected amounts below. Leave blank for no payment. Submit when done.</p>
+
+{% if error %}
+  <p class="alert alert-error">{{ error }}</p>
+{% endif %}
+
+<div class="summary-box">
+  <span id="payment-count">{{ paid_count }} vouchers collected</span>
+  <span class="summary-total">Total: <strong id="payment-total">{{ total_collected }}</strong></span>
+</div>
+
+<form method="post" action="/coll/submit/{{ stem }}">
+  <div class="table-wrapper">
+    <table class="data-table payment-table">
+      <thead>
+        <tr>
+          <th>Bill No</th>
+          <th>Voucher Date</th>
+          <th class="num">Balance</th>
+          <th class="num">Payment</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for v in vouchers %}
+        <tr>
+          <td class="mono">{{ v.bill_no }}</td>
+          <td>{{ v.get("voucher_date","") }}</td>
+          <td class="num mono">{{ v.balance }}</td>
+          <td class="pay-cell">
+            <input type="number" name="pay_{{ v.bill_no }}"
+                   value="{{ v.get('payment','') }}"
+                   min="0" step="0.01"
+                   inputmode="decimal"
+                   class="pay-input">
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="action-row">
+    <button type="submit" name="action" value="save" class="btn btn-secondary">Save</button>
+    <button type="submit" name="action" value="submit" class="btn btn-primary"
+            onclick="return confirm('Submit all payments for supervisor review?')">Submit for Review</button>
+    <a class="btn btn-secondary" href="/coll/submit">Cancel</a>
+  </div>
+</form>
+
+<script>
+(function () {
+  var inputs = Array.prototype.slice.call(document.querySelectorAll(".pay-input"));
+  var countEl = document.getElementById("payment-count");
+  var totalEl = document.getElementById("payment-total");
+
+  function recalc() {
+    var total = 0, count = 0;
+    inputs.forEach(function (input) {
+      var val = parseFloat(input.value);
+      if (!isNaN(val) && val > 0) {
+        total += val;
+        count += 1;
+      }
+    });
+    countEl.textContent = count + " vouchers collected";
+    totalEl.textContent = total.toFixed(2);
+  }
+
+  inputs.forEach(function (input) {
+    input.addEventListener("input", recalc);
+  });
+})();
+</script>
+{% endblock %}

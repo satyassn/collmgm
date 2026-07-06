@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Menu — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Main Menu</h2>
+<nav class="menu-grid">
+  {% if "coll_start" in perms %}
+    <a class="menu-card" href="/coll/start">
+      <span class="menu-icon">&#128196;</span>
+      <span>Generate Collection List</span>
+    </a>
+  {% endif %}
+  {% if "coll_approve_start" in perms %}
+    <a class="menu-card" href="/coll/approve-start">
+      <span class="menu-icon">&#9989;</span>
+      <span>Approve Collection List</span>
+    </a>
+  {% endif %}
+  {% if "coll_submit" in perms %}
+    <a class="menu-card" href="/coll/submit">
+      <span class="menu-icon">&#128176;</span>
+      <span>Submit Collections</span>
+    </a>
+  {% endif %}
+  {% if "coll_approve_submit" in perms %}
+    <a class="menu-card" href="/coll/approve-submit">
+      <span class="menu-icon">&#128204;</span>
+      <span>Approve Collections</span>
+    </a>
+  {% endif %}
+  {% if "coll_post" in perms %}
+    <a class="menu-card" href="/coll/post">
+      <span class="menu-icon">&#128229;</span>
+      <span>Post Collections</span>
+    </a>
+  {% endif %}
+  <a class="menu-card" href="/reports">
+    <span class="menu-icon">&#128202;</span>
+    <span>Reports</span>
+  </a>
+</nav>
+{% endblock %}

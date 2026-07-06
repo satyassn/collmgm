@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Approve Collection List — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Approve Collection List</h2>
+<p class="meta-line"><strong>Beat:</strong> {{ beat }} &nbsp;|&nbsp; <strong>Salesman:</strong> {{ salesman }} &nbsp;|&nbsp; <strong>Date:</strong> {{ data.get("date","") }}</p>
+
+<table class="data-table">
+  <thead>
+    <tr>
+      <th>Bill No</th>
+      <th>Voucher Date</th>
+      <th class="num">Balance</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for v in vouchers %}
+    <tr>
+      <td class="mono">{{ v.bill_no }}</td>
+      <td>{{ v.get("voucher_date","") }}</td>
+      <td class="num mono">{{ v.balance }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+  <tfoot>
+    <tr>
+      <td colspan="2"><strong>Total ({{ vouchers|length }} vouchers)</strong></td>
+      <td class="num mono"><strong>{{ total_balance }}</strong></td>
+    </tr>
+  </tfoot>
+</table>
+
+<form method="post" action="/coll/approve-start/{{ stem }}" class="action-row">
+  <button type="submit" name="action" value="approve" class="btn btn-primary">Approve</button>
+  <button type="submit" name="action" value="return" class="btn btn-warning"
+          onclick="return confirm('Return this list? Salesman must regenerate.')">Return</button>
+  <button type="submit" name="action" value="cancel" class="btn btn-danger"
+          onclick="return confirm('Cancel and delete this collection list?')">Cancel</button>
+  <a class="btn btn-secondary" href="/coll/approve-start">Back</a>
+</form>
+{% endblock %}

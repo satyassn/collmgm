@@ -1,8 +1,11 @@
 """
 File I/O and persistence layer for collection management.
 
-Owns all path constants, CSV reads/writes, and JSON reads/writes.
+Owns all path constants, SQLite DB access, and JSON reads/writes.
 No print() or input() calls. No imports from other coll_* modules.
+
+Master data (users, beats, vouchers, installments) is stored in SQLite.
+Staging and archive files remain as JSON/TXT on disk.
 """
 
 import binascii
@@ -10,6 +13,7 @@ import csv
 import hashlib
 import json
 import os
+import sqlite3
 from collections import namedtuple
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -29,13 +33,191 @@ _PRINT_PAGE_HEIGHT = 66
 _PRINT_FILE_HEADER_LINES = 3
 
 
-def bill_no_sort_key(bill_no):
-    """Sort key for bill_no: numeric value when digits-only, else the string itself.
+# ---------------------------------------------------------------------------
+# SQLite helpers
+# ---------------------------------------------------------------------------
 
-    bill_no values are normally fixed-width numeric strings, but manually
-    added vouchers can have shorter numeric ids (e.g. "999"); a plain string
-    sort would lexically order those after longer numeric bill_no values.
+def _db_path():
+    """Return the SQLite DB path. Derived at call time so DATA_DIR patches work in tests."""
+    return DATA_DIR / "collmgm.db"
+
+
+def get_db():
+    """Return an open sqlite3 connection with WAL mode and Row factory."""
+    conn = sqlite3.connect(str(_db_path()))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    name          TEXT PRIMARY KEY,
+    role          TEXT NOT NULL,
+    password_hash TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS beats (
+    name     TEXT PRIMARY KEY,
+    salesman TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS permissions (
+    role       TEXT NOT NULL,
+    action_key TEXT NOT NULL,
+    PRIMARY KEY (role, action_key)
+);
+CREATE TABLE IF NOT EXISTS vouchers (
+    bill_no    TEXT PRIMARY KEY,
+    date       TEXT NOT NULL,
+    amount     TEXT NOT NULL,
+    balance    TEXT NOT NULL,
+    beat       TEXT NOT NULL,
+    salesman   TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS installments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    bill_no    TEXT NOT NULL,
+    date       TEXT NOT NULL,
+    amount     TEXT NOT NULL,
+    salesman   TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT '',
+    UNIQUE(bill_no, date)
+);
+CREATE TABLE IF NOT EXISTS completed_vouchers (
+    bill_no    TEXT PRIMARY KEY,
+    date       TEXT NOT NULL,
+    amount     TEXT NOT NULL,
+    balance    TEXT NOT NULL,
+    beat       TEXT NOT NULL,
+    salesman   TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS completed_installments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    bill_no    TEXT NOT NULL,
+    date       TEXT NOT NULL,
+    amount     TEXT NOT NULL,
+    salesman   TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT ''
+);
+"""
+
+
+def init_db():
+    """Create all tables in the DB (idempotent). Creates the DB file if absent.
+
+    Also applies one-time additive migrations for DBs created before a given
+    column/table existed (beats.salesman, permissions), backfilling from the
+    matching CSV so an older collmgm.db catches up the moment it's reopened
+    by newer code.
     """
+    conn = get_db()
+    try:
+        conn.executescript(_SCHEMA)
+        conn.commit()
+        _backfill_beats_salesman(conn)
+        _backfill_permissions(conn)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _backfill_beats_salesman(conn):
+    """Add beats.salesman if missing, then fill it in from data/beats.csv by name."""
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(beats)").fetchall()]
+    if "salesman" not in cols:
+        conn.execute("ALTER TABLE beats ADD COLUMN salesman TEXT NOT NULL DEFAULT ''")
+    beats_csv = DATA_DIR / "beats.csv"
+    if not beats_csv.exists():
+        return
+    try:
+        with beats_csv.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                name = row.get("name", "").strip()
+                salesman = row.get("salesman", "").strip()
+                if name and salesman:
+                    conn.execute(
+                        "UPDATE beats SET salesman = ? WHERE name = ? AND salesman = ''",
+                        (salesman, name),
+                    )
+    except Exception:
+        pass
+
+
+def _backfill_permissions(conn):
+    """One-time seed of the permissions table from data/permissions.csv, if empty."""
+    count = conn.execute("SELECT COUNT(*) FROM permissions").fetchone()[0]
+    if count:
+        return
+    _migrate_csv_table(conn, "permissions", DATA_DIR / "permissions.csv", _P_FIELDS)
+
+
+def ensure_db():
+    """Initialise the SQLite DB, migrating existing CSVs on first run.
+
+    Call once at application startup (collmenu.py). Safe to call multiple times.
+    """
+    fresh = not _db_path().exists()
+    init_db()
+    if fresh:
+        _migrate_csv_to_db()
+
+
+_V_FIELDS = ["bill_no", "date", "amount", "balance", "beat", "salesman", "created_by", "created_at"]
+_I_FIELDS = ["bill_no", "date", "amount", "salesman", "created_by", "created_at"]
+_U_FIELDS = ["name", "role", "password_hash"]
+_B_FIELDS = ["name", "salesman"]
+_P_FIELDS = ["role", "action_key"]
+
+
+def _migrate_csv_table(conn, table, path, fields):
+    """Bulk-load one CSV file's rows into `table` via INSERT OR IGNORE (dedup on PK)."""
+    if not path.exists():
+        return
+    try:
+        with path.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                cols = ", ".join(fields)
+                placeholders = ", ".join("?" * len(fields))
+                values = [row.get(fld, "") for fld in fields]
+                conn.execute(
+                    f"INSERT OR IGNORE INTO {table} ({cols}) VALUES ({placeholders})",
+                    values,
+                )
+    except Exception:
+        pass
+
+
+def _migrate_csv_to_db():
+    """Bulk-load existing CSV data into the newly created SQLite DB."""
+    tables = [
+        ("users",                  DATA_DIR / "users.csv",                  _U_FIELDS),
+        ("beats",                  DATA_DIR / "beats.csv",                  _B_FIELDS),
+        ("permissions",            DATA_DIR / "permissions.csv",            _P_FIELDS),
+        ("vouchers",               DATA_DIR / "vouchers.csv",               _V_FIELDS),
+        ("installments",           DATA_DIR / "installments.csv",           _I_FIELDS),
+        ("completed_vouchers",     DATA_DIR / "completed_vouchers.csv",     _V_FIELDS),
+        ("completed_installments", DATA_DIR / "completed_installments.csv", _I_FIELDS),
+    ]
+    conn = get_db()
+    try:
+        for table, path, fields in tables:
+            _migrate_csv_table(conn, table, path, fields)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+def bill_no_sort_key(bill_no):
     return (0, int(bill_no)) if bill_no.isdigit() else (1, bill_no)
 
 
@@ -66,37 +248,301 @@ def _verify_password(stored_hash: str, password: str) -> bool:
 
 def verify_user(name: str, password: str):
     """Return User if credentials match a salesman/supervisor/distributor row, else None."""
-    users_file = DATA_DIR / 'users.csv'
-    if not users_file.exists():
+    if not _db_path().exists():
         return None
-    with users_file.open(newline='', encoding='utf-8') as f:
-        for row in csv.DictReader(f):
-            if row.get('name', '').strip() != name:
-                continue
-            role = row.get('role', '').strip()
-            stored = row.get('password_hash', '').strip()
-            if role in ('salesman', 'supervisor', 'distributor') and _verify_password(stored, password):
-                return User(name=name, role=role)
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT role, password_hash FROM users WHERE name = ?", (name,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    role = row["role"]
+    stored = row["password_hash"]
+    if role in ('salesman', 'supervisor', 'distributor') and _verify_password(stored, password):
+        return User(name=name, role=role)
     return None
 
 
 def load_permissions():
-    """Return dict[role -> frozenset[action_key]] from data/permissions.csv.
-
-    Fails loudly if the file is missing. Unknown action keys are accepted (forward-compat).
-    """
-    pfile = DATA_DIR / "permissions.csv"
-    if not pfile.exists():
-        raise FileNotFoundError(f"Missing permissions file: {pfile}")
+    """Return dict[role -> frozenset[action_key]] from the permissions table."""
+    if not _db_path().exists():
+        raise FileNotFoundError(f"Database not found: {_db_path()}")
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT role, action_key FROM permissions").fetchall()
+    finally:
+        conn.close()
     result = {}
-    with pfile.open(newline='', encoding='utf-8') as f:
-        for row in csv.DictReader(f):
-            role = row.get('role', '').strip()
-            key  = row.get('action_key', '').strip()
-            if role and key:
-                result.setdefault(role, set()).add(key)
+    for row in rows:
+        role = row["role"].strip()
+        key = row["action_key"].strip()
+        if role and key:
+            result.setdefault(role, set()).add(key)
     return {r: frozenset(keys) for r, keys in result.items()}
 
+
+# ---------------------------------------------------------------------------
+# Master data reads (SQLite)
+# ---------------------------------------------------------------------------
+
+def load_vouchers_raw():
+    """Read all rows from the vouchers table as a list of dicts."""
+    if not _db_path().exists():
+        raise FileNotFoundError(f"Database not found: {_db_path()}")
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT bill_no, date, amount, balance, beat, salesman, created_by, created_at"
+            " FROM vouchers"
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def load_beats_raw():
+    """Return list of beat dicts (name, salesman) from the beats table."""
+    if not _db_path().exists():
+        return []
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT name, salesman FROM beats ORDER BY name").fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def load_users_raw():
+    """Return list of user dicts (name, role) from the users table."""
+    if not _db_path().exists():
+        return []
+    conn = get_db()
+    try:
+        rows = conn.execute("SELECT name, role FROM users").fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def load_installments_for_bill(bill_no, completed=False):
+    """Return list of installment dicts for a bill_no from installments or completed_installments."""
+    if not _db_path().exists():
+        return []
+    table = "completed_installments" if completed else "installments"
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            f"SELECT bill_no, date, amount, salesman, created_by, created_at"
+            f" FROM {table} WHERE bill_no = ?",
+            (bill_no,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def load_completed_voucher(bill_no):
+    """Return completed_vouchers row as dict, or None if not found."""
+    if not _db_path().exists():
+        return None
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT bill_no, date, amount, balance, beat, salesman, created_by, created_at"
+            " FROM completed_vouchers WHERE bill_no = ?",
+            (bill_no,),
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
+
+
+def load_all_existing_bill_nos():
+    """Return set of all bill_nos from vouchers and completed_vouchers."""
+    if not _db_path().exists():
+        return set()
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT bill_no FROM vouchers UNION SELECT bill_no FROM completed_vouchers"
+        ).fetchall()
+    finally:
+        conn.close()
+    return {r["bill_no"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Master data writes (SQLite)
+# ---------------------------------------------------------------------------
+
+def _append_installments_csv(vouchers):
+    """Write new installment rows to the installments table (dedup on bill_no + date)."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    created_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    conn = get_db()
+    try:
+        with conn:
+            for v in vouchers:
+                payment = (v.get("payment") or "").strip()
+                if not payment:
+                    continue
+                try:
+                    amount = Decimal(payment)
+                except (ValueError, InvalidOperation):
+                    print(f"Warning: skipping invalid payment for {v.get('bill_no')}: {payment!r}")
+                    continue
+                if amount <= 0:
+                    continue
+                collection_date = (v.get("payment_date") or "").strip() or today
+                conn.execute(
+                    "INSERT OR IGNORE INTO installments"
+                    " (bill_no, date, amount, salesman, created_by, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (v["bill_no"], collection_date, payment, v["salesman"], "app", created_at),
+                )
+    finally:
+        conn.close()
+
+
+def _update_vouchers_balance(vouchers):
+    """Update balances in the vouchers table. Returns list of bill_nos that reached zero."""
+    payment_map = {
+        v["bill_no"]: Decimal(v["payment"])
+        for v in vouchers
+        if v.get("payment")
+    }
+    if not payment_map:
+        return []
+
+    if not _db_path().exists():
+        raise FileNotFoundError(f"Database not found: {_db_path()}")
+
+    completed_bill_nos = []
+    conn = get_db()
+    try:
+        with conn:
+            for bill_no, payment in payment_map.items():
+                row = conn.execute(
+                    "SELECT balance FROM vouchers WHERE bill_no = ?", (bill_no,)
+                ).fetchone()
+                if row is None:
+                    continue
+                try:
+                    old_balance = Decimal(row["balance"])
+                    new_balance = max(Decimal("0"), old_balance - payment)
+                    conn.execute(
+                        "UPDATE vouchers SET balance = ? WHERE bill_no = ?",
+                        (str(new_balance.quantize(Decimal("0.01"))), bill_no),
+                    )
+                    if new_balance == Decimal("0"):
+                        completed_bill_nos.append(bill_no)
+                except (ValueError, InvalidOperation):
+                    print(f"Warning: bill_no {bill_no} — invalid balance; skipping")
+    finally:
+        conn.close()
+    return completed_bill_nos
+
+
+def _archive_completed(bill_nos):
+    """Move completed vouchers and their installments to completed_* tables."""
+    if not bill_nos:
+        return
+    bill_list = list(bill_nos)
+    ph = ",".join("?" * len(bill_list))
+    conn = get_db()
+    try:
+        with conn:
+            rows = conn.execute(
+                f"SELECT bill_no, date, amount, balance, beat, salesman, created_by, created_at"
+                f" FROM vouchers WHERE bill_no IN ({ph})",
+                bill_list,
+            ).fetchall()
+            for r in rows:
+                conn.execute(
+                    "INSERT OR IGNORE INTO completed_vouchers"
+                    " (bill_no, date, amount, balance, beat, salesman, created_by, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (r["bill_no"], r["date"], r["amount"], r["balance"],
+                     r["beat"], r["salesman"], r["created_by"], r["created_at"]),
+                )
+            conn.execute(f"DELETE FROM vouchers WHERE bill_no IN ({ph})", bill_list)
+
+            inst_rows = conn.execute(
+                f"SELECT bill_no, date, amount, salesman, created_by, created_at"
+                f" FROM installments WHERE bill_no IN ({ph})",
+                bill_list,
+            ).fetchall()
+            for r in inst_rows:
+                conn.execute(
+                    "INSERT INTO completed_installments"
+                    " (bill_no, date, amount, salesman, created_by, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (r["bill_no"], r["date"], r["amount"],
+                     r["salesman"], r["created_by"], r["created_at"]),
+                )
+            conn.execute(f"DELETE FROM installments WHERE bill_no IN ({ph})", bill_list)
+    finally:
+        conn.close()
+
+
+def write_new_vouchers(vouchers):
+    """Insert new vouchers into the vouchers table."""
+    conn = get_db()
+    try:
+        with conn:
+            for v in vouchers:
+                conn.execute(
+                    "INSERT OR IGNORE INTO vouchers"
+                    " (bill_no, date, amount, balance, beat, salesman, created_by, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (v.get("bill_no", ""), v.get("date", ""), v.get("amount", ""),
+                     v.get("balance", ""), v.get("beat", ""), v.get("salesman", ""),
+                     v.get("created_by", ""), v.get("created_at", "")),
+                )
+    finally:
+        conn.close()
+
+
+def write_new_installments(installments):
+    """Insert new installments into the installments table."""
+    if not installments:
+        return
+    conn = get_db()
+    try:
+        with conn:
+            for inst in installments:
+                conn.execute(
+                    "INSERT OR IGNORE INTO installments"
+                    " (bill_no, date, amount, salesman, created_by, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (inst.get("bill_no", ""), inst.get("date", ""), inst.get("amount", ""),
+                     inst.get("salesman", ""), inst.get("created_by", ""), inst.get("created_at", "")),
+                )
+    finally:
+        conn.close()
+
+
+def reset_test_data_tables():
+    """Delete all rows from the transactional tables (vouchers, installments,
+    completed_vouchers, completed_installments). Leaves users/beats/permissions
+    untouched. Used by scripts/generate_test_data.py to reproduce its
+    full-reset-and-regenerate semantics against SQLite.
+    """
+    conn = get_db()
+    try:
+        with conn:
+            for table in ("vouchers", "installments", "completed_vouchers", "completed_installments"):
+                conn.execute(f"DELETE FROM {table}")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Staging JSON helpers (unchanged — staging stays on disk as JSON)
+# ---------------------------------------------------------------------------
 
 def _load_pending_start_reports():
     """Reports generated but not yet supervisor-confirmed (stages.start == 'new')."""
@@ -117,7 +563,7 @@ def _load_pending_start_reports():
 
 
 def _load_pending_submit_reports():
-    """Reports submitted by salesman but not yet supervisor-confirmed (stages.submit == 'submitted')."""
+    """Reports submitted but not yet supervisor-confirmed (stages.submit == 'submitted')."""
     if not STAGING_DIR.exists():
         return []
     result = []
@@ -154,13 +600,10 @@ def load_collection_json(path):
     return data.get("vouchers", [])
 
 
-def load_vouchers_raw():
-    """Read all rows from vouchers.csv as a list of dicts."""
-    vouchers_file = DATA_DIR / "vouchers.csv"
-    if not vouchers_file.exists():
-        raise FileNotFoundError(f"Missing vouchers file: {vouchers_file}")
-    with vouchers_file.open(newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+def load_report_json(path):
+    """Read a full report dict (stages/selection/vouchers/...) from a JSON file."""
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 def write_collection_text(path, beats, salesmen, vouchers, stage=None, status=None):
@@ -238,6 +681,25 @@ def release_beat_lock(beat_name):
     path.unlink(missing_ok=True)
 
 
+def _post_claim_path(report_path):
+    return report_path.parent / f".posting-{report_path.stem}.lock"
+
+
+def acquire_post_claim(report_path):
+    """Atomically claim a report for posting. Returns True if acquired, False if
+    another session is already posting it."""
+    try:
+        _post_claim_path(report_path).open('x').close()
+        return True
+    except FileExistsError:
+        return False
+
+
+def release_post_claim(report_path):
+    """Release a previously acquired posting claim."""
+    _post_claim_path(report_path).unlink(missing_ok=True)
+
+
 def cancel_staging_report(report_path, beat_name):
     """Delete all staging files for a report and release its beat lock."""
     report_path.unlink(missing_ok=True)
@@ -300,8 +762,7 @@ def _load_installments(report_path):
         with path.open(encoding="utf-8") as f:
             data = json.load(f)
         bookmark = data.pop("__bookmark__", None)
-        data.pop("__status__", None)  # discard legacy field if present
-        # Legacy cache format stored a plain payment string per bill_no.
+        data.pop("__status__", None)
         data = {
             bn: (entry if isinstance(entry, dict) else {"payment": entry, "date": ""})
             for bn, entry in data.items()
@@ -311,113 +772,7 @@ def _load_installments(report_path):
         return {}, None
 
 
-def _append_installments_csv(vouchers):
-    inst_file = DATA_DIR / "installments.csv"
-    today = datetime.now().strftime("%Y-%m-%d")
-    created_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-
-    existing_keys = set()
-    if inst_file.exists():
-        with inst_file.open(newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                bn = row.get("bill_no", "").strip()
-                dt = row.get("date", "").strip()
-                if bn and dt:
-                    existing_keys.add((bn, dt))
-
-    rows_to_write = []
-    for v in vouchers:
-        payment = (v.get("payment") or "").strip()
-        if not payment:
-            continue
-        try:
-            amount = Decimal(payment)
-        except (ValueError, InvalidOperation):
-            print(f"Warning: skipping invalid payment for {v.get('bill_no')}: {payment!r}")
-            continue
-        if amount <= 0:
-            continue
-        # Reports predating per-voucher payment_date tracking fall back to today.
-        collection_date = (v.get("payment_date") or "").strip() or today
-        key = (v["bill_no"], collection_date)
-        if key in existing_keys:
-            continue
-        rows_to_write.append({
-            "bill_no": v["bill_no"],
-            "date": collection_date,
-            "amount": payment,
-            "salesman": v["salesman"],
-            "created_by": "app",
-            "created_at": created_at,
-        })
-
-    if not rows_to_write:
-        return
-
-    write_header = not inst_file.exists()
-    with inst_file.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["bill_no", "date", "amount", "salesman", "created_by", "created_at"])
-        if write_header:
-            writer.writeheader()
-        writer.writerows(rows_to_write)
-
-
-def _update_vouchers_balance(vouchers):
-    """Update balances in vouchers.csv atomically. Returns list of bill_nos that reached zero."""
-    vouchers_file = DATA_DIR / "vouchers.csv"
-    lock_file = DATA_DIR / ".vouchers.lock"
-    if not vouchers_file.exists():
-        raise FileNotFoundError(f"Missing vouchers file: {vouchers_file}")
-
-    payment_map = {
-        v["bill_no"]: Decimal(v["payment"])
-        for v in vouchers
-        if v.get("payment")
-    }
-    if not payment_map:
-        return []
-
-    try:
-        lock_file.open('x').close()
-    except FileExistsError:
-        raise RuntimeError("vouchers.csv is locked by another process — please retry.")
-
-    try:
-        rows = []
-        completed_bill_nos = []
-        fieldnames = None
-        with vouchers_file.open(newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            fieldnames = reader.fieldnames
-            if not fieldnames:
-                raise ValueError(f"Cannot read columns from {vouchers_file} — file may be empty or malformed")
-            for row in reader:
-                bill_no = row.get("bill_no", "").strip()
-                if bill_no in payment_map:
-                    try:
-                        old_balance = Decimal(row["balance"].strip())
-                        new_balance = max(Decimal("0"), old_balance - payment_map[bill_no])
-                        row["balance"] = str(new_balance.quantize(Decimal("0.01")))
-                        if new_balance == Decimal("0"):
-                            completed_bill_nos.append(bill_no)
-                    except (ValueError, InvalidOperation):
-                        print(f"Warning: bill_no {row.get('bill_no')} — balance '{row.get('balance')}' is invalid; skipping")
-                rows.append(row)
-
-        tmp_file = vouchers_file.with_suffix(".tmp")
-        with tmp_file.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-        os.replace(str(tmp_file), str(vouchers_file))
-    finally:
-        lock_file.unlink(missing_ok=True)
-
-    return completed_bill_nos
-
-
 def _unique_archive_dest(name):
-    """Return a non-colliding ARCHIVE_DIR path for `name`, adding a '_dupN' suffix if needed."""
     dest = ARCHIVE_DIR / name
     if not dest.exists():
         return dest
@@ -433,10 +788,8 @@ def _unique_archive_dest(name):
 def archive_files(paths):
     """Move each existing path in `paths` into ARCHIVE_DIR.
 
-    On Windows, Path.rename() raises FileExistsError if the destination name is
-    already taken (e.g. same beat+salesman archived earlier the same day) — unlike
-    POSIX, which would silently overwrite. Disambiguate with a '_dupN' suffix instead
-    of letting the move fail, so a posted report can never get stranded in staging/.
+    Uses a '_dupN' suffix on name collisions instead of overwriting (Windows
+    Path.rename() raises FileExistsError if the destination already exists).
     """
     ARCHIVE_DIR.mkdir(exist_ok=True)
     archived = {}
@@ -449,69 +802,11 @@ def archive_files(paths):
     return archived
 
 
-def _archive_completed(bill_nos):
-    """Move completed vouchers and their installments to completed_* CSV files."""
-    if not bill_nos:
-        return
-    bill_set = set(bill_nos)
-
-    # --- Archive vouchers ---
-    vouchers_file = DATA_DIR / "vouchers.csv"
-    completed_vouchers_file = DATA_DIR / "completed_vouchers.csv"
-    remaining_vouchers = []
-    completed_vouchers = []
-    v_fieldnames = None
-    if vouchers_file.exists():
-        with vouchers_file.open(newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            v_fieldnames = reader.fieldnames
-            for row in reader:
-                if row.get("bill_no", "").strip() in bill_set:
-                    completed_vouchers.append(row)
-                else:
-                    remaining_vouchers.append(row)
-        with vouchers_file.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=v_fieldnames)
-            writer.writeheader()
-            writer.writerows(remaining_vouchers)
-        if completed_vouchers:
-            write_header = not completed_vouchers_file.exists() or completed_vouchers_file.stat().st_size == 0
-            with completed_vouchers_file.open("a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=v_fieldnames)
-                if write_header:
-                    writer.writeheader()
-                writer.writerows(completed_vouchers)
-
-    # --- Archive installments ---
-    inst_file = DATA_DIR / "installments.csv"
-    completed_inst_file = DATA_DIR / "completed_installments.csv"
-    remaining_inst = []
-    completed_inst = []
-    i_fieldnames = None
-    if inst_file.exists():
-        with inst_file.open(newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            i_fieldnames = reader.fieldnames
-            for row in reader:
-                if row.get("bill_no", "").strip() in bill_set:
-                    completed_inst.append(row)
-                else:
-                    remaining_inst.append(row)
-        with inst_file.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=i_fieldnames)
-            writer.writeheader()
-            writer.writerows(remaining_inst)
-        if completed_inst and i_fieldnames:
-            write_header = not completed_inst_file.exists() or completed_inst_file.stat().st_size == 0
-            with completed_inst_file.open("a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=i_fieldnames)
-                if write_header:
-                    writer.writeheader()
-                writer.writerows(completed_inst)
-
+# ---------------------------------------------------------------------------
+# Print / HTML generation (unchanged)
+# ---------------------------------------------------------------------------
 
 def _build_print_column(report_data, bal_width, coll_width):
-    """Render one report as a list of _PRINT_COL_WIDTH-char padded strings."""
     W = _PRINT_COL_WIDTH
     sel_type = report_data.get("selection_type", "beat")
     sel = report_data.get("selection", [])
@@ -548,7 +843,6 @@ def _build_print_column(report_data, bal_width, coll_width):
 
 
 def write_print_collection_txt(output_path, reports_data):
-    """Write up to 3 reports side by side in A4-optimized columns to a print TXT file."""
     if not reports_data:
         return
 
@@ -628,7 +922,6 @@ def _build_html_column(report_data):
 
 
 def write_print_collection_html(output_path, reports_data):
-    """Write up to 3 reports side by side as a print-optimised HTML file."""
     if not reports_data:
         return
 
@@ -720,10 +1013,12 @@ def write_print_collection_html(output_path, reports_data):
         f.write(html)
 
 
-# --- Add-vouchers pipeline helpers ---
+# ---------------------------------------------------------------------------
+# Add-vouchers pipeline helpers (staging JSON — unchanged)
+# ---------------------------------------------------------------------------
 
 def read_csv_file(path):
-    """Read a CSV file and return (fieldnames, rows). Raises FileNotFoundError or ValueError."""
+    """Read a CSV file and return (fieldnames, rows). Used for batch import feature."""
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"File not found: {path}")
@@ -733,21 +1028,6 @@ def read_csv_file(path):
         if not reader.fieldnames:
             raise ValueError(f"File appears empty or has no header: {path}")
         return list(reader.fieldnames), rows
-
-
-def load_all_existing_bill_nos():
-    """Return set of all bill_nos from vouchers.csv and completed_vouchers.csv."""
-    bill_nos = set()
-    for fname in ("vouchers.csv", "completed_vouchers.csv"):
-        fpath = DATA_DIR / fname
-        if not fpath.exists():
-            continue
-        with fpath.open(newline='', encoding='utf-8') as f:
-            for row in csv.DictReader(f):
-                b = row.get("bill_no", "").strip()
-                if b:
-                    bill_nos.add(b)
-    return bill_nos
 
 
 def load_addv_staged_bill_nos():
@@ -808,31 +1088,3 @@ def load_addv_pending_finalize():
         if stages.get("confirm") == "confirmed" and stages.get("post") != "confirmed":
             result.append((path, data))
     return result
-
-
-def write_new_vouchers(vouchers):
-    """Append new vouchers to data/vouchers.csv."""
-    fpath = DATA_DIR / "vouchers.csv"
-    write_header = not fpath.exists() or fpath.stat().st_size == 0
-    fieldnames = ["bill_no", "date", "amount", "balance", "beat", "salesman", "created_by", "created_at"]
-    with fpath.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        for v in vouchers:
-            writer.writerow({k: v.get(k, "") for k in fieldnames})
-
-
-def write_new_installments(installments):
-    """Append new installments to data/installments.csv."""
-    if not installments:
-        return
-    fpath = DATA_DIR / "installments.csv"
-    write_header = not fpath.exists() or fpath.stat().st_size == 0
-    fieldnames = ["bill_no", "date", "amount", "salesman", "created_by", "created_at"]
-    with fpath.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        for inst in installments:
-            writer.writerow({k: inst.get(k, "") for k in fieldnames})

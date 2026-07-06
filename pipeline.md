@@ -137,18 +137,22 @@ Its state is encoded entirely in the `stages` sub-dict — the canonical single 
 
 ## RBAC per action
 
-| Action                    | Salesman | Supervisor | Distributor |
-|---------------------------|:--------:|:----------:|:-----------:|
-| Generate Collection List  | ✓        | ✓          | ✓           |
-| Approve Collection List   |          | ✓          | ✓           |
-| Return Collection List    |          | ✓          | ✓           |
-| Cancel Collection List    | ✓ (own)  | ✓          | ✓           |
-| Submit Collections        | ✓        | ✓          | ✓           |
-| Cancel Submission         | ✓ (own)  |            |             |
-| Approve Collections       |          | ✓          | ✓           |
-| Return Collections        |          | ✓          | ✓           |
-| Post Collections          |          |            | ✓           |
-| Return to Supervisor      |          |            | ✓           |
+| Action                    | Salesman     | Supervisor | Distributor |
+|---------------------------|:------------:|:----------:|:-----------:|
+| Generate Collection List  | ✓ (own beat) | ✓          | ✓           |
+| Approve Collection List   |              | ✓          | ✓           |
+| Return Collection List    |              | ✓          | ✓           |
+| Cancel Collection List    | ✓ (own)      | ✓          | ✓           |
+| Submit Collections        | ✓ (own)      | ✓          | ✓           |
+| Cancel Submission         | ✓ (own)      |            |             |
+| Approve Collections       |              | ✓          | ✓           |
+| Return Collections        |              | ✓          | ✓           |
+| Post Collections          |              |            | ✓           |
+| Return to Supervisor      |              |            | ✓           |
+
+`(own beat)` / `(own)` are enforced server-side, not just hidden in the UI: a salesman is
+restricted to beats they're assigned (`beats.salesman` column) and to reports whose
+`selection[1]` (salesman) matches their own username. See roadmap.md's alpha milestone.
 
 ---
 

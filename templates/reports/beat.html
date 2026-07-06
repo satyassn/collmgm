@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}{{ beat }} — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Pending: {{ beat }}</h2>
+
+{% if not grouped %}
+  <p class="empty-state">No pending vouchers for {{ beat }}.</p>
+{% else %}
+  {% for salesman, vouchers in grouped.items() %}
+  <h3 class="group-heading">{{ salesman }} <span class="group-total">({{ totals.get(salesman,0) }})</span></h3>
+  <table class="data-table">
+    <thead>
+      <tr><th>Bill No</th><th>Date</th><th class="num">Balance</th></tr>
+    </thead>
+    <tbody>
+      {% for v in vouchers %}
+      <tr>
+        <td class="mono">{{ v.bill_no }}</td>
+        <td>{{ v.date }}</td>
+        <td class="num mono">{{ v.balance }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% endfor %}
+  <p class="grand-total">Grand total: <strong>{{ grand }}</strong></p>
+{% endif %}
+
+<a class="btn btn-secondary" href="/reports/beat">Back</a>
+{% endblock %}

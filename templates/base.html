@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#1a56db">
+  <link rel="manifest" href="/static/manifest.json">
+  <link rel="stylesheet" href="/static/style.css">
+  <title>{% block title %}CollMgm{% endblock %}</title>
+  <script>
+    if ('serviceWorker' in navigator)
+      navigator.serviceWorker.register('/static/sw.js');
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/menu">CollMgm</a>
+    {% if user is defined and user %}
+      <span class="user-info">
+        <span class="role-badge role-{{ user.role }}">{{ user.role }}</span>
+        {{ user.name }}
+      </span>
+      <a class="logout-btn" href="/logout">Logout</a>
+    {% endif %}
+  </header>
+
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

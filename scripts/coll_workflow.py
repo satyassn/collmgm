@@ -5,6 +5,7 @@ Orchestrates UI ↔ data ↔ store interactions.
 No direct print/input calls (delegates to coll_cli).
 No direct file I/O (delegates to coll_store).
 No direct CSV reads (delegates to coll_data).
+Stage-transition rules shared with coll_api.py live in coll_orchestrate.py.
 """
 
 import os
@@ -12,16 +13,20 @@ import sys
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
+from coll_orchestrate import (
+    prepare_submit_review, apply_submit_approval,
+    ActiveReportState, check_active_beat_report, generate_collection_list, apply_start_approval,
+    compute_payment_dates, record_submit_payments,
+    post_confirmed_report, return_post_stage,
+)
 from coll_store import (
     STAGING_DIR, PRINTS_DIR,
     ensure_staging_dir, ensure_prints_dir, save_report_json,
     write_collection_text, write_print_collection_txt, write_print_collection_html,
     sanitize_filename_component,
-    _installments_path, _save_installments, _load_installments,
-    _append_installments_csv, _update_vouchers_balance, _archive_completed,
-    archive_files,
-    acquire_beat_lock, release_beat_lock, cancel_staging_report,
-    write_finalize_checkpoint, clear_finalize_checkpoint, read_finalize_checkpoint,
+    _load_installments,
+    archive_files, cancel_staging_report,
+    read_finalize_checkpoint,
     verify_user, _load_pending_start_reports, _load_pending_submit_reports,
     read_csv_file, load_all_existing_bill_nos, load_addv_staged_bill_nos,
     load_addv_pending_confirm, load_addv_pending_finalize,
@@ -30,7 +35,7 @@ from coll_store import (
 )
 from coll_data import (
     load_beats, load_salesmen, load_beats_pending_summary, _load_vouchers_by_criterion,
-    _find_any_active_beat_report, _load_confirmed_start_reports, load_active_beat_statuses,
+    _load_confirmed_start_reports, load_active_beat_statuses,
     _load_submit_confirmed_reports,
     query_pending_by_salesman, query_pending_by_beat,
     query_pending_by_age, query_pending_by_amount,
@@ -147,17 +152,12 @@ def run_coll_start(current_user):
         # Filter in-memory to chosen salesman (no second CSV read)
         vouchers = [v for v in beat_vouchers if v["salesman"] == chosen_salesman]
 
-        existing = _find_any_active_beat_report(selection_type, selection_values)
-        if existing:
-            existing_path, existing_data = existing
-            stages = existing_data.get("stages", {})
-            start_confirmed = stages.get("start") == "confirmed"
-            in_submit_pipeline = stages.get("submit") in ("submitted", "inprogress", "confirmed")
-
+        state, existing_path, existing_data = check_active_beat_report(selection_type, selection_values)
+        if state != ActiveReportState.NONE:
             print(f"\nAn active collection already exists for Beat: {beat} | Salesman: {chosen_salesman}")
 
-            if start_confirmed or in_submit_pipeline:
-                if start_confirmed and not in_submit_pipeline:
+            if state != ActiveReportState.PENDING_START:
+                if state == ActiveReportState.START_CONFIRMED:
                     print("This report has been approved by a supervisor. It cannot be modified.")
                 else:
                     print("This report is in the submit/post pipeline. Complete it before starting a new collection.")
@@ -174,64 +174,34 @@ def run_coll_start(current_user):
                 choice = input("\nApprove (y) / Cancel (c) / Back (b): ").strip().lower()
                 if choice == "b":
                     break  # back to beat selection
-                elif choice == "y":
-                    existing_data.setdefault("stages", {})["start"] = "confirmed"
-                    try:
-                        save_report_json(existing_path, existing_data)
-                        sel = existing_data.get("selection", [])
-                        write_collection_text(
-                            txt_path,
-                            [sel[0]] if len(sel) > 0 else [],
-                            [sel[1]] if len(sel) > 1 else [],
-                            existing_data["vouchers"],
-                            stage="start", status="confirmed",
-                        )
-                        print(f"\nReport approved: {existing_path.name}")
-                    except Exception as error:
-                        print(f"Failed to approve report: {error}")
-                    active_statuses = load_active_beat_statuses()
-                    prompt_continue()
-                    break
-                elif choice == "c":
-                    cancel_staging_report(existing_path, beat)
-                    active_statuses = load_active_beat_statuses()
-                    print("\nCollection list cancelled.")
-                    prompt_continue()
-                    break
-                else:
+                action = "approve" if choice == "y" else "cancel" if choice == "c" else None
+                if action is None:
                     print("Please enter 'y', 'c', or 'b'.")
+                    continue
+                try:
+                    apply_start_approval(existing_path, existing_data, action)
+                    print(f"\nReport approved: {existing_path.name}" if action == "approve"
+                          else "\nCollection list cancelled.")
+                except Exception as error:
+                    print(f"Failed to approve report: {error}")
+                active_statuses = load_active_beat_statuses()
+                prompt_continue()
+                break
 
             continue  # back to beat selection
 
-        if not acquire_beat_lock(beat):
-            print(f"\nBeat '{beat}' was just claimed by another session. Please retry.")
-            prompt_continue()
-            active_statuses = load_active_beat_statuses()
-            continue
-
-        ensure_staging_dir()
-        timestamp = datetime.now().strftime("%Y%m%d")
-        safe_selection = "_".join(sanitize_filename_component(v) for v in selection_values)
-        base_name = f"coll{timestamp}-{selection_type}-{safe_selection}"
-        json_path = STAGING_DIR / f"{base_name}.json"
-        txt_path = STAGING_DIR / f"{base_name}.txt"
-
-        start_data = {
-            "stages": {"start": "new"},
-            "selection_type": selection_type,
-            "selection": selection_values,
-            "vouchers": vouchers,
-        }
-
-        try:
-            save_report_json(json_path, start_data)
-            write_collection_text(txt_path, [beat], [chosen_salesman], vouchers,
-                                  stage="start", status="new")
-        except Exception as error:
-            print(f"Failed to create report files: {error}")
-            release_beat_lock(beat)
+        outcome = generate_collection_list(beat, chosen_salesman, vouchers)
+        if not outcome.ok:
+            if outcome.reason == "lock_conflict":
+                print(f"\nBeat '{beat}' was just claimed by another session. Please retry.")
+                prompt_continue()
+                active_statuses = load_active_beat_statuses()
+                continue
+            print(f"Failed to create report files: {outcome.error}")
             prompt_continue()
             return
+
+        json_path, txt_path = outcome.json_path, outcome.txt_path
 
         clear_screen()
         print(txt_path.read_text(encoding="utf-8"))
@@ -263,12 +233,8 @@ def _prompt_submit_for_review(report_path, report_data, vouchers, beats, salesme
         print(f"Collections saved. Submission deferred for {report_path.name}.")
         return
     try:
-        report_data.setdefault("stages", {})["submit"] = "submitted"
-        save_report_json(report_path, report_data)
-        txt_path = report_path.with_suffix(".txt")
-        write_collection_text(txt_path, beats, salesmen, vouchers,
-                              stage="submit", status="submitted")
-        _save_installments(report_path, vouchers)
+        record_submit_payments(report_path, report_data, vouchers, submit_for_review=True,
+                               beats=beats, salesmen=salesmen)
         print(f"Submitted for supervisor review: {report_path.name}")
     except Exception as error:
         print(f"Failed to submit report {report_path.name}: {error}")
@@ -396,26 +362,14 @@ def run_coll_submit(current_user):
         vouchers, completed, quit_idx = interactive_payment_editor(vouchers, beats, salesmen, start_idx=start_idx)
 
         if vouchers is not None:
-            today = datetime.now().strftime("%Y-%m-%d")
-            for v in vouchers:
-                payment = (v.get("payment") or "").strip()
-                if not payment:
-                    v["payment_date"] = ""
-                    continue
-                prior = installments.get(v["bill_no"])
-                if prior and (prior.get("payment") or "").strip() == payment:
-                    v["payment_date"] = prior.get("date") or today
-                else:
-                    v["payment_date"] = today
+            compute_payment_dates(vouchers, installments)
 
         if not completed:
             if vouchers is not None:
                 try:
                     bookmark = vouchers[quit_idx]["bill_no"] if quit_idx is not None else None
-                    _save_installments(report_path, vouchers, bookmark_bill_no=bookmark)
-                    report_data.setdefault("stages", {})["submit"] = "inprogress"
-                    report_data["vouchers"] = vouchers
-                    save_report_json(report_path, report_data)
+                    record_submit_payments(report_path, report_data, vouchers, submit_for_review=False,
+                                           bookmark_bill_no=bookmark)
                     print(f"Progress saved as installments for {report_path.name}.")
                     if bookmark:
                         print(f"Bookmarked at: {bookmark}")
@@ -436,10 +390,7 @@ def run_coll_submit(current_user):
             continue
 
         try:
-            _save_installments(report_path, vouchers)
-            report_data.setdefault("stages", {})["submit"] = "inprogress"
-            report_data["vouchers"] = vouchers
-            save_report_json(report_path, report_data)
+            record_submit_payments(report_path, report_data, vouchers, submit_for_review=False)
         except Exception as error:
             print(f"Failed to save collections for {report_path.name}: {error}")
             continue
@@ -510,9 +461,8 @@ def run_coll_post(current_user):
                 do_post = True
                 break
             if confirm == "r":
-                report_data.setdefault("stages", {})["submit"] = "submitted"
                 try:
-                    save_report_json(report_path, report_data)
+                    return_post_stage(report_path, report_data)
                     print("Returned to supervisor for re-approval.")
                 except Exception as error:
                     print(f"Failed to return report: {error}")
@@ -525,48 +475,22 @@ def run_coll_post(current_user):
         if not do_post:
             continue
 
-        write_finalize_checkpoint(report_path, 1)
-        try:
-            _append_installments_csv(vouchers)
-            write_finalize_checkpoint(report_path, 2)
-            completed_bill_nos = _update_vouchers_balance(vouchers)
-            write_finalize_checkpoint(report_path, 3)
-            if completed_bill_nos:
-                _archive_completed(completed_bill_nos)
-            write_finalize_checkpoint(report_path, 4)
-        except Exception as error:
-            print(f"Failed to update data files for {report_path.name}: {error}")
+        outcome = post_confirmed_report(report_path)
+        if not outcome.ok:
+            step_note = f" (step {outcome.step_failed})" if outcome.step_failed else ""
+            print(f"Failed to post {report_path.name}{step_note}: {outcome.error}")
             print("  IMPORTANT: A post checkpoint remains. Verify data before retrying.")
             continue
-
-        report_data.setdefault("stages", {})["post"] = "confirmed"
-        try:
-            save_report_json(report_path, report_data)
-            write_finalize_checkpoint(report_path, 5)
-        except Exception as error:
-            print(f"Failed to update staging JSON for {report_path.name}: {error}")
-            continue
-
-        try:
-            archive_files([report_path, _installments_path(report_path), txt_path])
-        except Exception as error:
-            print(f"  Warning: could not archive {report_path.name}: {error}")
-
-        clear_finalize_checkpoint()
-        if beat:
-            release_beat_lock(beat)
-
-        total = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
-        paid_count = sum(1 for v in vouchers if Decimal(v.get("payment", "0") or "0") > 0)
-        completed_count = len(completed_bill_nos)
+        if outcome.archive_warning:
+            print(f"  Warning: could not archive {report_path.name}: {outcome.archive_warning}")
 
         print("\n" + "-" * 50)
         print(f"Posted: {report_path.name}")
         print(f"  Beat                 : {beat}")
         print(f"  Vouchers in report   : {len(vouchers)}")
-        print(f"  Vouchers with payment: {paid_count}")
-        print(f"  Total collected      : {total}")
-        print(f"  Fully settled        : {completed_count}")
+        print(f"  Vouchers with payment: {outcome.paid_count}")
+        print(f"  Total collected      : {outcome.total_collected}")
+        print(f"  Fully settled        : {len(outcome.completed_bill_nos)}")
         print("-" * 50)
 
     prompt_continue()
@@ -602,16 +526,14 @@ def run_coll_approve_start(current_user):
             confirm = input("\nApprove (y) / Return (r) / Cancel (c) / Back (b): ").strip().lower()
             if confirm == "b":
                 break
-            if confirm == "r":
-                beat_name = report_data.get("selection", [None])[0]
-                cancel_staging_report(report_path, beat_name)
-                print("Collection list returned — it must be regenerated by the salesman.")
-                prompt_continue()
-                return
-            if confirm == "c":
-                beat_name = report_data.get("selection", [None])[0]
-                cancel_staging_report(report_path, beat_name)
-                print("Collection list cancelled.")
+            if confirm in ("r", "c"):
+                action, done_msg = (("return", "Collection list returned — it must be regenerated by the salesman.")
+                                    if confirm == "r" else ("cancel", "Collection list cancelled."))
+                try:
+                    apply_start_approval(report_path, report_data, action)
+                    print(done_msg)
+                except Exception as error:
+                    print(f"Failed to {action} collection list: {error}")
                 prompt_continue()
                 return
             if confirm in ("y", "yes"):
@@ -623,14 +545,8 @@ def run_coll_approve_start(current_user):
         if confirm not in ("y", "yes"):
             continue
 
-        report_data.setdefault("stages", {})["start"] = "confirmed"
         try:
-            save_report_json(report_path, report_data)
-            sel = report_data.get("selection", [])
-            beat = sel[0] if len(sel) > 0 else ""
-            salesman = sel[1] if len(sel) > 1 else ""
-            write_collection_text(txt_path, [beat], [salesman], report_data["vouchers"],
-                                  stage="start", status="confirmed")
+            apply_start_approval(report_path, report_data, "approve")
             print(f"Collection list approved: {report_path.name}")
         except Exception as error:
             print(f"Failed to approve report: {error}")
@@ -657,18 +573,8 @@ def run_coll_approve_submit(current_user):
             return
 
         report_path = report_paths[idx]
-        report_data = report_map[report_path]
-        report_data["vouchers"] = sorted(report_data["vouchers"], key=lambda v: bill_no_sort_key(v["bill_no"]))
+        report_data = prepare_submit_review(report_path, report_map[report_path])
         txt_path = report_path.with_suffix(".txt")
-
-        sel = report_data.get("selection", [])
-        beat = sel[0] if len(sel) > 0 else ""
-        salesman = sel[1] if len(sel) > 1 else ""
-        try:
-            write_collection_text(txt_path, [beat], [salesman], report_data["vouchers"],
-                                  stage="submit", status="submitted")
-        except Exception:
-            pass
 
         clear_screen()
         display_report_for_review(report_data, txt_path)
@@ -677,25 +583,21 @@ def run_coll_approve_submit(current_user):
             confirm = input("\nApprove (y) / Return (r) / Back (b): ").strip().lower()
             if confirm == "b":
                 break
-            if confirm == "r":
-                report_data.setdefault("stages", {})["submit"] = "returned"
-                try:
-                    save_report_json(report_path, report_data)
-                    print("Collections returned to salesman for correction.")
-                except Exception as error:
-                    print(f"Failed to return collections: {error}")
-                prompt_continue()
-                return
-            if confirm in ("y", "yes"):
-                report_data.setdefault("stages", {})["submit"] = "confirmed"
-                try:
-                    save_report_json(report_path, report_data)
+            action = "approve" if confirm in ("y", "yes") else "return" if confirm == "r" else None
+            if action is None:
+                print("Please enter 'y', 'r', or 'b'.")
+                continue
+            try:
+                apply_submit_approval(report_path, report_data, action)
+                if action == "approve":
                     print(f"Collections approved: {report_path.name}")
-                except Exception as error:
-                    print(f"Failed to approve collections: {error}")
-                prompt_continue()
-                return
-            print("Please enter 'y', 'r', or 'b'.")
+                else:
+                    print("Collections returned to salesman for correction.")
+            except Exception as error:
+                verb = "approve" if action == "approve" else "return"
+                print(f"Failed to {verb} collections: {error}")
+            prompt_continue()
+            return
 
 
 def run_report_salesman_pending(current_user):
