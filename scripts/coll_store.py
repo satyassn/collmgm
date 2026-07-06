@@ -600,6 +600,12 @@ def load_collection_json(path):
     return data.get("vouchers", [])
 
 
+def load_report_json(path):
+    """Read a full report dict (stages/selection/vouchers/...) from a JSON file."""
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def write_collection_text(path, beats, salesmen, vouchers, stage=None, status=None):
     if not vouchers:
         raise ValueError("No vouchers available to write to text report.")
@@ -673,6 +679,25 @@ def release_beat_lock(beat_name):
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", beat_name.strip()) or "unknown"
     path = STAGING_DIR / f".beatlock-{safe}.lock"
     path.unlink(missing_ok=True)
+
+
+def _post_claim_path(report_path):
+    return report_path.parent / f".posting-{report_path.stem}.lock"
+
+
+def acquire_post_claim(report_path):
+    """Atomically claim a report for posting. Returns True if acquired, False if
+    another session is already posting it."""
+    try:
+        _post_claim_path(report_path).open('x').close()
+        return True
+    except FileExistsError:
+        return False
+
+
+def release_post_claim(report_path):
+    """Release a previously acquired posting claim."""
+    _post_claim_path(report_path).unlink(missing_ok=True)
 
 
 def cancel_staging_report(report_path, beat_name):

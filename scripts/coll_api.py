@@ -6,7 +6,7 @@ Run via:  run_server.bat
        or uvicorn scripts.coll_api:app --host 0.0.0.0 --port 8100 --reload
 """
 
-import json
+import re
 import secrets
 import sys
 from decimal import Decimal, InvalidOperation
@@ -20,9 +20,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from coll_orchestrate import (
+    StageError,
     prepare_submit_review, apply_submit_approval,
     ActiveReportState, check_active_beat_report, generate_collection_list, apply_start_approval,
-    compute_payment_dates, record_submit_payments,
+    compute_payment_dates, record_submit_payments, validate_payment,
     post_confirmed_report, return_post_stage,
 )
 from coll_store import (
@@ -34,6 +35,7 @@ from coll_store import (
     cancel_staging_report,
     ensure_db,
     load_permissions,
+    load_report_json,
     read_finalize_checkpoint,
     verify_user,
 )
@@ -118,6 +120,43 @@ def _report_label(data: dict) -> str:
     if sel_type == "beat_salesman" and len(sel) >= 2:
         return f"{sel[0]} / {sel[1]}"
     return ", ".join(sel)
+
+
+# Staging report stems are built from sanitize_filename_component output, so a
+# legitimate stem never needs anything outside this alphabet. Rejecting the
+# rest blocks path traversal: '/' can't appear in a path segment, but an
+# URL-encoded backslash can — and pathlib treats it as a separator on Windows.
+_STEM_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _load_staging_report(stem: str):
+    """Resolve a client-supplied report stem to (json_path, report_data).
+
+    Returns (None, None) for a malformed stem, a missing file, or unreadable/
+    non-dict JSON — callers render the same 'Report not found.' either way.
+    """
+    if not stem or not _STEM_RE.match(stem):
+        return None, None
+    path = STAGING_DIR / f"{stem}.json"
+    if not path.exists():
+        return None, None
+    try:
+        data = load_report_json(path)
+    except Exception:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    return path, data
+
+
+def _safe_decimal(value) -> Decimal:
+    """Parse a stored payment/balance string, treating junk as zero so report
+    screens still render if bad data predates server-side payment validation."""
+    try:
+        d = Decimal((value or "").strip() or "0")
+        return d if d.is_finite() else Decimal("0")
+    except InvalidOperation:
+        return Decimal("0")
 
 
 # ---------------------------------------------------------------------------
@@ -306,21 +345,24 @@ def coll_start_generate(request: Request,
 @app.post("/coll/start/confirm", response_class=HTMLResponse)
 def coll_start_confirm(request: Request,
                         action: str = Form(default="keep"),
-                        report_stem: str = Form(default=""),
-                        beat: str = Form(default="")):
+                        report_stem: str = Form(default="")):
     user, err = _require(request, "coll_start")
     if err:
         return err
-    json_path = STAGING_DIR / f"{report_stem}.json"
     if action == "cancel":
-        if user.role == "salesman":
-            if not json_path.exists():
-                return _tmpl("error.html", request, user=user, message="Report not found.")
-            data = json.loads(json_path.read_text(encoding="utf-8"))
-            sel = data.get("selection", [])
-            if len(sel) < 2 or sel[1] != user.name:
-                return _tmpl("error.html", request, user=user, message="Report not found.")
-        cancel_staging_report(json_path, beat.strip() or None)
+        json_path, data = _load_staging_report(report_stem)
+        if json_path is None:
+            return _tmpl("error.html", request, user=user, message="Report not found.")
+        sel = data.get("selection", [])
+        if user.role == "salesman" and (len(sel) < 2 or sel[1] != user.name):
+            return _tmpl("error.html", request, user=user, message="Report not found.")
+        if data.get("stages", {}).get("start") != "new":
+            return _tmpl("error.html", request, user=user,
+                         message="This collection list has already been approved — "
+                                 "it can no longer be cancelled here.")
+        # Beat comes from the report itself, not the form — a forged beat value
+        # must not release another beat's lock.
+        cancel_staging_report(json_path, sel[0] if sel else None)
         return _tmpl("message.html", request, user=user,
                      message="Collection list cancelled.", back="/menu")
     return _tmpl("message.html", request, user=user,
@@ -346,13 +388,12 @@ def coll_approve_start_review(request: Request, stem: str):
     user, err = _require(request, "coll_approve_start")
     if err:
         return err
-    json_path = STAGING_DIR / f"{stem}.json"
-    if not json_path.exists():
+    json_path, data = _load_staging_report(stem)
+    if json_path is None:
         return _tmpl("error.html", request, user=user, message="Report not found.")
-    data = json.loads(json_path.read_text(encoding="utf-8"))
     sel = data.get("selection", [])
     vouchers = sorted(data.get("vouchers", []), key=lambda v: bill_no_sort_key(v["bill_no"]))
-    total = sum(Decimal(v.get("balance", "0") or "0") for v in vouchers)
+    total = sum(_safe_decimal(v.get("balance")) for v in vouchers)
     return _tmpl("coll/approve_start_review.html", request, user=user,
                  stem=stem, data=data, vouchers=vouchers,
                  beat=sel[0] if sel else "",
@@ -367,11 +408,13 @@ def coll_approve_start_action(request: Request, stem: str, action: str = Form(de
         return err
     if action not in ("approve", "return", "cancel"):
         return _r("/coll/approve-start")
-    json_path = STAGING_DIR / f"{stem}.json"
-    if not json_path.exists():
+    json_path, data = _load_staging_report(stem)
+    if json_path is None:
         return _tmpl("error.html", request, user=user, message="Report not found.")
-    data = json.loads(json_path.read_text(encoding="utf-8"))
-    apply_start_approval(json_path, data, action)
+    try:
+        apply_start_approval(json_path, data, action)
+    except StageError as e:
+        return _tmpl("error.html", request, user=user, message=str(e))
 
     if action in ("return", "cancel"):
         msg = ("Collection list returned — salesman must regenerate." if action == "return"
@@ -405,17 +448,16 @@ def coll_submit_edit(request: Request, stem: str):
     user, err = _require(request, "coll_submit")
     if err:
         return err
-    json_path = STAGING_DIR / f"{stem}.json"
-    if not json_path.exists():
+    json_path, data = _load_staging_report(stem)
+    if json_path is None:
         return _tmpl("error.html", request, user=user, message="Report not found.")
-    data = json.loads(json_path.read_text(encoding="utf-8"))
     sel = data.get("selection", [])
     if user.role == "salesman" and (len(sel) < 2 or sel[1] != user.name):
         return _tmpl("error.html", request, user=user, message="Report not found.")
     stages = data.get("stages", {})
-    if stages.get("submit") == "submitted":
+    if stages.get("submit") in ("submitted", "confirmed"):
         return _tmpl("error.html", request, user=user,
-                     message="This report is already submitted — awaiting supervisor approval.")
+                     message="This report is already submitted — payments can no longer be edited.")
     vouchers = sorted(data.get("vouchers", []), key=lambda v: bill_no_sort_key(v["bill_no"]))
     installments, _ = _load_installments(json_path)
     for v in vouchers:
@@ -423,8 +465,8 @@ def coll_submit_edit(request: Request, stem: str):
         if entry:
             v["payment"] = entry.get("payment", "")
             v["payment_date"] = entry.get("date", "")
-    total_collected = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
-    paid_count = sum(1 for v in vouchers if Decimal(v.get("payment", "0") or "0") > 0)
+    total_collected = sum(_safe_decimal(v.get("payment")) for v in vouchers)
+    paid_count = sum(1 for v in vouchers if _safe_decimal(v.get("payment")) > 0)
     return _tmpl("coll/submit_edit.html", request, user=user,
                  stem=stem, data=data, vouchers=vouchers,
                  beat=sel[0] if sel else "",
@@ -437,10 +479,9 @@ async def coll_submit_save(request: Request, stem: str):
     user, err = _require(request, "coll_submit")
     if err:
         return err
-    json_path = STAGING_DIR / f"{stem}.json"
-    if not json_path.exists():
+    json_path, data = _load_staging_report(stem)
+    if json_path is None:
         return _tmpl("error.html", request, user=user, message="Report not found.")
-    data = json.loads(json_path.read_text(encoding="utf-8"))
     sel = data.get("selection", [])
     if user.role == "salesman" and (len(sel) < 2 or sel[1] != user.name):
         return _tmpl("error.html", request, user=user, message="Report not found.")
@@ -448,18 +489,36 @@ async def coll_submit_save(request: Request, stem: str):
     form = await request.form()
     action = (form.get("action") or "save").strip()
 
+    beat = sel[0] if sel else ""
+    salesman = sel[1] if len(sel) > 1 else ""
+
     vouchers = sorted(data.get("vouchers", []), key=lambda v: bill_no_sort_key(v["bill_no"]))
+    invalid = []
     for v in vouchers:
-        v["payment"] = (form.get(f"pay_{v['bill_no']}") or "").strip()
+        raw = (form.get(f"pay_{v['bill_no']}") or "").strip()
+        normalized, reason = validate_payment(raw, v.get("balance"))
+        if reason:
+            invalid.append(f"{v['bill_no']}: {reason}")
+            v["payment"] = raw  # keep what was typed so the form re-renders with it
+        else:
+            v["payment"] = normalized
+    if invalid:
+        total_collected = sum(_safe_decimal(v.get("payment")) for v in vouchers)
+        paid_count = sum(1 for v in vouchers if _safe_decimal(v.get("payment")) > 0)
+        return _tmpl("coll/submit_edit.html", request, user=user,
+                     stem=stem, data=data, vouchers=vouchers,
+                     beat=beat, salesman=salesman,
+                     total_collected=total_collected, paid_count=paid_count,
+                     error="Nothing saved — fix these payments: " + "; ".join(invalid))
 
     prior_installments, _ = _load_installments(json_path)
     compute_payment_dates(vouchers, prior_installments)
 
-    beat = sel[0] if sel else ""
-    salesman = sel[1] if len(sel) > 1 else ""
-
-    record_submit_payments(json_path, data, vouchers, submit_for_review=(action == "submit"),
-                           beats=[beat] if beat else [], salesmen=[salesman] if salesman else [])
+    try:
+        record_submit_payments(json_path, data, vouchers, submit_for_review=(action == "submit"),
+                               beats=[beat] if beat else [], salesmen=[salesman] if salesman else [])
+    except StageError as e:
+        return _tmpl("error.html", request, user=user, message=str(e))
 
     if action == "submit":
         return _tmpl("message.html", request, user=user,
@@ -488,15 +547,14 @@ def coll_approve_submit_review(request: Request, stem: str):
     user, err = _require(request, "coll_approve_submit")
     if err:
         return err
-    json_path = STAGING_DIR / f"{stem}.json"
-    if not json_path.exists():
+    json_path, data = _load_staging_report(stem)
+    if json_path is None:
         return _tmpl("error.html", request, user=user, message="Report not found.")
-    data = json.loads(json_path.read_text(encoding="utf-8"))
     data = prepare_submit_review(json_path, data)
     vouchers = data["vouchers"]
     sel = data.get("selection", [])
-    total_collected = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
-    paid_count = sum(1 for v in vouchers if Decimal(v.get("payment", "0") or "0") > 0)
+    total_collected = sum(_safe_decimal(v.get("payment")) for v in vouchers)
+    paid_count = sum(1 for v in vouchers if _safe_decimal(v.get("payment")) > 0)
     return _tmpl("coll/approve_submit_review.html", request, user=user,
                  stem=stem, data=data, vouchers=vouchers,
                  beat=sel[0] if sel else "",
@@ -511,11 +569,13 @@ def coll_approve_submit_action(request: Request, stem: str, action: str = Form(d
         return err
     if action not in ("approve", "return"):
         return _r("/coll/approve-submit")
-    json_path = STAGING_DIR / f"{stem}.json"
-    if not json_path.exists():
+    json_path, data = _load_staging_report(stem)
+    if json_path is None:
         return _tmpl("error.html", request, user=user, message="Report not found.")
-    data = json.loads(json_path.read_text(encoding="utf-8"))
-    apply_submit_approval(json_path, data, action)
+    try:
+        apply_submit_approval(json_path, data, action)
+    except StageError as e:
+        return _tmpl("error.html", request, user=user, message=str(e))
 
     if action == "return":
         return _tmpl("message.html", request, user=user,
@@ -544,14 +604,13 @@ def coll_post_review(request: Request, stem: str):
     user, err = _require(request, "coll_post")
     if err:
         return err
-    json_path = STAGING_DIR / f"{stem}.json"
-    if not json_path.exists():
+    json_path, data = _load_staging_report(stem)
+    if json_path is None:
         return _tmpl("error.html", request, user=user, message="Report not found.")
-    data = json.loads(json_path.read_text(encoding="utf-8"))
     sel = data.get("selection", [])
     vouchers = sorted(data.get("vouchers", []), key=lambda v: bill_no_sort_key(v["bill_no"]))
-    total_collected = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
-    paid_count = sum(1 for v in vouchers if Decimal(v.get("payment", "0") or "0") > 0)
+    total_collected = sum(_safe_decimal(v.get("payment")) for v in vouchers)
+    paid_count = sum(1 for v in vouchers if _safe_decimal(v.get("payment")) > 0)
     return _tmpl("coll/post_review.html", request, user=user,
                  stem=stem, data=data, vouchers=vouchers,
                  beat=sel[0] if sel else "",
@@ -566,22 +625,26 @@ def coll_post_action(request: Request, stem: str, action: str = Form(default="")
         return err
     if action not in ("post", "return"):
         return _r("/coll/post")
-    json_path = STAGING_DIR / f"{stem}.json"
-    if not json_path.exists():
+    json_path, data = _load_staging_report(stem)
+    if json_path is None:
         return _tmpl("error.html", request, user=user, message="Report not found.")
-    data = json.loads(json_path.read_text(encoding="utf-8"))
 
     if action == "return":
-        return_post_stage(json_path, data)
+        try:
+            return_post_stage(json_path, data)
+        except StageError as e:
+            return _tmpl("error.html", request, user=user, message=str(e))
         return _tmpl("message.html", request, user=user,
                      message="Returned to supervisor for re-approval.", back="/coll/post")
 
-    outcome = post_confirmed_report(json_path, data)
+    outcome = post_confirmed_report(json_path)
     if not outcome.ok:
-        step_note = f" at step {outcome.step_failed}" if outcome.step_failed else ""
-        return _tmpl("error.html", request, user=user,
-                     message=f"Post failed{step_note}: {outcome.error}. "
-                              "A checkpoint remains — check data before retrying.")
+        if outcome.step_failed:
+            message = (f"Post failed at step {outcome.step_failed}: {outcome.error}. "
+                       "A checkpoint remains — check data before retrying.")
+        else:
+            message = f"Post failed: {outcome.error}"
+        return _tmpl("error.html", request, user=user, message=message)
 
     return _tmpl("message.html", request, user=user,
                  message=f"Posted. {outcome.paid_count} vouchers collected. Total: {outcome.total_collected}",

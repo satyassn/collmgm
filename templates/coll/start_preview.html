@@ -33,7 +33,6 @@
 
 <form method="post" action="/coll/start/confirm">
   <input type="hidden" name="report_stem" value="{{ report_stem }}">
-  <input type="hidden" name="beat" value="{{ beat }}">
   <button type="submit" name="action" value="keep" class="btn btn-primary">Keep</button>
   <button type="submit" name="action" value="cancel" class="btn btn-danger"
           onclick="return confirm('Cancel and delete this collection list?')">Cancel</button>
