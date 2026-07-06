@@ -322,135 +322,133 @@ class TestInstallmentsSidecar(StoreTestCase):
 
 
 # ---------------------------------------------------------------------------
-# _append_installments_csv  (now writes to SQLite installments table)
+# apply_post_to_db  (single-transaction post: installments + balances + archive)
 # ---------------------------------------------------------------------------
 
-class TestAppendInstallmentsCSV(StoreTestCase):
-    def _vouchers(self, *bill_payments):
-        return [{"bill_no": bn, "payment": pay, "salesman": "sm1"}
-                for bn, pay in bill_payments]
+class TestApplyPostToDb(StoreTestCase):
+    def _staged(self, bill_no, payment, **extra):
+        v = {"bill_no": bill_no, "payment": payment, "salesman": "s1"}
+        v.update(extra)
+        return v
 
     def _read_installments(self):
         return self._query("SELECT * FROM installments")
 
-    def test_inserts_row_to_db(self):
-        coll_store._append_installments_csv(self._vouchers(("B001", "100.00")))
+    def _read_vouchers(self):
+        return self._query("SELECT * FROM vouchers")
+
+    def test_inserts_installment_and_reduces_balance(self):
+        self._insert_rows("vouchers", [self._v_row("B001", balance="500.00")])
+        completed = coll_store.apply_post_to_db([self._staged("B001", "200.00")])
+        self.assertEqual(completed, [])
         rows = self._read_installments()
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["bill_no"], "B001")
+        self.assertEqual(self._read_vouchers()[0]["balance"], "300.00")
 
-    def test_appends_to_existing_rows(self):
-        self._insert_rows("installments",
-                          [self._i_row("B000", date="2026-01-01", amount="50.00")])
-        coll_store._append_installments_csv(self._vouchers(("B001", "10.00")))
+    def test_two_same_day_installments_both_persist(self):
+        # A second genuine payment on the same bill and date must not be
+        # silently swallowed (the old UNIQUE(bill_no,date) + INSERT OR IGNORE
+        # behaviour) — posting is exactly-once now, so both rows are real.
+        self._insert_rows("vouchers", [self._v_row("B001", balance="100.00")])
+        coll_store.apply_post_to_db([self._staged("B001", "10.00",
+                                                  payment_date="2026-06-20")])
+        coll_store.apply_post_to_db([self._staged("B001", "10.00",
+                                                  payment_date="2026-06-20")])
         rows = self._read_installments()
         self.assertEqual(len(rows), 2)
+        self.assertEqual(self._read_vouchers()[0]["balance"], "80.00")
 
-    def test_duplicate_bill_no_and_date_skipped(self):
-        from datetime import datetime as _dt
-        today = _dt.now().strftime("%Y-%m-%d")
-        self._insert_rows("installments",
-                          [self._i_row("B001", date=today, amount="10.00")])
-        coll_store._append_installments_csv(self._vouchers(("B001", "10.00")))
+    def test_zero_and_empty_payments_skipped(self):
+        self._insert_rows("vouchers", [self._v_row("B001"), self._v_row("B002"),
+                                       self._v_row("B003")])
+        completed = coll_store.apply_post_to_db([
+            self._staged("B001", "0"),
+            self._staged("B002", ""),
+            self._staged("B003", "5.00"),
+        ])
+        self.assertEqual(completed, [])
         rows = self._read_installments()
-        self.assertEqual(len(rows), 1)
-
-    def test_same_bill_different_date_allowed(self):
-        self._insert_rows("installments",
-                          [self._i_row("B001", date="2026-01-01", amount="10.00")])
-        vouchers = [{"bill_no": "B001", "payment": "20.00", "salesman": "sm1",
-                     "payment_date": "2026-06-20"}]
-        coll_store._append_installments_csv(vouchers)
-        rows = self._read_installments()
-        self.assertEqual(len(rows), 2)
-
-    def test_zero_payment_skipped(self):
-        coll_store._append_installments_csv(self._vouchers(("B001", "0"), ("B002", "5.00")))
-        rows = self._read_installments()
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["bill_no"], "B002")
-
-    def test_empty_payment_skipped(self):
-        coll_store._append_installments_csv([{"bill_no": "B1", "payment": "", "salesman": "s"}])
-        self.assertEqual(self._read_installments(), [])
+        self.assertEqual([r["bill_no"] for r in rows], ["B003"])
+        vouchers = {r["bill_no"]: r["balance"] for r in self._read_vouchers()}
+        self.assertEqual(vouchers["B001"], "100.00")
+        self.assertEqual(vouchers["B002"], "100.00")
+        self.assertEqual(vouchers["B003"], "95.00")
 
     def test_no_rows_nothing_inserted(self):
-        coll_store._append_installments_csv([])
+        coll_store.apply_post_to_db([])
         self.assertEqual(self._read_installments(), [])
 
     def test_uses_voucher_payment_date_not_today(self):
-        vouchers = [{"bill_no": "B001", "payment": "10.00", "salesman": "sm1",
-                     "payment_date": "2026-06-20"}]
-        coll_store._append_installments_csv(vouchers)
-        rows = self._read_installments()
-        self.assertEqual(rows[0]["date"], "2026-06-20")
+        self._insert_rows("vouchers", [self._v_row("B001")])
+        coll_store.apply_post_to_db([self._staged("B001", "10.00",
+                                                  payment_date="2026-06-20")])
+        self.assertEqual(self._read_installments()[0]["date"], "2026-06-20")
 
     def test_missing_payment_date_falls_back_to_today(self):
         from datetime import datetime as _dt
         today = _dt.now().strftime("%Y-%m-%d")
-        coll_store._append_installments_csv(self._vouchers(("B001", "10.00")))
-        rows = self._read_installments()
-        self.assertEqual(rows[0]["date"], today)
-
-    def test_dedup_keyed_on_per_voucher_date(self):
-        self._insert_rows("installments",
-                          [self._i_row("B001", date="2026-06-20", amount="10.00")])
-        vouchers = [{"bill_no": "B001", "payment": "10.00", "salesman": "sm1",
-                     "payment_date": "2026-06-20"}]
-        coll_store._append_installments_csv(vouchers)
-        rows = self._read_installments()
-        self.assertEqual(len(rows), 1)
-
-
-# ---------------------------------------------------------------------------
-# _update_vouchers_balance
-# ---------------------------------------------------------------------------
-
-class TestUpdateVouchersBalance(StoreTestCase):
-    def _make_vouchers(self, rows):
-        self._insert_rows("vouchers", rows)
-
-    def _read_vouchers(self):
-        return self._query("SELECT * FROM vouchers")
-
-    def test_balance_reduced_by_payment(self):
-        self._make_vouchers([self._v_row("B001", balance="500.00")])
-        coll_store._update_vouchers_balance([{"bill_no": "B001", "payment": "200.00"}])
-        rows = self._read_vouchers()
-        self.assertEqual(rows[0]["balance"], "300.00")
+        self._insert_rows("vouchers", [self._v_row("B001")])
+        coll_store.apply_post_to_db([self._staged("B001", "10.00")])
+        self.assertEqual(self._read_installments()[0]["date"], today)
 
     def test_balance_floored_at_zero(self):
-        self._make_vouchers([self._v_row("B001", balance="50.00")])
-        coll_store._update_vouchers_balance([{"bill_no": "B001", "payment": "200.00"}])
-        self.assertEqual(self._read_vouchers()[0]["balance"], "0.00")
+        self._insert_rows("vouchers", [self._v_row("B001", balance="50.00")])
+        completed = coll_store.apply_post_to_db([self._staged("B001", "200.00")])
+        # Floored to zero => completed and archived.
+        self.assertEqual(completed, ["B001"])
+        archived = self._query("SELECT balance FROM completed_vouchers")
+        self.assertEqual(archived[0]["balance"], "0.00")
 
-    def test_zero_balance_returned_as_completed(self):
-        self._make_vouchers([self._v_row("B001", balance="100.00")])
-        completed = coll_store._update_vouchers_balance([{"bill_no": "B001", "payment": "100.00"}])
-        self.assertIn("B001", completed)
-
-    def test_partial_payment_not_in_completed(self):
-        self._make_vouchers([self._v_row("B001", balance="100.00")])
-        completed = coll_store._update_vouchers_balance([{"bill_no": "B001", "payment": "50.00"}])
-        self.assertEqual(completed, [])
+    def test_full_payment_archives_voucher_and_installments(self):
+        self._insert_rows("vouchers", [self._v_row("B001", balance="100.00")])
+        completed = coll_store.apply_post_to_db([self._staged("B001", "100.00")])
+        self.assertEqual(completed, ["B001"])
+        self.assertEqual(self._read_vouchers(), [])
+        self.assertEqual(self._read_installments(), [])
+        self.assertEqual(len(self._query("SELECT * FROM completed_vouchers")), 1)
+        self.assertEqual(len(self._query("SELECT * FROM completed_installments")), 1)
 
     def test_missing_db_raises(self):
-        # Remove the DB so the function can detect it's missing
         coll_store._db_path().unlink()
         with self.assertRaises(FileNotFoundError):
-            coll_store._update_vouchers_balance([{"bill_no": "B1", "payment": "5"}])
-
-    def test_empty_payment_map_returns_empty_list(self):
-        self._make_vouchers([self._v_row("B1")])
-        result = coll_store._update_vouchers_balance([{"bill_no": "B1", "payment": ""}])
-        self.assertEqual(result, [])
+            coll_store.apply_post_to_db([self._staged("B1", "5")])
 
     def test_unrelated_vouchers_untouched(self):
-        self._make_vouchers([self._v_row("B001", balance="100.00"),
-                              self._v_row("B002", balance="200.00")])
-        coll_store._update_vouchers_balance([{"bill_no": "B001", "payment": "50"}])
+        self._insert_rows("vouchers", [self._v_row("B001", balance="100.00"),
+                                       self._v_row("B002", balance="200.00")])
+        coll_store.apply_post_to_db([self._staged("B001", "50")])
         rows = {r["bill_no"]: r for r in self._read_vouchers()}
         self.assertEqual(rows["B002"]["balance"], "200.00")
+
+    def test_invalid_payment_raises_before_any_write(self):
+        self._insert_rows("vouchers", [self._v_row("B001"), self._v_row("B002")])
+        for bad in ("garbage", "NaN", "Infinity"):
+            with self.assertRaises(ValueError):
+                coll_store.apply_post_to_db([self._staged("B001", "10.00"),
+                                             self._staged("B002", bad)])
+            self.assertEqual(self._read_installments(), [], bad)
+            vouchers = {r["bill_no"]: r["balance"] for r in self._read_vouchers()}
+            self.assertEqual(vouchers["B001"], "100.00", bad)
+
+    def test_missing_voucher_rolls_back_everything(self):
+        # Second voucher absent from master: the first voucher's installment
+        # and balance change must roll back with it — nothing partial persists.
+        self._insert_rows("vouchers", [self._v_row("B001", balance="100.00")])
+        with self.assertRaises(ValueError) as ctx:
+            coll_store.apply_post_to_db([self._staged("B001", "10.00"),
+                                         self._staged("B999", "10.00")])
+        self.assertIn("B999", str(ctx.exception))
+        self.assertIn("not found in master", str(ctx.exception))
+        self.assertEqual(self._read_installments(), [])
+        self.assertEqual(self._read_vouchers()[0]["balance"], "100.00")
+
+    def test_corrupt_stored_balance_rolls_back(self):
+        self._insert_rows("vouchers", [self._v_row("B001", balance="garbage")])
+        with self.assertRaises(ValueError) as ctx:
+            coll_store.apply_post_to_db([self._staged("B001", "10.00")])
+        self.assertIn("invalid stored balance", str(ctx.exception))
+        self.assertEqual(self._read_installments(), [])
 
 
 # ---------------------------------------------------------------------------
@@ -542,9 +540,17 @@ class TestLoadVouchersRaw(StoreTestCase):
 # ---------------------------------------------------------------------------
 
 class TestArchiveCompleted(StoreTestCase):
+    def _archive(self, bill_nos):
+        conn = coll_store.get_db()
+        try:
+            with conn:
+                coll_store._archive_completed(conn, bill_nos)
+        finally:
+            conn.close()
+
     def test_completed_voucher_moved(self):
         self._insert_rows("vouchers", [self._v_row("B001"), self._v_row("B002", balance="50.00")])
-        coll_store._archive_completed(["B001"])
+        self._archive(["B001"])
         remaining  = self._query("SELECT bill_no FROM vouchers")
         completed  = self._query("SELECT bill_no FROM completed_vouchers")
         self.assertEqual([r["bill_no"] for r in remaining], ["B002"])
@@ -552,27 +558,27 @@ class TestArchiveCompleted(StoreTestCase):
 
     def test_non_completed_voucher_stays(self):
         self._insert_rows("vouchers", [self._v_row("B001"), self._v_row("B002")])
-        coll_store._archive_completed(["B001"])
+        self._archive(["B001"])
         remaining = self._query("SELECT bill_no FROM vouchers")
         self.assertTrue(any(r["bill_no"] == "B002" for r in remaining))
 
     def test_installments_archived_too(self):
         self._insert_rows("vouchers",      [self._v_row("B001")])
         self._insert_rows("installments",  [self._i_row("B001")])
-        coll_store._archive_completed(["B001"])
+        self._archive(["B001"])
         self.assertEqual(self._query("SELECT * FROM installments"), [])
         self.assertEqual(len(self._query("SELECT * FROM completed_installments")), 1)
 
     def test_empty_bill_nos_is_noop(self):
         self._insert_rows("vouchers", [self._v_row("B001")])
-        coll_store._archive_completed([])
+        self._archive([])
         self.assertEqual(len(self._query("SELECT * FROM vouchers")), 1)
         self.assertEqual(self._query("SELECT * FROM completed_vouchers"), [])
 
     def test_appends_to_existing_completed(self):
         self._insert_rows("vouchers",           [self._v_row("B002")])
         self._insert_rows("completed_vouchers", [self._v_row("B001")])
-        coll_store._archive_completed(["B002"])
+        self._archive(["B002"])
         completed = self._query("SELECT bill_no FROM completed_vouchers")
         self.assertEqual(len(completed), 2)
 

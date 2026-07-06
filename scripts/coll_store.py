@@ -97,8 +97,7 @@ CREATE TABLE IF NOT EXISTS installments (
     amount     TEXT NOT NULL,
     salesman   TEXT NOT NULL,
     created_by TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT '',
-    UNIQUE(bill_no, date)
+    created_at TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS completed_vouchers (
     bill_no    TEXT PRIMARY KEY,
@@ -421,116 +420,141 @@ def load_vouchers_by_bill_nos(bill_nos):
 # Master data writes (SQLite)
 # ---------------------------------------------------------------------------
 
-def _append_installments_csv(vouchers, created_by="app"):
-    """Write new installment rows to the installments table (dedup on bill_no + date).
+def _parse_payment_strict(voucher):
+    """Return the voucher's payment as a finite Decimal, or None when empty.
+
+    Raises ValueError on unparseable/non-finite payments — post write paths
+    must abort before touching the master tables, never skip silently.
+    """
+    payment = (voucher.get("payment") or "").strip()
+    if not payment:
+        return None
+    try:
+        amount = Decimal(payment)
+        if not amount.is_finite():
+            raise InvalidOperation
+    except (ValueError, InvalidOperation):
+        raise ValueError(
+            f"invalid payment for {voucher.get('bill_no', '?')}: {payment!r}")
+    return amount
+
+
+def _append_installments(conn, vouchers, created_by="app"):
+    """Insert one installment row per paying voucher on an open connection.
 
     created_by is the audit identity of the user performing the post —
-    callers should pass the logged-in user's name.
+    callers should pass the logged-in user's name. Raises ValueError on an
+    unparseable payment so the enclosing transaction rolls back.
     """
     today = datetime.now().strftime("%Y-%m-%d")
     created_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    conn = get_db()
-    try:
-        with conn:
-            for v in vouchers:
-                payment = (v.get("payment") or "").strip()
-                if not payment:
-                    continue
-                try:
-                    amount = Decimal(payment)
-                except (ValueError, InvalidOperation):
-                    print(f"Warning: skipping invalid payment for {v.get('bill_no')}: {payment!r}")
-                    continue
-                if amount <= 0:
-                    continue
-                collection_date = (v.get("payment_date") or "").strip() or today
-                conn.execute(
-                    "INSERT OR IGNORE INTO installments"
-                    " (bill_no, date, amount, salesman, created_by, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    (v["bill_no"], collection_date, payment, v["salesman"], created_by, created_at),
-                )
-    finally:
-        conn.close()
+    for v in vouchers:
+        amount = _parse_payment_strict(v)
+        if amount is None or amount <= 0:
+            continue
+        collection_date = (v.get("payment_date") or "").strip() or today
+        conn.execute(
+            "INSERT INTO installments"
+            " (bill_no, date, amount, salesman, created_by, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (v["bill_no"], collection_date, str(amount), v["salesman"], created_by, created_at),
+        )
 
 
-def _update_vouchers_balance(vouchers):
-    """Update balances in the vouchers table. Returns list of bill_nos that reached zero."""
-    payment_map = {
-        v["bill_no"]: Decimal(v["payment"])
-        for v in vouchers
-        if v.get("payment")
-    }
+def _update_vouchers_balance(conn, vouchers):
+    """Deduct payments from voucher balances on an open connection.
+
+    Returns list of bill_nos that reached zero. Raises ValueError on an
+    unparseable payment, a voucher missing from master, or a corrupt stored
+    balance — the whole payment_map is parsed before the first UPDATE so a
+    bad row aborts the enclosing transaction rather than half-applying.
+    """
+    payment_map = {}
+    for v in vouchers:
+        amount = _parse_payment_strict(v)
+        if amount is not None:
+            payment_map[v["bill_no"]] = amount
     if not payment_map:
         return []
 
-    if not _db_path().exists():
-        raise FileNotFoundError(f"Database not found: {_db_path()}")
-
     completed_bill_nos = []
-    conn = get_db()
-    try:
-        with conn:
-            for bill_no, payment in payment_map.items():
-                row = conn.execute(
-                    "SELECT balance FROM vouchers WHERE bill_no = ?", (bill_no,)
-                ).fetchone()
-                if row is None:
-                    continue
-                try:
-                    old_balance = Decimal(row["balance"])
-                    new_balance = max(Decimal("0"), old_balance - payment)
-                    conn.execute(
-                        "UPDATE vouchers SET balance = ? WHERE bill_no = ?",
-                        (str(new_balance.quantize(Decimal("0.01"))), bill_no),
-                    )
-                    if new_balance == Decimal("0"):
-                        completed_bill_nos.append(bill_no)
-                except (ValueError, InvalidOperation):
-                    print(f"Warning: bill_no {bill_no} — invalid balance; skipping")
-    finally:
-        conn.close()
+    for bill_no, payment in payment_map.items():
+        row = conn.execute(
+            "SELECT balance FROM vouchers WHERE bill_no = ?", (bill_no,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"voucher {bill_no} not found in master — posting aborted")
+        try:
+            old_balance = Decimal(row["balance"])
+            if not old_balance.is_finite():
+                raise InvalidOperation
+        except (ValueError, InvalidOperation):
+            raise ValueError(
+                f"voucher {bill_no} has an invalid stored balance {row['balance']!r}")
+        new_balance = max(Decimal("0"), old_balance - payment)
+        conn.execute(
+            "UPDATE vouchers SET balance = ? WHERE bill_no = ?",
+            (str(new_balance.quantize(Decimal("0.01"))), bill_no),
+        )
+        if new_balance == Decimal("0"):
+            completed_bill_nos.append(bill_no)
     return completed_bill_nos
 
 
-def _archive_completed(bill_nos):
-    """Move completed vouchers and their installments to completed_* tables."""
+def _archive_completed(conn, bill_nos):
+    """Move completed vouchers and their installments to completed_* tables
+    on an open connection."""
     if not bill_nos:
         return
     bill_list = list(bill_nos)
     ph = ",".join("?" * len(bill_list))
+    rows = conn.execute(
+        f"SELECT bill_no, date, amount, balance, beat, salesman, created_by, created_at"
+        f" FROM vouchers WHERE bill_no IN ({ph})",
+        bill_list,
+    ).fetchall()
+    for r in rows:
+        conn.execute(
+            "INSERT OR IGNORE INTO completed_vouchers"
+            " (bill_no, date, amount, balance, beat, salesman, created_by, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (r["bill_no"], r["date"], r["amount"], r["balance"],
+             r["beat"], r["salesman"], r["created_by"], r["created_at"]),
+        )
+    conn.execute(f"DELETE FROM vouchers WHERE bill_no IN ({ph})", bill_list)
+
+    inst_rows = conn.execute(
+        f"SELECT bill_no, date, amount, salesman, created_by, created_at"
+        f" FROM installments WHERE bill_no IN ({ph})",
+        bill_list,
+    ).fetchall()
+    for r in inst_rows:
+        conn.execute(
+            "INSERT INTO completed_installments"
+            " (bill_no, date, amount, salesman, created_by, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (r["bill_no"], r["date"], r["amount"],
+             r["salesman"], r["created_by"], r["created_at"]),
+        )
+    conn.execute(f"DELETE FROM installments WHERE bill_no IN ({ph})", bill_list)
+
+
+def apply_post_to_db(vouchers, created_by="app"):
+    """All DB writes for posting one report in a single transaction:
+    insert installments, deduct voucher balances, archive fully-settled
+    vouchers. Returns the list of bill_nos that reached zero balance.
+    Raises on any error, rolling back so no partial write persists.
+    """
+    if not _db_path().exists():
+        raise FileNotFoundError(f"Database not found: {_db_path()}")
     conn = get_db()
     try:
         with conn:
-            rows = conn.execute(
-                f"SELECT bill_no, date, amount, balance, beat, salesman, created_by, created_at"
-                f" FROM vouchers WHERE bill_no IN ({ph})",
-                bill_list,
-            ).fetchall()
-            for r in rows:
-                conn.execute(
-                    "INSERT OR IGNORE INTO completed_vouchers"
-                    " (bill_no, date, amount, balance, beat, salesman, created_by, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (r["bill_no"], r["date"], r["amount"], r["balance"],
-                     r["beat"], r["salesman"], r["created_by"], r["created_at"]),
-                )
-            conn.execute(f"DELETE FROM vouchers WHERE bill_no IN ({ph})", bill_list)
-
-            inst_rows = conn.execute(
-                f"SELECT bill_no, date, amount, salesman, created_by, created_at"
-                f" FROM installments WHERE bill_no IN ({ph})",
-                bill_list,
-            ).fetchall()
-            for r in inst_rows:
-                conn.execute(
-                    "INSERT INTO completed_installments"
-                    " (bill_no, date, amount, salesman, created_by, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    (r["bill_no"], r["date"], r["amount"],
-                     r["salesman"], r["created_by"], r["created_at"]),
-                )
-            conn.execute(f"DELETE FROM installments WHERE bill_no IN ({ph})", bill_list)
+            _append_installments(conn, vouchers, created_by)
+            completed = _update_vouchers_balance(conn, vouchers)
+            if completed:
+                _archive_completed(conn, completed)
+        return completed
     finally:
         conn.close()
 

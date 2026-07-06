@@ -23,7 +23,7 @@ from coll_store import (
     acquire_beat_lock, release_beat_lock, cancel_staging_report,
     acquire_post_claim, release_post_claim,
     _save_installments, _installments_path,
-    _append_installments_csv, _update_vouchers_balance, _archive_completed,
+    apply_post_to_db,
     archive_files,
     write_finalize_checkpoint, clear_finalize_checkpoint, read_finalize_checkpoint,
 )
@@ -402,16 +402,20 @@ def post_confirmed_report(report_path, posted_by="app"):
     anything touches the master tables.
 
     Steps (checkpointed via write_finalize_checkpoint so a crash mid-sequence
-    can be diagnosed): append installments -> update voucher balances ->
-    archive fully-settled vouchers -> mark stages.post='confirmed' + save ->
-    archive staging files -> release the beat lock.
+    can be diagnosed): all DB writes (installments + balances + archival of
+    fully-settled vouchers) in one transaction via apply_post_to_db -> mark
+    stages.post='confirmed' + save -> archive staging files -> release the
+    beat lock.
 
-    On failure, the checkpoint file is left in place (no rollback — matches
-    the existing at-least-once semantics both UIs already relied on) and the
-    returned PostOutcome has ok=False with step_failed/error set. Does not
-    raise — both UIs need to render a message either way, so the outcome is
-    always a normal return value rather than an exception. Claim and stage
-    failures come back the same way, with step_failed=None.
+    A DB failure rolls the transaction back completely (checkpoint cleared,
+    nothing written). The only remaining at-least-once window is a failure
+    AFTER the DB commit — saving the staging JSON — where the checkpoint is
+    left at step 4+ so a retry is refused until the operator verifies the
+    data and removes it. The returned PostOutcome has ok=False with
+    step_failed/error set on any failure. Does not raise — both UIs need to
+    render a message either way, so the outcome is always a normal return
+    value rather than an exception. Claim and stage failures come back the
+    same way, with step_failed=None.
     """
     if not acquire_post_claim(report_path):
         return PostOutcome(False, None,
@@ -424,6 +428,13 @@ def post_confirmed_report(report_path, posted_by="app"):
 
 
 def _post_claimed_report(report_path, posted_by):
+    stale = read_finalize_checkpoint()
+    if stale and stale.get("report") == str(report_path) and (stale.get("step") or 0) >= 4:
+        return PostOutcome(False, None,
+                           "A previous post of this report reached the database but did not "
+                           "finish. Verify installments/balances manually, then delete "
+                           "staging/.finalize_checkpoint.json to proceed.",
+                           None, [], Decimal("0"), 0)
     try:
         report_data = load_report_json(report_path)
     except Exception as error:
@@ -448,17 +459,14 @@ def _post_claimed_report(report_path, posted_by):
 
     write_finalize_checkpoint(report_path, 1)
     try:
-        _append_installments_csv(vouchers, created_by=posted_by)
-        write_finalize_checkpoint(report_path, 2)
-        completed_bill_nos = _update_vouchers_balance(vouchers)
-        write_finalize_checkpoint(report_path, 3)
-        if completed_bill_nos:
-            _archive_completed(completed_bill_nos)
+        completed_bill_nos = apply_post_to_db(vouchers, created_by=posted_by)
         write_finalize_checkpoint(report_path, 4)
     except Exception as error:
-        checkpoint = read_finalize_checkpoint()
-        step_failed = checkpoint.get("step") if checkpoint else None
-        return PostOutcome(False, step_failed, str(error), None, [], Decimal("0"), 0)
+        # The transaction rolled back — nothing was written, so the
+        # checkpoint has nothing left to diagnose.
+        clear_finalize_checkpoint()
+        return PostOutcome(False, 1, f"{error} (no changes were written)",
+                           None, [], Decimal("0"), 0)
 
     report_data.setdefault("stages", {})["post"] = "confirmed"
     try:

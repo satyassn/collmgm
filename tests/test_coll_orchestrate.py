@@ -447,20 +447,62 @@ class TestPostConfirmedReport(PostTestCase):
         self.assertEqual(len(remaining), 1)
         self.assertEqual(remaining[0]["balance"], "60.00")
 
-    def test_failure_during_balance_update_leaves_checkpoint(self):
+    def test_db_failure_rolls_back_and_clears_checkpoint(self):
         self._insert_voucher(balance="100.00")
         data = self._post_report(payment="100.00")
         report_path = self._write_staging_json("coll1.json", data)
 
-        with patch.object(coll_orchestrate, "_update_vouchers_balance", side_effect=RuntimeError("boom")):
+        with patch.object(coll_orchestrate, "apply_post_to_db", side_effect=RuntimeError("boom")):
             outcome = coll_orchestrate.post_confirmed_report(report_path)
 
         self.assertFalse(outcome.ok)
-        self.assertEqual(outcome.step_failed, 2)
-        self.assertEqual(outcome.error, "boom")
-        # Checkpoint left in place for manual recovery; staging file untouched.
-        self.assertIsNotNone(coll_store.read_finalize_checkpoint())
+        self.assertEqual(outcome.step_failed, 1)
+        self.assertIn("boom", outcome.error)
+        self.assertIn("no changes were written", outcome.error)
+        # DB rolled back — checkpoint cleared, staging file untouched.
+        self.assertIsNone(coll_store.read_finalize_checkpoint())
         self.assertTrue(report_path.exists())
+
+    def test_partial_failure_rolls_back_all_db_writes(self):
+        # Two-voucher report; the second voucher vanishes from master after
+        # approval (validation is patched out to simulate the race) — the
+        # first voucher's installment and balance change must roll back too.
+        self._insert_voucher(bill_no="1", balance="100.00")
+        data = self._post_report(payment="40.00")
+        data["vouchers"].append({"bill_no": "2", "balance": "100.00", "payment": "10.00",
+                                 "payment_date": "2026-02-01", "beat": "beat1",
+                                 "salesman": "sm1"})
+        report_path = self._write_staging_json("coll1.json", data)
+
+        with patch.object(coll_orchestrate, "validate_staged_report", return_value=[]):
+            outcome = coll_orchestrate.post_confirmed_report(report_path)
+
+        self.assertFalse(outcome.ok)
+        self.assertIn("2 not found in master", outcome.error)
+        self.assertIn("no changes were written", outcome.error)
+        self.assertEqual(self._query("SELECT * FROM installments"), [])
+        rows = self._query("SELECT balance FROM vouchers WHERE bill_no = '1'")
+        self.assertEqual(rows[0]["balance"], "100.00")
+        self.assertIsNone(coll_store.read_finalize_checkpoint())
+
+    def test_stale_checkpoint_at_db_commit_blocks_repost(self):
+        # A checkpoint at step >= 4 for this report means a previous post
+        # reached the DB but never finished — a blind retry would double-post.
+        self._insert_voucher(balance="100.00")
+        data = self._post_report(payment="40.00")
+        report_path = self._write_staging_json("coll1.json", data)
+        coll_store.write_finalize_checkpoint(report_path, 4)
+
+        outcome = coll_orchestrate.post_confirmed_report(report_path)
+
+        self.assertFalse(outcome.ok)
+        self.assertIn("reached the database", outcome.error)
+        self.assertEqual(self._query("SELECT * FROM installments"), [])
+
+        # A different report's checkpoint does not block this one.
+        coll_store.write_finalize_checkpoint(self.tmp / "staging" / "other.json", 4)
+        outcome = coll_orchestrate.post_confirmed_report(report_path)
+        self.assertTrue(outcome.ok, outcome.error)
 
     def test_failure_saving_json_after_db_writes_succeed(self):
         # The riskiest edge case: DB already updated, but the staging JSON
@@ -578,7 +620,7 @@ class TestPostStageGuards(PostTestCase):
         data = self._post_report(payment="100.00")
         report_path = self._write_staging_json("coll1.json", data)
 
-        with patch.object(coll_orchestrate, "_update_vouchers_balance", side_effect=RuntimeError("boom")):
+        with patch.object(coll_orchestrate, "apply_post_to_db", side_effect=RuntimeError("boom")):
             outcome = coll_orchestrate.post_confirmed_report(report_path)
         self.assertFalse(outcome.ok)
         self.assertTrue(coll_store.acquire_post_claim(report_path))
