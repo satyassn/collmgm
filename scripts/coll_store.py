@@ -33,6 +33,20 @@ _PRINT_PAGE_HEIGHT = 66
 _PRINT_FILE_HEADER_LINES = 3
 
 
+def parse_decimal(value, default=Decimal("0")):
+    """Lenient Decimal parse for report/display totals.
+
+    Returns `default` for None/empty/non-numeric/NaN/Infinity input so a
+    report screen or text sidecar still renders when bad data predates
+    validation. Never use on a write path — write paths must raise.
+    """
+    try:
+        d = Decimal(str(value or "").strip() or "0")
+        return d if d.is_finite() else default
+    except (InvalidOperation, ValueError):
+        return default
+
+
 # ---------------------------------------------------------------------------
 # SQLite helpers
 # ---------------------------------------------------------------------------
@@ -647,8 +661,8 @@ def write_collection_text(path, beats, salesmen, vouchers, stage=None, status=No
 
     lines.append(separator)
     total_vouchers = len(vouchers)
-    total_balance = sum(Decimal(v.get("balance", "0") or "0") for v in vouchers)
-    total_payments = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
+    total_balance = sum(parse_decimal(v.get("balance")) for v in vouchers)
+    total_payments = sum(parse_decimal(v.get("payment")) for v in vouchers)
     lines.append(f"Total vouchers: {total_vouchers}")
     lines.append(f"Sum of balances: {total_balance}")
     if total_payments > 0:
@@ -828,7 +842,7 @@ def _build_print_column(report_data, bal_width, coll_width):
 
     vouchers = report_data.get("vouchers", [])
     total_vouchers = len(vouchers)
-    total_bal = sum(Decimal(v.get("balance", "0") or "0") for v in vouchers)
+    total_bal = sum(parse_decimal(v.get("balance")) for v in vouchers)
     summary = f"#:{total_vouchers}  Bal:{total_bal}"
 
     lines = [
@@ -894,8 +908,8 @@ def _build_html_column(report_data):
 
     vouchers = report_data.get("vouchers", [])
     total_vouchers = len(vouchers)
-    total_bal = sum(Decimal(v.get("balance", "0") or "0") for v in vouchers)
-    total_coll = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
+    total_bal = sum(parse_decimal(v.get("balance")) for v in vouchers)
+    total_coll = sum(parse_decimal(v.get("payment")) for v in vouchers)
 
     rows_html = "".join(
         f"<tr><td>{v['bill_no'][-7:]}</td>"

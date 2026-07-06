@@ -662,8 +662,11 @@ class TestValidatePayment(unittest.TestCase):
         self.assertIsNone(normalized)
         self.assertIn("exceeds balance", reason)
 
-    def test_unparseable_balance_skips_balance_check(self):
-        self.assertEqual(coll_orchestrate.validate_payment("10", "garbage"), ("10.00", None))
+    def test_unparseable_balance_rejects_payment(self):
+        for bad_balance in ("garbage", "NaN", "Infinity", "-Infinity"):
+            normalized, reason = coll_orchestrate.validate_payment("10", bad_balance)
+            self.assertIsNone(normalized, bad_balance)
+            self.assertIn("stored balance is invalid", reason)
 
 
 if __name__ == "__main__":

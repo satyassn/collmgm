@@ -918,8 +918,8 @@ def run_add_vouchers_inline(current_user):
             except InvalidOperation:
                 print(f"  Warning: invalid installment amount '{inst_f['amount_str']}'; skipped.")
                 continue
-            if ia <= 0:
-                print("  Warning: installment amount must be positive; skipped.")
+            if not ia.is_finite() or ia <= 0:
+                print("  Warning: installment amount must be a positive number; skipped.")
                 continue
             inst_sum += ia
             valid_insts.append(inst_f)

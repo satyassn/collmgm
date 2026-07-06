@@ -36,6 +36,7 @@ from coll_store import (
     ensure_db,
     load_permissions,
     load_report_json,
+    parse_decimal,
     read_finalize_checkpoint,
     verify_user,
 )
@@ -147,16 +148,6 @@ def _load_staging_report(stem: str):
     if not isinstance(data, dict):
         return None, None
     return path, data
-
-
-def _safe_decimal(value) -> Decimal:
-    """Parse a stored payment/balance string, treating junk as zero so report
-    screens still render if bad data predates server-side payment validation."""
-    try:
-        d = Decimal((value or "").strip() or "0")
-        return d if d.is_finite() else Decimal("0")
-    except InvalidOperation:
-        return Decimal("0")
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +384,7 @@ def coll_approve_start_review(request: Request, stem: str):
         return _tmpl("error.html", request, user=user, message="Report not found.")
     sel = data.get("selection", [])
     vouchers = sorted(data.get("vouchers", []), key=lambda v: bill_no_sort_key(v["bill_no"]))
-    total = sum(_safe_decimal(v.get("balance")) for v in vouchers)
+    total = sum(parse_decimal(v.get("balance")) for v in vouchers)
     return _tmpl("coll/approve_start_review.html", request, user=user,
                  stem=stem, data=data, vouchers=vouchers,
                  beat=sel[0] if sel else "",
@@ -465,8 +456,8 @@ def coll_submit_edit(request: Request, stem: str):
         if entry:
             v["payment"] = entry.get("payment", "")
             v["payment_date"] = entry.get("date", "")
-    total_collected = sum(_safe_decimal(v.get("payment")) for v in vouchers)
-    paid_count = sum(1 for v in vouchers if _safe_decimal(v.get("payment")) > 0)
+    total_collected = sum(parse_decimal(v.get("payment")) for v in vouchers)
+    paid_count = sum(1 for v in vouchers if parse_decimal(v.get("payment")) > 0)
     return _tmpl("coll/submit_edit.html", request, user=user,
                  stem=stem, data=data, vouchers=vouchers,
                  beat=sel[0] if sel else "",
@@ -503,8 +494,8 @@ async def coll_submit_save(request: Request, stem: str):
         else:
             v["payment"] = normalized
     if invalid:
-        total_collected = sum(_safe_decimal(v.get("payment")) for v in vouchers)
-        paid_count = sum(1 for v in vouchers if _safe_decimal(v.get("payment")) > 0)
+        total_collected = sum(parse_decimal(v.get("payment")) for v in vouchers)
+        paid_count = sum(1 for v in vouchers if parse_decimal(v.get("payment")) > 0)
         return _tmpl("coll/submit_edit.html", request, user=user,
                      stem=stem, data=data, vouchers=vouchers,
                      beat=beat, salesman=salesman,
@@ -553,8 +544,8 @@ def coll_approve_submit_review(request: Request, stem: str):
     data = prepare_submit_review(json_path, data)
     vouchers = data["vouchers"]
     sel = data.get("selection", [])
-    total_collected = sum(_safe_decimal(v.get("payment")) for v in vouchers)
-    paid_count = sum(1 for v in vouchers if _safe_decimal(v.get("payment")) > 0)
+    total_collected = sum(parse_decimal(v.get("payment")) for v in vouchers)
+    paid_count = sum(1 for v in vouchers if parse_decimal(v.get("payment")) > 0)
     return _tmpl("coll/approve_submit_review.html", request, user=user,
                  stem=stem, data=data, vouchers=vouchers,
                  beat=sel[0] if sel else "",
@@ -609,8 +600,8 @@ def coll_post_review(request: Request, stem: str):
         return _tmpl("error.html", request, user=user, message="Report not found.")
     sel = data.get("selection", [])
     vouchers = sorted(data.get("vouchers", []), key=lambda v: bill_no_sort_key(v["bill_no"]))
-    total_collected = sum(_safe_decimal(v.get("payment")) for v in vouchers)
-    paid_count = sum(1 for v in vouchers if _safe_decimal(v.get("payment")) > 0)
+    total_collected = sum(parse_decimal(v.get("payment")) for v in vouchers)
+    paid_count = sum(1 for v in vouchers if parse_decimal(v.get("payment")) > 0)
     return _tmpl("coll/post_review.html", request, user=user,
                  stem=stem, data=data, vouchers=vouchers,
                  beat=sel[0] if sel else "",

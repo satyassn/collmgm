@@ -15,7 +15,15 @@ def clear_screen():
 
 
 def _sum_decimal_field(items, field, default="0"):
-    return sum(Decimal(v.get(field, default) or default) for v in items)
+    total = Decimal("0")
+    for v in items:
+        try:
+            d = Decimal(v.get(field, default) or default)
+        except (ValueError, InvalidOperation):
+            continue
+        if d.is_finite():
+            total += d
+    return total
 
 
 def _format_decimal(d):
@@ -346,7 +354,13 @@ def get_payment_input(voucher, current_idx, total_records, total_payments_so_far
 
     Returns tuple: (payment_amount_str, action) where action is 'next', 'prev', 'skip', 'quit'
     """
-    balance = Decimal(voucher.get("balance", "0") or "0")
+    try:
+        balance = Decimal(voucher.get("balance", "0") or "0")
+        if not balance.is_finite():
+            raise InvalidOperation
+    except (ValueError, InvalidOperation):
+        balance = Decimal("0")
+        print("Warning: stored balance is invalid — only 0 can be entered; return this report for correction.")
     current_payment = voucher.get("payment", "")
 
     print(f"\nRecord {current_idx + 1}/{total_records}")
@@ -374,6 +388,8 @@ def get_payment_input(voucher, current_idx, total_records, total_payments_so_far
         else:
             try:
                 payment = Decimal(value)
+                if not payment.is_finite():
+                    raise InvalidOperation
                 if payment < 0:
                     print("Payment must be zero or positive.")
                     continue

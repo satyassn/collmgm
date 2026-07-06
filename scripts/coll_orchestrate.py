@@ -17,6 +17,7 @@ from typing import Literal, NamedTuple, Optional
 from coll_data import _find_any_active_beat_report
 from coll_store import (
     STAGING_DIR,
+    parse_decimal,
     save_report_json, load_report_json, write_collection_text, bill_no_sort_key,
     ensure_staging_dir, sanitize_filename_component,
     acquire_beat_lock, release_beat_lock, cancel_staging_report,
@@ -311,9 +312,11 @@ def validate_payment(raw, balance):
         return None, "cannot be negative"
     try:
         balance_dec = Decimal(balance or "0")
-    except InvalidOperation:
-        balance_dec = None
-    if balance_dec is not None and amount > balance_dec:
+        if not balance_dec.is_finite():
+            raise InvalidOperation
+    except (InvalidOperation, ValueError):
+        return None, "stored balance is invalid — return the report for correction"
+    if amount > balance_dec:
         return None, f"exceeds balance ({balance})"
     try:
         return str(amount.quantize(Decimal("0.01"))), None
@@ -424,8 +427,8 @@ def _post_claimed_report(report_path, posted_by):
     if beat:
         release_beat_lock(beat)
 
-    total_collected = sum(Decimal(v.get("payment", "0") or "0") for v in vouchers)
-    paid_count = sum(1 for v in vouchers if Decimal(v.get("payment", "0") or "0") > 0)
+    total_collected = sum(parse_decimal(v.get("payment")) for v in vouchers)
+    paid_count = sum(1 for v in vouchers if parse_decimal(v.get("payment")) > 0)
 
     return PostOutcome(True, None, None, archive_warning, completed_bill_nos, total_collected, paid_count)
 

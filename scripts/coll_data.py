@@ -6,6 +6,7 @@ Imports only from coll_store. current_user parameter is reserved for future RBAC
 """
 
 import json
+import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
@@ -410,6 +411,11 @@ def load_addv_pending_confirm_by_beat():
 
 # --- Add-vouchers validation ---
 
+# First char alphanumeric blocks spreadsheet formula injection (=+-@);
+# the allowlist excludes commas/quotes/whitespace that break CSV exports.
+_BILL_NO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+
+
 def validate_single_voucher(bill_no, date_str, amount_str, beat, salesman,
                              existing_bill_nos, valid_beats, valid_salesmen):
     """Validate one voucher's fields. Returns (errors: list[str], amount: Decimal or None)."""
@@ -418,6 +424,9 @@ def validate_single_voucher(bill_no, date_str, amount_str, beat, salesman,
 
     if not bill_no:
         errors.append("Bill No is required.")
+    elif not _BILL_NO_RE.match(bill_no):
+        errors.append(f"Bill No '{bill_no}' contains invalid characters "
+                      "(allowed: letters, digits, . _ / - ; must start with a letter or digit).")
     elif bill_no in existing_bill_nos:
         errors.append(f"Bill No '{bill_no}' already exists in the system.")
 
@@ -425,7 +434,9 @@ def validate_single_voucher(bill_no, date_str, amount_str, beat, salesman,
         errors.append("Date is required.")
     else:
         try:
-            datetime.strptime(date_str, "%Y-%m-%d")
+            parsed = datetime.strptime(date_str, "%Y-%m-%d").date()
+            if parsed > datetime.now().date():
+                errors.append(f"Date '{date_str}' is in the future.")
         except ValueError:
             errors.append(f"Invalid date '{date_str}'; expected YYYY-MM-DD.")
 
@@ -434,8 +445,8 @@ def validate_single_voucher(bill_no, date_str, amount_str, beat, salesman,
     else:
         try:
             amount = Decimal(amount_str)
-            if amount <= 0:
-                errors.append("Amount must be positive.")
+            if not amount.is_finite() or amount <= 0:
+                errors.append("Amount must be a positive number.")
                 amount = None
         except InvalidOperation:
             errors.append(f"Invalid amount '{amount_str}'.")
@@ -515,7 +526,10 @@ def validate_addv_batch(voucher_rows, inst_rows, existing_bill_nos,
             errors.append(f"Installment row {i} ({bill_no}): date is empty.")
             continue
         try:
-            datetime.strptime(date_str, "%Y-%m-%d")
+            parsed = datetime.strptime(date_str, "%Y-%m-%d").date()
+            if parsed > datetime.now().date():
+                errors.append(f"Installment row {i} ({bill_no}): date '{date_str}' is in the future.")
+                continue
         except ValueError:
             errors.append(f"Installment row {i} ({bill_no}): invalid date '{date_str}'.")
             continue
@@ -527,8 +541,8 @@ def validate_addv_batch(voucher_rows, inst_rows, existing_bill_nos,
         except InvalidOperation:
             errors.append(f"Installment row {i} ({bill_no}): invalid amount '{amount_str}'.")
             continue
-        if inst_amount <= 0:
-            errors.append(f"Installment row {i} ({bill_no}): amount must be positive.")
+        if not inst_amount.is_finite() or inst_amount <= 0:
+            errors.append(f"Installment row {i} ({bill_no}): amount must be a positive number.")
             continue
         if not salesman:
             errors.append(f"Installment row {i} ({bill_no}): salesman is empty.")
