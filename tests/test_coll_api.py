@@ -658,6 +658,32 @@ class TestStageGuardEndpoints(ApiTestCase):
         saved = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(saved["stages"]["submit"], "submitted")
 
+    def test_tampered_staged_balance_cannot_overcollect(self):
+        # A hand-edited staging file inflates the balance copy to 500 so a
+        # 60.00 payment looks legitimate — master says the voucher is 50.00.
+        # Both the approval gate and the post backstop must refuse.
+        def tampered(submit):
+            return self._write_staging_report(
+                self.stem, "beatA", "smA", start="confirmed", submit=submit,
+                vouchers=[{"bill_no": "900", "date": "2026-01-01", "balance": "500.00",
+                           "payment": "60.00", "payment_date": "2026-01-01",
+                           "beat": "beatA", "salesman": "smA"}],
+            )
+
+        tampered(submit="submitted")
+        opener = self._login("sup", "pwS")
+        status, body = self._post(opener, f"/coll/approve-submit/{self.stem}",
+                                  {"action": "approve"})
+        self.assertEqual(status, 200)
+        self.assertIn("exceeds balance (50.00)", body)
+
+        tampered(submit="confirmed")
+        opener = self._login("dist", "pwD")
+        status, body = self._post(opener, f"/coll/post/{self.stem}", {"action": "post"})
+        self.assertEqual(status, 200)
+        self.assertIn("exceeds balance (50.00)", body)
+        self.assertEqual(self._voucher_balance(), "50.00")
+
     def test_overpaid_confirmed_report_cannot_be_posted(self):
         # Final backstop at post, even if approval was somehow bypassed.
         self._report_with_payment(submit="confirmed", payment="50.01")
