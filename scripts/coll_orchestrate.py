@@ -37,6 +37,16 @@ class StageError(ValueError):
     """
 
 
+class ValidationError(ValueError):
+    """A report carries payment data that fails validation (non-numeric,
+    negative, or exceeding the voucher balance).
+
+    Raised at approval so bad data staged by an older/unvalidated client is
+    stopped at the supervisor gate instead of flowing on toward the master
+    tables. Posting re-checks the same rules as a final backstop.
+    """
+
+
 def _require_stage(report_data, ok, action_desc):
     if not ok:
         s = report_data.get("stages", {})
@@ -71,13 +81,22 @@ def apply_submit_approval(report_path, report_data, action: Literal["approve", "
 
     'approve' -> stages.submit = 'confirmed' (ready to post).
     'return'  -> stages.submit = 'returned' (salesman must revise).
-    Requires stages.submit == 'submitted' (StageError otherwise).
+    Requires stages.submit == 'submitted' (StageError otherwise). Approving
+    also re-validates every payment (ValidationError otherwise) so bad data
+    staged by an unvalidated client stops at the supervisor gate — 'return'
+    is deliberately exempt, since returning is the remedy for bad data.
     Persists report_data via save_report_json; raises on I/O failure —
     caller decides how to surface it (print vs error.html).
     """
     stages = report_data.get("stages", {})
     _require_stage(report_data, stages.get("submit") == "submitted",
                    "approved" if action == "approve" else "returned")
+    if action == "approve":
+        errors = validate_report_payments(report_data.get("vouchers", []))
+        if errors:
+            raise ValidationError(
+                "Cannot approve — invalid payments: " + "; ".join(errors)
+                + ". Return the report to the salesman for correction.")
     report_data.setdefault("stages", {})["submit"] = "confirmed" if action == "approve" else "returned"
     save_report_json(report_path, report_data)
     return report_data
@@ -255,6 +274,22 @@ def record_submit_payments(report_path, report_data, vouchers, submit_for_review
     return report_data
 
 
+def validate_report_payments(vouchers):
+    """Run validate_payment over every voucher in a report.
+
+    Returns a list of 'bill_no: reason' strings (empty when all payments are
+    valid). Used as a defense-in-depth re-check at approve and post time —
+    entry-time validation can be bypassed by an older client or by data
+    staged before validation existed.
+    """
+    errors = []
+    for v in vouchers:
+        _, reason = validate_payment(v.get("payment"), v.get("balance"))
+        if reason:
+            errors.append(f"{v.get('bill_no', '?')}: {reason}")
+    return errors
+
+
 def validate_payment(raw, balance):
     """Validate one payment entry against a voucher balance.
 
@@ -300,13 +335,18 @@ class PostOutcome(NamedTuple):
     paid_count: int
 
 
-def post_confirmed_report(report_path):
+def post_confirmed_report(report_path, posted_by="app"):
     """Checkpointed write-to-DB sequence for a submit-confirmed report.
+
+    posted_by is the audit identity written to installments.created_by —
+    pass the logged-in user's name.
 
     Single-flight: an atomic claim file makes a concurrent post of the same
     report fail fast instead of deducting balances twice, and report_data is
     re-read from disk inside the claim so the stage check (stages.submit ==
     'confirmed', not yet posted) cannot race a concurrent approve/return.
+    Payments are re-validated inside the claim as a final backstop before
+    anything touches the master tables.
 
     Steps (checkpointed via write_finalize_checkpoint so a crash mid-sequence
     can be diagnosed): append installments -> update voucher balances ->
@@ -325,12 +365,12 @@ def post_confirmed_report(report_path):
                            "This report is already being posted by another session.",
                            None, [], Decimal("0"), 0)
     try:
-        return _post_claimed_report(report_path)
+        return _post_claimed_report(report_path, posted_by)
     finally:
         release_post_claim(report_path)
 
 
-def _post_claimed_report(report_path):
+def _post_claimed_report(report_path, posted_by):
     try:
         report_data = load_report_json(report_path)
     except Exception as error:
@@ -342,13 +382,20 @@ def _post_claimed_report(report_path):
                            "Report is not approved for posting — supervisor approval is required first.",
                            None, [], Decimal("0"), 0)
 
+    payment_errors = validate_report_payments(report_data.get("vouchers", []))
+    if payment_errors:
+        return PostOutcome(False, None,
+                           "Cannot post — invalid payments: " + "; ".join(payment_errors)
+                           + ". Return the report for correction.",
+                           None, [], Decimal("0"), 0)
+
     vouchers = sorted(report_data["vouchers"], key=lambda v: bill_no_sort_key(v["bill_no"]))
     report_data["vouchers"] = vouchers
     beat = report_data.get("selection", [None])[0]
 
     write_finalize_checkpoint(report_path, 1)
     try:
-        _append_installments_csv(vouchers)
+        _append_installments_csv(vouchers, created_by=posted_by)
         write_finalize_checkpoint(report_path, 2)
         completed_bill_nos = _update_vouchers_balance(vouchers)
         write_finalize_checkpoint(report_path, 3)

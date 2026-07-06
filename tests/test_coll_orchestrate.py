@@ -130,6 +130,33 @@ class TestApplySubmitApproval(OrchestrateTestCase):
             persisted = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertEqual(persisted["stages"]["submit"], submit_stage)
 
+    def test_approve_rejects_payment_over_balance(self):
+        # Defense in depth: data staged by an unvalidated client must stop
+        # at the supervisor gate, not flow on toward the master tables.
+        data = self._report()
+        data["vouchers"][0]["payment"] = "50.01"  # balance is 50.00
+        report_path = self._write_json("coll1.json", data)
+        with self.assertRaises(coll_orchestrate.ValidationError) as ctx:
+            coll_orchestrate.apply_submit_approval(report_path, data, "approve")
+        self.assertIn("20: exceeds balance", str(ctx.exception))
+        persisted = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["stages"]["submit"], "submitted")
+
+    def test_approve_rejects_non_numeric_payment(self):
+        data = self._report()
+        data["vouchers"][0]["payment"] = "abc"
+        report_path = self._write_json("coll1.json", data)
+        with self.assertRaises(coll_orchestrate.ValidationError):
+            coll_orchestrate.apply_submit_approval(report_path, data, "approve")
+
+    def test_return_allowed_despite_invalid_payments(self):
+        # Returning IS the remedy for bad data — it must never be blocked.
+        data = self._report()
+        data["vouchers"][0]["payment"] = "99999.00"
+        report_path = self._write_json("coll1.json", data)
+        coll_orchestrate.apply_submit_approval(report_path, data, "return")
+        self.assertEqual(data["stages"]["submit"], "returned")
+
 
 class TestCheckActiveBeatReport(OrchestrateTestCase):
     def _start_report(self, stages):
@@ -504,6 +531,35 @@ class TestPostStageGuards(PostTestCase):
         self.assertTrue(outcome.ok, outcome.error)
         rows = self._query("SELECT balance FROM vouchers WHERE bill_no = '1'")
         self.assertEqual(rows[0]["balance"], "60.00")
+
+    def test_payment_over_balance_is_not_posted(self):
+        # Final backstop: even a submit-confirmed report is re-validated
+        # before anything touches the master tables.
+        self._insert_voucher(balance="100.00")
+        data = self._post_report(payment="100.01")
+        report_path = self._write_staging_json("coll1.json", data)
+
+        outcome = coll_orchestrate.post_confirmed_report(report_path)
+
+        self.assertFalse(outcome.ok)
+        self.assertIn("invalid payments", outcome.error)
+        self.assertIn("exceeds balance", outcome.error)
+        rows = self._query("SELECT balance FROM vouchers WHERE bill_no = '1'")
+        self.assertEqual(rows[0]["balance"], "100.00")
+        self.assertEqual(self._query("SELECT * FROM installments"), [])
+        self.assertIsNone(coll_store.read_finalize_checkpoint())
+        self.assertTrue(report_path.exists())
+
+    def test_posted_by_recorded_in_installments(self):
+        self._insert_voucher(balance="100.00")
+        data = self._post_report(payment="40.00")
+        report_path = self._write_staging_json("coll1.json", data)
+
+        outcome = coll_orchestrate.post_confirmed_report(report_path, posted_by="dist1")
+
+        self.assertTrue(outcome.ok, outcome.error)
+        rows = self._query("SELECT created_by FROM installments WHERE bill_no = '1'")
+        self.assertEqual(rows, [{"created_by": "dist1"}])
 
     def test_claim_released_after_failed_post(self):
         # A failure inside the sequence must not leave the claim behind,

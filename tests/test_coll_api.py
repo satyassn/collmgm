@@ -647,6 +647,39 @@ class TestStageGuardEndpoints(ApiTestCase):
         self.assertEqual(status, 200)
         self.assertIn("cannot be approved", body)
 
+    def test_supervisor_cannot_approve_payment_over_balance(self):
+        # Staged data from an unvalidated client stops at the approval gate.
+        path = self._report_with_payment(submit="submitted", payment="50.01")
+        opener = self._login("sup", "pwS")
+        status, body = self._post(opener, f"/coll/approve-submit/{self.stem}",
+                                  {"action": "approve"})
+        self.assertEqual(status, 200)
+        self.assertIn("exceeds balance", body)
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["stages"]["submit"], "submitted")
+
+    def test_overpaid_confirmed_report_cannot_be_posted(self):
+        # Final backstop at post, even if approval was somehow bypassed.
+        self._report_with_payment(submit="confirmed", payment="50.01")
+        opener = self._login("dist", "pwD")
+        status, body = self._post(opener, f"/coll/post/{self.stem}", {"action": "post"})
+        self.assertEqual(status, 200)
+        self.assertIn("exceeds balance", body)
+        self.assertEqual(self._voucher_balance(), "50.00")
+
+    def test_post_records_logged_in_user_as_created_by(self):
+        self._report_with_payment(submit="confirmed", payment="20.00")
+        opener = self._login("dist", "pwD")
+        status, body = self._post(opener, f"/coll/post/{self.stem}", {"action": "post"})
+        self.assertIn("Posted.", body)
+        conn = coll_store.get_db()
+        try:
+            row = conn.execute(
+                "SELECT created_by FROM installments WHERE bill_no = '900'").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["created_by"], "dist")
+
 
 # ---------------------------------------------------------------------------
 # POST /coll/submit/{stem} must validate payments server-side — the

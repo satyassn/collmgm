@@ -378,8 +378,12 @@ def load_all_existing_bill_nos():
 # Master data writes (SQLite)
 # ---------------------------------------------------------------------------
 
-def _append_installments_csv(vouchers):
-    """Write new installment rows to the installments table (dedup on bill_no + date)."""
+def _append_installments_csv(vouchers, created_by="app"):
+    """Write new installment rows to the installments table (dedup on bill_no + date).
+
+    created_by is the audit identity of the user performing the post —
+    callers should pass the logged-in user's name.
+    """
     today = datetime.now().strftime("%Y-%m-%d")
     created_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     conn = get_db()
@@ -401,7 +405,7 @@ def _append_installments_csv(vouchers):
                     "INSERT OR IGNORE INTO installments"
                     " (bill_no, date, amount, salesman, created_by, created_at)"
                     " VALUES (?, ?, ?, ?, ?, ?)",
-                    (v["bill_no"], collection_date, payment, v["salesman"], "app", created_at),
+                    (v["bill_no"], collection_date, payment, v["salesman"], created_by, created_at),
                 )
     finally:
         conn.close()

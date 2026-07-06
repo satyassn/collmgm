@@ -475,7 +475,7 @@ def run_coll_post(current_user):
         if not do_post:
             continue
 
-        outcome = post_confirmed_report(report_path)
+        outcome = post_confirmed_report(report_path, posted_by=current_user.name)
         if not outcome.ok:
             step_note = f" (step {outcome.step_failed})" if outcome.step_failed else ""
             print(f"Failed to post {report_path.name}{step_note}: {outcome.error}")

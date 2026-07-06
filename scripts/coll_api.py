@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from coll_orchestrate import (
-    StageError,
+    StageError, ValidationError,
     prepare_submit_review, apply_submit_approval,
     ActiveReportState, check_active_beat_report, generate_collection_list, apply_start_approval,
     compute_payment_dates, record_submit_payments, validate_payment,
@@ -574,7 +574,7 @@ def coll_approve_submit_action(request: Request, stem: str, action: str = Form(d
         return _tmpl("error.html", request, user=user, message="Report not found.")
     try:
         apply_submit_approval(json_path, data, action)
-    except StageError as e:
+    except (StageError, ValidationError) as e:
         return _tmpl("error.html", request, user=user, message=str(e))
 
     if action == "return":
@@ -637,7 +637,7 @@ def coll_post_action(request: Request, stem: str, action: str = Form(default="")
         return _tmpl("message.html", request, user=user,
                      message="Returned to supervisor for re-approval.", back="/coll/post")
 
-    outcome = post_confirmed_report(json_path)
+    outcome = post_confirmed_report(json_path, posted_by=user.name)
     if not outcome.ok:
         if outcome.step_failed:
             message = (f"Post failed at step {outcome.step_failed}: {outcome.error}. "
