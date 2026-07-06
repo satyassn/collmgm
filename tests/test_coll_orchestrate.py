@@ -758,9 +758,11 @@ class TestValidateStagedReport(DbTestCase):
         self.assertTrue(any("invalid payment date 'not-a-date'" in e for e in errors))
 
     def test_corrupt_master_balance_is_an_error(self):
+        # '1.2.3' passes the schema's GLOB check (digits and dots only) but
+        # is not a parseable Decimal.
         conn = coll_store.get_db()
         try:
-            conn.execute("UPDATE vouchers SET balance = 'garbage' WHERE bill_no = '20'")
+            conn.execute("UPDATE vouchers SET balance = '1.2.3' WHERE bill_no = '20'")
             conn.commit()
         finally:
             conn.close()

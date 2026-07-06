@@ -444,7 +444,9 @@ class TestApplyPostToDb(StoreTestCase):
         self.assertEqual(self._read_vouchers()[0]["balance"], "100.00")
 
     def test_corrupt_stored_balance_rolls_back(self):
-        self._insert_rows("vouchers", [self._v_row("B001", balance="garbage")])
+        # '1.2.3' passes the schema's GLOB check (digits and dots only) but
+        # is not a parseable Decimal — the strict write path must reject it.
+        self._insert_rows("vouchers", [self._v_row("B001", balance="1.2.3")])
         with self.assertRaises(ValueError) as ctx:
             coll_store.apply_post_to_db([self._staged("B001", "10.00")])
         self.assertIn("invalid stored balance", str(ctx.exception))
@@ -581,6 +583,204 @@ class TestArchiveCompleted(StoreTestCase):
         self._archive(["B002"])
         completed = self._query("SELECT bill_no FROM completed_vouchers")
         self.assertEqual(len(completed), 2)
+
+
+# ---------------------------------------------------------------------------
+# Schema v1 migration
+# ---------------------------------------------------------------------------
+
+# The pre-v1 DDL, verbatim, to build legacy databases for migration tests.
+_V0_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    name          TEXT PRIMARY KEY,
+    role          TEXT NOT NULL,
+    password_hash TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS beats (
+    name     TEXT PRIMARY KEY,
+    salesman TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS permissions (
+    role       TEXT NOT NULL,
+    action_key TEXT NOT NULL,
+    PRIMARY KEY (role, action_key)
+);
+CREATE TABLE IF NOT EXISTS vouchers (
+    bill_no    TEXT PRIMARY KEY,
+    date       TEXT NOT NULL,
+    amount     TEXT NOT NULL,
+    balance    TEXT NOT NULL,
+    beat       TEXT NOT NULL,
+    salesman   TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS installments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    bill_no    TEXT NOT NULL,
+    date       TEXT NOT NULL,
+    amount     TEXT NOT NULL,
+    salesman   TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT '',
+    UNIQUE(bill_no, date)
+);
+CREATE TABLE IF NOT EXISTS completed_vouchers (
+    bill_no    TEXT PRIMARY KEY,
+    date       TEXT NOT NULL,
+    amount     TEXT NOT NULL,
+    balance    TEXT NOT NULL,
+    beat       TEXT NOT NULL,
+    salesman   TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS completed_installments (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    bill_no    TEXT NOT NULL,
+    date       TEXT NOT NULL,
+    amount     TEXT NOT NULL,
+    salesman   TEXT NOT NULL,
+    created_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT ''
+);
+"""
+
+
+class TestSchemaMigrationV1(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmpdir.name)
+        (self.tmp / "data").mkdir()
+        self._patch = patch.object(coll_store, "DATA_DIR", self.tmp / "data")
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmpdir.cleanup()
+
+    def _build_v0_db(self, inserts=()):
+        import sqlite3
+        conn = sqlite3.connect(str(coll_store._db_path()))
+        try:
+            conn.executescript(_V0_SCHEMA)
+            for sql, params in inserts:
+                conn.execute(sql, params)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _user_version(self):
+        conn = coll_store.get_db()
+        try:
+            return conn.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            conn.close()
+
+    def _query(self, sql, params=()):
+        conn = coll_store.get_db()
+        try:
+            return [dict(r) for r in conn.execute(sql, params).fetchall()]
+        finally:
+            conn.close()
+
+    def _exec(self, sql, params=()):
+        conn = coll_store.get_db()
+        try:
+            with conn:
+                conn.execute(sql, params)
+        finally:
+            conn.close()
+
+    _VOUCHER = ("INSERT INTO vouchers (bill_no, date, amount, balance, beat, salesman)"
+                " VALUES (?, ?, ?, ?, ?, ?)")
+    _INSTALLMENT = ("INSERT INTO installments (bill_no, date, amount, salesman)"
+                    " VALUES (?, ?, ?, ?)")
+
+    def test_v0_db_migrates_with_data_intact(self):
+        self._build_v0_db([
+            ("INSERT INTO users (name, role) VALUES (?, ?)", ("sm1", "salesman")),
+            ("INSERT INTO beats (name, salesman) VALUES (?, ?)", ("beat1", "sm1")),
+            (self._VOUCHER, ("B001", "2026-01-01", "100.00", "60.00", "beat1", "sm1")),
+            (self._INSTALLMENT, ("B001", "2026-01-02", "40.00", "sm1")),
+            ("INSERT INTO completed_vouchers (bill_no, date, amount, balance, beat, salesman)"
+             " VALUES (?, ?, ?, ?, ?, ?)",
+             ("B000", "2025-12-01", "50.00", "0.00", "beat1", "sm1")),
+        ])
+        coll_store.init_db()
+        self.assertEqual(self._user_version(), 1)
+        self.assertEqual(self._query("SELECT balance FROM vouchers")[0]["balance"], "60.00")
+        self.assertEqual(len(self._query("SELECT * FROM installments")), 1)
+        self.assertEqual(len(self._query("SELECT * FROM completed_vouchers")), 1)
+        self.assertEqual(self._query("SELECT role FROM users")[0]["role"], "salesman")
+        # UNIQUE(bill_no,date) is gone: a second same-day installment persists.
+        self._exec(self._INSTALLMENT, ("B001", "2026-01-02", "5.00", "sm1"))
+        self.assertEqual(len(self._query("SELECT * FROM installments")), 2)
+
+    def test_constraints_enforced_after_migration(self):
+        import sqlite3
+        self._build_v0_db([(self._VOUCHER,
+                            ("B001", "2026-01-01", "100.00", "100.00", "beat1", "sm1"))])
+        coll_store.init_db()
+        cases = [
+            ("INSERT INTO users (name, role) VALUES (?, ?)", ("x", "hacker")),
+            ("INSERT INTO users (name, role) VALUES (?, ?)", ("", "salesman")),
+            (self._INSTALLMENT, ("B999", "2026-01-01", "10.00", "sm1")),  # orphan FK
+            (self._INSTALLMENT, ("B001", "2026-01-01", "nan", "sm1")),
+            (self._INSTALLMENT, ("B001", "2026-01-01", "-5", "sm1")),
+            (self._VOUCHER, (None, "2026-01-01", "1", "1", "b", "s")),
+            (self._VOUCHER, ("B002", "2026-01-01", "Infinity", "1", "b", "s")),
+            (self._VOUCHER, ("B003", "", "1", "1", "b", "s")),
+        ]
+        for sql, params in cases:
+            with self.assertRaises(sqlite3.IntegrityError, msg=params):
+                self._exec(sql, params)
+
+    def test_dirty_legacy_data_blocks_migration(self):
+        self._build_v0_db([
+            ("INSERT INTO users (name, role) VALUES (?, ?)", ("x", "hacker")),
+        ])
+        with self.assertRaises(coll_store.MigrationError) as ctx:
+            coll_store.init_db()
+        self.assertIn("users[x]", str(ctx.exception))
+        self.assertEqual(self._user_version(), 0)
+        # DB untouched — the bad row is still there for repair.
+        self.assertEqual(self._query("SELECT role FROM users")[0]["role"], "hacker")
+
+    def test_non_numeric_money_blocks_migration(self):
+        self._build_v0_db([(self._VOUCHER,
+                            ("B001", "2026-01-01", "100.00", "nan", "beat1", "sm1"))])
+        with self.assertRaises(coll_store.MigrationError) as ctx:
+            coll_store.init_db()
+        self.assertIn("non-numeric balance", str(ctx.exception))
+
+    def test_orphan_from_interrupted_archive_auto_repaired(self):
+        # Voucher already archived, but its installment was left behind —
+        # debris from a historically interrupted post. Moved, not fatal.
+        self._build_v0_db([
+            ("INSERT INTO completed_vouchers (bill_no, date, amount, balance, beat, salesman)"
+             " VALUES (?, ?, ?, ?, ?, ?)",
+             ("B001", "2026-01-01", "100.00", "0.00", "beat1", "sm1")),
+            (self._INSTALLMENT, ("B001", "2026-01-02", "100.00", "sm1")),
+        ])
+        coll_store.init_db()
+        self.assertEqual(self._user_version(), 1)
+        self.assertEqual(self._query("SELECT * FROM installments"), [])
+        moved = self._query("SELECT bill_no, amount FROM completed_installments")
+        self.assertEqual(moved, [{"bill_no": "B001", "amount": "100.00"}])
+
+    def test_true_orphan_installment_blocks_migration(self):
+        self._build_v0_db([(self._INSTALLMENT, ("B404", "2026-01-01", "10.00", "sm1"))])
+        with self.assertRaises(coll_store.MigrationError) as ctx:
+            coll_store.init_db()
+        self.assertIn("no matching voucher", str(ctx.exception))
+
+    def test_fresh_db_stamped_v1_and_idempotent(self):
+        coll_store.init_db()
+        self.assertEqual(self._user_version(), 1)
+        coll_store.init_db()  # second run is a no-op, not an error
+        self.assertEqual(self._user_version(), 1)
 
 
 if __name__ == "__main__":

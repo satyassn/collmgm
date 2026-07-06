@@ -8,7 +8,7 @@ ACTION_REGISTRY maps action keys to display labels and workflow handlers.
 
 import sys
 
-from coll_store import load_permissions, ensure_db
+from coll_store import load_permissions, ensure_db, MigrationError
 from coll_cli import display_main_menu, get_menu_choice, build_role_menu, InputCancelled
 from coll_workflow import (
     run_login,
@@ -37,7 +37,11 @@ ACTION_REGISTRY = [
 
 
 def main():
-    ensure_db()
+    try:
+        ensure_db()
+    except MigrationError as error:
+        print(f"\nDatabase migration failed:\n{error}\n")
+        sys.exit(1)
     while True:
         try:
             current_user = run_login()

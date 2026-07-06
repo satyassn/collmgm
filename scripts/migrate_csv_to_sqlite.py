@@ -21,7 +21,11 @@ def main():
     print(f"Database: {db}")
 
     existed = db.exists()
-    coll_store.init_db()
+    try:
+        coll_store.init_db()
+    except coll_store.MigrationError as error:
+        print(f"\nDatabase migration failed:\n{error}\n")
+        sys.exit(1)
     if not existed:
         print("Created new database.")
 
