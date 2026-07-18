@@ -4,11 +4,13 @@
 <h2 class="page-heading">Approve Collection List</h2>
 <p class="meta-line"><strong>Beat:</strong> {{ beat }} &nbsp;|&nbsp; <strong>Salesman:</strong> {{ salesman }} &nbsp;|&nbsp; <strong>Date:</strong> {{ data.get("date","") }}</p>
 
-<table class="data-table">
+<table class="data-table stack-table">
   <thead>
     <tr>
       <th>Bill No</th>
       <th>Voucher Date</th>
+      <th class="num">Amount</th>
+      <th class="num">Total Paid</th>
       <th class="num">Balance</th>
     </tr>
   </thead>
@@ -17,19 +19,21 @@
     <tr>
       <td class="mono"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
       <td>{{ v.get("voucher_date","") }}</td>
-      <td class="num mono">{{ v.balance }}</td>
+      <td class="num mono" data-label="Amt">{{ v.get("amount","") }}</td>
+      <td class="num mono" data-label="Total">{{ v.get("total_paid","") }}</td>
+      <td class="num mono" data-label="Bal">{{ v.balance }}</td>
     </tr>
     {% endfor %}
   </tbody>
   <tfoot>
     <tr>
-      <td colspan="2"><strong>Total ({{ vouchers|length }} vouchers)</strong></td>
+      <td colspan="4"><strong>Total ({{ vouchers|length }} vouchers)</strong></td>
       <td class="num mono"><strong>{{ total_balance }}</strong></td>
     </tr>
   </tfoot>
 </table>
 
-<form method="post" action="/coll/approve-start/{{ stem }}" class="action-row">
+<form method="post" action="/coll/approve-start/{{ stem }}" class="action-row action-row--sticky">
   <button type="submit" name="action" value="approve" class="btn btn-primary">Approve</button>
   <button type="submit" name="action" value="return" class="btn btn-warning"
           onclick="return confirm('Return this list? Salesman must regenerate.')">Return</button>

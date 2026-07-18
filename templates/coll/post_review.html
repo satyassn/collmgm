@@ -9,11 +9,13 @@
   <span class="summary-total">Total: <strong>{{ total_collected }}</strong></span>
 </div>
 
-<table class="data-table">
+<table class="data-table stack-table">
   <thead>
     <tr>
       <th>Bill No</th>
       <th>Voucher Date</th>
+      <th class="num">Amount</th>
+      <th class="num">Total Paid</th>
       <th class="num">Balance</th>
       <th class="num">Payment</th>
     </tr>
@@ -23,20 +25,22 @@
     <tr{% if v.get("payment") %} class="has-payment"{% endif %}>
       <td class="mono"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
       <td>{{ v.get("voucher_date","") }}</td>
-      <td class="num mono">{{ v.balance }}</td>
-      <td class="num mono{% if not v.get('payment') %} muted{% endif %}">{{ v.get("payment","") or "—" }}</td>
+      <td class="num mono" data-label="Amt">{{ v.get("amount","") }}</td>
+      <td class="num mono" data-label="Total">{{ v.get("total_paid","") }}</td>
+      <td class="num mono" data-label="Bal">{{ v.balance }}</td>
+      <td class="num mono{% if not v.get('payment') %} muted{% endif %}" data-label="Paid">{{ v.get("payment","") or "—" }}</td>
     </tr>
     {% endfor %}
   </tbody>
   <tfoot>
     <tr>
-      <td colspan="3"><strong>Total collected</strong></td>
+      <td colspan="5"><strong>Total collected</strong></td>
       <td class="num mono"><strong>{{ total_collected }}</strong></td>
     </tr>
   </tfoot>
 </table>
 
-<form method="post" action="/coll/post/{{ stem }}" class="action-row">
+<form method="post" action="/coll/post/{{ stem }}" class="action-row action-row--sticky">
   <button type="submit" name="action" value="post" class="btn btn-primary"
           onclick="return confirm('Post these collections to master data? This cannot be undone.')">Post</button>
   <button type="submit" name="action" value="return" class="btn btn-warning"

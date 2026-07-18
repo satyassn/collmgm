@@ -3,7 +3,6 @@
 {% block content %}
 <h2 class="page-heading">Submit Collections</h2>
 <p class="meta-line"><strong>Beat:</strong> {{ beat }} &nbsp;|&nbsp; <strong>Salesman:</strong> {{ salesman }}</p>
-<p class="hint">Enter collected amounts below. Leave blank for no payment. Submit when done.</p>
 
 {% if error %}
   <p class="alert alert-error">{{ error }}</p>
@@ -16,11 +15,13 @@
 
 <form method="post" action="/coll/submit/{{ stem }}">
   <div class="table-wrapper">
-    <table class="data-table payment-table">
+    <table class="data-table payment-table stack-table">
       <thead>
         <tr>
           <th>Bill No</th>
           <th>Voucher Date</th>
+          <th class="num">Amount</th>
+          <th class="num">Total Paid</th>
           <th class="num">Balance</th>
           <th class="num">Payment</th>
         </tr>
@@ -30,7 +31,9 @@
         <tr>
           <td class="mono"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
           <td>{{ v.get("voucher_date","") }}</td>
-          <td class="num mono">{{ v.balance }}</td>
+          <td class="num mono" data-label="Amt">{{ v.get("amount","") }}</td>
+          <td class="num mono" data-label="Total">{{ v.get("total_paid","") }}</td>
+          <td class="num mono" data-label="Bal">{{ v.balance }}</td>
           <td class="pay-cell">
             <input type="number" name="pay_{{ v.bill_no }}" id="pay-{{ loop.index }}"
                    value="{{ v.get('payment','') }}"
@@ -48,7 +51,7 @@
     </table>
   </div>
 
-  <div class="action-row">
+  <div class="action-row action-row--sticky">
     <button type="submit" name="action" value="save" class="btn btn-secondary">Save</button>
     <button type="submit" name="action" value="submit" class="btn btn-primary"
             onclick="return confirm('Submit all payments for supervisor review?')">Submit for Review</button>
@@ -111,18 +114,38 @@
     }
     var val = Number(raw);
     var bal = parseFloat(input.dataset.balance);
-    if (!isFinite(val)) setError(input, "not a number");
+    if (!isFinite(val) || /e/i.test(raw)) setError(input, "not a number");
     else if (val < 0) setError(input, "cannot be negative");
+    else if (/^0\d/.test(raw)) setError(input, "no leading zeros");
     else if (isFinite(bal) && val > bal) setError(input, "exceeds balance (" + input.dataset.balance + ")");
     else clearError(input);
   }
 
   inputs.forEach(function (input) {
     input.addEventListener("input", function () {
+      // Cap at 2 decimal places by trimming, not erroring: a third decimal
+      // digit (typed or pasted) is dropped on the spot. Caret APIs are
+      // unavailable on type=number, so trim the value itself.
+      var extra = input.value.match(/^(-?\d*\.\d\d)\d+$/);
+      if (extra) input.value = extra[1];
       liveValidate(input);
       recalc();
     });
     input.addEventListener("keydown", function (e) {
+      // type=number accepts these as float syntax; payments never need them.
+      if (e.key === "e" || e.key === "E" || e.key === "+" || e.key === "-") {
+        e.preventDefault();
+        return;
+      }
+      if (e.key === "Enter") {
+        // Advance to the next payment instead of the implicit form submit
+        // (which would trigger Save); blur on the last one.
+        e.preventDefault();
+        var nextInput = inputs[inputs.indexOf(input) + 1];
+        if (nextInput) nextInput.focus();
+        else input.blur();
+        return;
+      }
       if (e.key !== "Tab") return;
       if (!input.classList.contains("field-invalid")) return;
       // Jump to the next invalid field in the Tab direction, but never

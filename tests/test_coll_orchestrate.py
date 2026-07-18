@@ -791,12 +791,28 @@ class TestValidatePayment(unittest.TestCase):
         self.assertEqual(coll_orchestrate.validate_payment("10", "50.00"), ("10.00", None))
         self.assertEqual(coll_orchestrate.validate_payment(" 10.5 ", "50.00"), ("10.50", None))
         self.assertEqual(coll_orchestrate.validate_payment("50.00", "50.00"), ("50.00", None))
+        self.assertEqual(coll_orchestrate.validate_payment("0", "50.00"), ("0.00", None))
+        self.assertEqual(coll_orchestrate.validate_payment("0.50", "50.00"), ("0.50", None))
+        self.assertEqual(coll_orchestrate.validate_payment(".5", "50.00"), ("0.50", None))
 
     def test_rejects_non_numbers(self):
-        for bad in ("abc", "10x", "NaN", "Infinity", "-Infinity"):
+        for bad in ("abc", "10x", "NaN", "Infinity", "-Infinity", "1e3", "1E3", "+5", ".", "1.2.3"):
             normalized, reason = coll_orchestrate.validate_payment(bad, "50.00")
             self.assertIsNone(normalized, bad)
             self.assertEqual(reason, "not a number")
+
+    def test_rejects_more_than_two_decimal_places(self):
+        # Rejected outright — never silently rounded (1.239 used to become 1.24).
+        for bad in ("1.239", "0.001", "10.123"):
+            normalized, reason = coll_orchestrate.validate_payment(bad, "50.00")
+            self.assertIsNone(normalized, bad)
+            self.assertEqual(reason, "max 2 decimal places")
+
+    def test_rejects_leading_zeros(self):
+        for bad in ("007", "01.5", "00"):
+            normalized, reason = coll_orchestrate.validate_payment(bad, "50.00")
+            self.assertIsNone(normalized, bad)
+            self.assertEqual(reason, "no leading zeros")
 
     def test_rejects_negative(self):
         normalized, reason = coll_orchestrate.validate_payment("-5", "50.00")

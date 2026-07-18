@@ -4,11 +4,13 @@
 <h2 class="page-heading">Collection List Preview</h2>
 <p class="meta-line"><strong>Beat:</strong> {{ beat }} &nbsp;|&nbsp; <strong>Salesman:</strong> {{ salesman }}</p>
 
-<table class="data-table">
+<table class="data-table stack-table">
   <thead>
     <tr>
       <th>Bill No</th>
       <th>Voucher Date</th>
+      <th class="num">Amount</th>
+      <th class="num">Total Paid</th>
       <th class="num">Balance</th>
     </tr>
   </thead>
@@ -17,21 +19,21 @@
     <tr>
       <td class="mono"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
       <td>{{ v.voucher_date }}</td>
-      <td class="num mono">{{ v.balance }}</td>
+      <td class="num mono" data-label="Amt">{{ v.amount }}</td>
+      <td class="num mono" data-label="Total">{{ v.total_paid }}</td>
+      <td class="num mono" data-label="Bal">{{ v.balance }}</td>
     </tr>
     {% endfor %}
   </tbody>
   <tfoot>
     <tr>
-      <td colspan="2"><strong>Total ({{ vouchers|length }} vouchers)</strong></td>
+      <td colspan="4"><strong>Total ({{ vouchers|length }} vouchers)</strong></td>
       <td class="num mono"><strong>{{ total_balance }}</strong></td>
     </tr>
   </tfoot>
 </table>
 
-<p class="hint">Keep this list to send for supervisor approval, or cancel to discard it.</p>
-
-<form method="post" action="/coll/start/confirm">
+<form method="post" action="/coll/start/confirm" class="action-row action-row--sticky">
   <input type="hidden" name="report_stem" value="{{ report_stem }}">
   <button type="submit" name="action" value="keep" class="btn btn-primary">Keep</button>
   <button type="submit" name="action" value="cancel" class="btn btn-danger"

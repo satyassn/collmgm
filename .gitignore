@@ -89,3 +89,6 @@ docs/_build/
 
 # Windows
 Thumbs.db
+
+# Planning docs live in Claude session memory, not the repo
+*-plan.md
