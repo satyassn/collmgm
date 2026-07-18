@@ -21,7 +21,7 @@
   <tbody>
     {% for v in vouchers %}
     <tr{% if v.get("payment") %} class="has-payment"{% endif %}>
-      <td class="mono">{{ v.bill_no }}</td>
+      <td class="mono"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
       <td>{{ v.get("voucher_date","") }}</td>
       <td class="num mono">{{ v.balance }}</td>
       <td class="num mono{% if not v.get('payment') %} muted{% endif %}">{{ v.get("payment","") or "—" }}</td>

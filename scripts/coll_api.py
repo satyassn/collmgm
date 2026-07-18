@@ -32,6 +32,7 @@ from coll_store import (
     _load_pending_start_reports,
     _load_pending_submit_reports,
     bill_no_sort_key,
+    build_print_collection_html,
     cancel_staging_report,
     ensure_db,
     load_permissions,
@@ -484,12 +485,13 @@ async def coll_submit_save(request: Request, stem: str):
     salesman = sel[1] if len(sel) > 1 else ""
 
     vouchers = sorted(data.get("vouchers", []), key=lambda v: bill_no_sort_key(v["bill_no"]))
-    invalid = []
+    invalid = 0
     for v in vouchers:
         raw = (form.get(f"pay_{v['bill_no']}") or "").strip()
         normalized, reason = validate_payment(raw, v.get("balance"))
         if reason:
-            invalid.append(f"{v['bill_no']}: {reason}")
+            invalid += 1
+            v["error"] = reason  # template renders an inline bubble on this row
             v["payment"] = raw  # keep what was typed so the form re-renders with it
         else:
             v["payment"] = normalized
@@ -500,7 +502,7 @@ async def coll_submit_save(request: Request, stem: str):
                      stem=stem, data=data, vouchers=vouchers,
                      beat=beat, salesman=salesman,
                      total_collected=total_collected, paid_count=paid_count,
-                     error="Nothing saved — fix these payments: " + "; ".join(invalid))
+                     error=f"Nothing saved — {invalid} payment(s) need correction")
 
     prior_installments, _ = _load_installments(json_path)
     compute_payment_dates(vouchers, prior_installments)
@@ -517,6 +519,51 @@ async def coll_submit_save(request: Request, stem: str):
 
     return _tmpl("message.html", request, user=user,
                  message="Progress saved.", back=f"/coll/submit/{stem}")
+
+
+# ---------------------------------------------------------------------------
+# Print Collection List  (coll_print)
+# ---------------------------------------------------------------------------
+
+def _print_candidates():
+    return [{"stem": p.stem, "label": _report_label(d), "data": d}
+            for p, d in _load_confirmed_start_reports()]
+
+
+@app.get("/coll/print", response_class=HTMLResponse)
+def coll_print(request: Request):
+    user, err = _require(request, "coll_print")
+    if err:
+        return err
+    return _tmpl("coll/print.html", request, user=user, reports=_print_candidates())
+
+
+@app.post("/coll/print", response_class=HTMLResponse)
+async def coll_print_generate(request: Request):
+    user, err = _require(request, "coll_print")
+    if err:
+        return err
+    form = await request.form()
+    stems = form.getlist("stems")
+
+    def _retry(message):
+        return _tmpl("coll/print.html", request, user=user,
+                     reports=_print_candidates(), error=message)
+
+    if not stems:
+        return _retry("Select at least one collection list.")
+    if len(stems) > 3:
+        return _retry("Select at most 3 collection lists.")
+    # Only lists the selection page offers may be printed — a crafted POST
+    # must not reach reports in other stages.
+    candidates = {p.stem: d for p, d in _load_confirmed_start_reports()}
+    chosen = []
+    for stem in stems:
+        data = candidates.get(stem)
+        if data is None:
+            return _retry("Report not found.")
+        chosen.append(data)
+    return HTMLResponse(build_print_collection_html(chosen, auto_print=True))
 
 
 # ---------------------------------------------------------------------------
@@ -640,6 +687,30 @@ def coll_post_action(request: Request, stem: str, action: str = Form(default="")
     return _tmpl("message.html", request, user=user,
                  message=f"Posted. {outcome.paid_count} vouchers collected. Total: {outcome.total_collected}",
                  back="/menu")
+
+
+# ---------------------------------------------------------------------------
+# Voucher detail
+# ---------------------------------------------------------------------------
+
+@app.get("/voucher/{bill_no}", response_class=HTMLResponse)
+def voucher_detail(request: Request, bill_no: str, fragment: int = 0):
+    # No permission key: any logged-in user may look up a voucher, same as
+    # the Voucher Search report this view reuses.
+    user, err = _require(request)
+    if err:
+        return err
+    result = search_voucher(bill_no)
+    if result is None:
+        if fragment:
+            return HTMLResponse('<p class="alert alert-error">Voucher not found.</p>',
+                                status_code=404)
+        return _tmpl("error.html", request, user=user,
+                     message=f"No voucher found for: {bill_no.strip()}")
+    voucher, installments, is_completed = result
+    template = "_voucher_card.html" if fragment else "voucher.html"
+    return _tmpl(template, request, user=user,
+                 voucher=voucher, installments=installments, is_completed=is_completed)
 
 
 # ---------------------------------------------------------------------------

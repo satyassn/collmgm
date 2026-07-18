@@ -135,8 +135,10 @@ class ApiTestCase(unittest.TestCase):
         try:
             with real_csv.open(newline="", encoding="utf-8") as f:
                 for row in csv.DictReader(f):
+                    # OR IGNORE: init_db's coll_print backfill pre-inserts two
+                    # of these rows, and (role, action_key) is the primary key.
                     conn.execute(
-                        "INSERT INTO permissions (role, action_key) VALUES (?, ?)",
+                        "INSERT OR IGNORE INTO permissions (role, action_key) VALUES (?, ?)",
                         (row["role"], row["action_key"]),
                     )
             conn.commit()
@@ -734,6 +736,11 @@ class TestSubmitPaymentValidation(ApiTestCase):
         self.assertEqual(status, 200)
         self.assertIn("Nothing saved", body)
         self.assertIn("not a number", body)
+        # Errors are inline per-field bubbles now, not a joined top-of-page list.
+        self.assertNotIn("fix these payments", body)
+        self.assertIn("payment(s) need correction", body)
+        self.assertIn('aria-invalid="true"', body)
+        self.assertIn('value="abc"', body)  # typed value retained for correction
         self.assertFalse(self.sidecar.exists())
 
     def test_negative_payment_rejected(self):
@@ -746,11 +753,225 @@ class TestSubmitPaymentValidation(ApiTestCase):
         self.assertIn("exceeds balance", body)
         self.assertFalse(self.sidecar.exists())
 
+    def test_two_invalid_payments_flag_both_rows(self):
+        stem = "coll20260102-beat_salesman-beatB_smA"
+        path = self._write_staging_report(
+            stem, "beatB", "smA", start="confirmed", submit="",
+            vouchers=[{"bill_no": "901", "date": "2026-01-01", "balance": "50.00",
+                       "payment": "", "payment_date": "", "beat": "beatB", "salesman": "smA"},
+                      {"bill_no": "902", "date": "2026-01-01", "balance": "30.00",
+                       "payment": "", "payment_date": "", "beat": "beatB", "salesman": "smA"}],
+        )
+        status, body = self._post(self.opener, f"/coll/submit/{stem}",
+                                  {"action": "save", "pay_901": "60", "pay_902": "-1"})
+        self.assertEqual(status, 200)
+        self.assertIn("2 payment(s) need correction", body)
+        self.assertIn("exceeds balance", body)
+        self.assertIn("cannot be negative", body)
+        self.assertEqual(body.count('aria-invalid="true"'), 2)
+        sidecar = path.parent / f"{path.stem}-installments.json"
+        self.assertFalse(sidecar.exists())
+
+    def test_mixed_valid_and_invalid_saves_nothing(self):
+        stem = "coll20260103-beat_salesman-beatC_smA"
+        path = self._write_staging_report(
+            stem, "beatC", "smA", start="confirmed", submit="",
+            vouchers=[{"bill_no": "903", "date": "2026-01-01", "balance": "50.00",
+                       "payment": "", "payment_date": "", "beat": "beatC", "salesman": "smA"},
+                      {"bill_no": "904", "date": "2026-01-01", "balance": "30.00",
+                       "payment": "", "payment_date": "", "beat": "beatC", "salesman": "smA"}],
+        )
+        status, body = self._post(self.opener, f"/coll/submit/{stem}",
+                                  {"action": "save", "pay_903": "20", "pay_904": "40"})
+        self.assertEqual(status, 200)
+        self.assertIn("1 payment(s) need correction", body)
+        # Only the invalid row is flagged; the valid row keeps its (normalized) value.
+        self.assertEqual(body.count('aria-invalid="true"'), 1)
+        self.assertIn('value="20.00"', body)
+        sidecar = path.parent / f"{path.stem}-installments.json"
+        self.assertFalse(sidecar.exists())
+
     def test_valid_payment_saved_quantized(self):
         status, body = self._save("20")
         self.assertIn("Progress saved.", body)
         saved = json.loads(self.sidecar.read_text(encoding="utf-8"))
         self.assertEqual(saved["900"]["payment"], "20.00")
+
+
+# ---------------------------------------------------------------------------
+# Print Collection List — /coll/print (coll_print permission)
+# ---------------------------------------------------------------------------
+
+class TestCollPrint(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self._add_user("sup", "supervisor", "pwS")
+        self._add_user("dist", "distributor", "pwD")
+        self._add_user("smA", "salesman", "pwA")
+        self.stems = []
+        for i, beat in enumerate(("beatA", "beatB", "beatC", "beatD"), start=1):
+            stem = f"coll2026010{i}-beat_salesman-{beat}_smA"
+            self._write_staging_report(stem, beat, "smA", start="confirmed", submit="")
+            self.stems.append(stem)
+        # Already submitted — must not be offered for printing.
+        self._write_staging_report("coll20260109-beat_salesman-beatX_smA",
+                                   "beatX", "smA", start="confirmed", submit="submitted")
+
+    def _post_stems(self, opener, stems):
+        return self._post(opener, "/coll/print", [("stems", s) for s in stems])
+
+    def test_menu_card_shown_to_supervisor_and_distributor_only(self):
+        for name, pw in (("sup", "pwS"), ("dist", "pwD")):
+            status, body = self._get(self._login(name, pw), "/menu")
+            self.assertIn("Print Collection List", body)
+        status, body = self._get(self._login("smA", "pwA"), "/menu")
+        self.assertNotIn("Print Collection List", body)
+
+    def test_salesman_denied(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._get(opener, "/coll/print")
+        self.assertIn("have permission for this action", body)
+        status, body = self._post_stems(opener, [self.stems[0]])
+        self.assertIn("have permission for this action", body)
+
+    def test_get_lists_confirmed_reports_only(self):
+        opener = self._login("sup", "pwS")
+        status, body = self._get(opener, "/coll/print")
+        self.assertEqual(status, 200)
+        for beat in ("beatA", "beatB", "beatC", "beatD"):
+            self.assertIn(f"{beat} / smA", body)
+        self.assertNotIn("beatX / smA", body)
+
+    def test_get_empty_state(self):
+        for p in (self.tmp / "staging").glob("coll*.json"):
+            p.unlink()
+        opener = self._login("dist", "pwD")
+        status, body = self._get(opener, "/coll/print")
+        self.assertIn("No approved collection lists to print.", body)
+
+    def test_post_zero_selections_rejected(self):
+        opener = self._login("sup", "pwS")
+        status, body = self._post_stems(opener, [])
+        self.assertIn("Select at least one collection list.", body)
+
+    def test_post_more_than_three_rejected(self):
+        opener = self._login("sup", "pwS")
+        status, body = self._post_stems(opener, self.stems)  # 4 stems
+        self.assertIn("Select at most 3 collection lists.", body)
+        self.assertNotIn("COLLECTION LIST", body)
+
+    def test_post_unknown_stem_rejected(self):
+        opener = self._login("sup", "pwS")
+        status, body = self._post_stems(opener, ["..%5c..%5csecrets"])
+        self.assertIn("Report not found.", body)
+
+    def test_post_submitted_stage_stem_rejected(self):
+        # A crafted POST must not print reports the selection page doesn't offer.
+        opener = self._login("sup", "pwS")
+        status, body = self._post_stems(opener, ["coll20260109-beat_salesman-beatX_smA"])
+        self.assertIn("Report not found.", body)
+        self.assertNotIn("COLLECTION LIST", body)
+
+    def test_post_up_to_three_returns_printable_document(self):
+        opener = self._login("dist", "pwD")
+        status, body = self._post_stems(opener, self.stems[:3])
+        self.assertEqual(status, 200)
+        self.assertIn("COLLECTION LIST", body)
+        for beat in ("beatA", "beatB", "beatC"):
+            self.assertIn(f"{beat} / smA", body)
+        self.assertIn("window.print()", body)
+
+    def test_post_single_selection_ok(self):
+        opener = self._login("sup", "pwS")
+        status, body = self._post_stems(opener, [self.stems[0]])
+        self.assertIn("COLLECTION LIST", body)
+        self.assertIn("beatA / smA", body)
+
+
+# ---------------------------------------------------------------------------
+# GET /voucher/{bill_no} — inline detail view behind the voucher hyperlinks
+# ---------------------------------------------------------------------------
+
+class TestVoucherDetail(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self._add_user("smA", "salesman", "pwA")
+        self._add_beat("beatA", "smA")
+        self._add_voucher("100", "beatA", "smA", balance="60.00")
+        self._add_installment("100", "2026-02-01", "40.00", "smA")
+
+    def _add_installment(self, bill_no, date, amount, salesman, completed=False):
+        table = "completed_installments" if completed else "installments"
+        conn = coll_store.get_db()
+        try:
+            conn.execute(
+                f"INSERT INTO {table} (bill_no, date, amount, salesman, created_by, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (bill_no, date, amount, salesman, "test", "2026-02-01T00:00:00"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _add_completed_voucher(self, bill_no, beat, salesman, amount="80.00"):
+        conn = coll_store.get_db()
+        try:
+            conn.execute(
+                "INSERT INTO completed_vouchers "
+                "(bill_no, date, amount, balance, beat, salesman, created_by, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (bill_no, "2026-01-01", amount, "0.00", beat, salesman,
+                 "test", "2026-01-01T00:00:00"),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_full_page_shows_voucher_and_installments(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._get(opener, "/voucher/100")
+        self.assertEqual(status, 200)
+        self.assertIn("Voucher Details", body)
+        self.assertIn("2026-01-01", body)   # voucher date
+        self.assertIn("60.00", body)        # amount/balance
+        self.assertIn("2026-02-01", body)   # installment date
+        self.assertIn("40.00", body)        # installment amount
+
+    def test_fragment_returns_card_only(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._get(opener, "/voucher/100?fragment=1")
+        self.assertEqual(status, 200)
+        self.assertIn("voucher-card", body)
+        self.assertIn("40.00", body)
+        self.assertNotIn("<header", body)   # no base.html chrome
+
+    def test_completed_voucher_shows_badge_and_archived_installments(self):
+        self._add_completed_voucher("200", "beatA", "smA")
+        self._add_installment("200", "2026-03-01", "80.00", "smA", completed=True)
+        opener = self._login("smA", "pwA")
+        status, body = self._get(opener, "/voucher/200")
+        self.assertEqual(status, 200)
+        self.assertIn("Completed", body)
+        self.assertIn("80.00", body)
+
+    def test_unknown_bill_full_page(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._get(opener, "/voucher/999")
+        self.assertEqual(status, 200)
+        self.assertIn("No voucher found for: 999", body)
+
+    def test_unknown_bill_fragment_is_404_with_message(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._get(opener, "/voucher/999?fragment=1")
+        self.assertEqual(status, 404)
+        self.assertIn("Voucher not found.", body)
+
+    def test_unauthenticated_redirects_to_login(self):
+        opener = self._client()  # no session cookie
+        status, body = self._get(opener, "/voucher/100")
+        self.assertEqual(status, 200)   # opener follows the 303 to /login
+        self.assertIn('name="password"', body)
+        self.assertNotIn("voucher-card", body)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Voucher {{ voucher.bill_no }} — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Voucher Details</h2>
+
+{% include "_voucher_card.html" %}
+
+<a class="btn btn-secondary" href="/menu">Back to Menu</a>
+{% endblock %}

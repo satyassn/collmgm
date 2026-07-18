@@ -28,15 +28,19 @@
       <tbody>
         {% for v in vouchers %}
         <tr>
-          <td class="mono">{{ v.bill_no }}</td>
+          <td class="mono"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
           <td>{{ v.get("voucher_date","") }}</td>
           <td class="num mono">{{ v.balance }}</td>
           <td class="pay-cell">
-            <input type="number" name="pay_{{ v.bill_no }}"
+            <input type="number" name="pay_{{ v.bill_no }}" id="pay-{{ loop.index }}"
                    value="{{ v.get('payment','') }}"
                    min="0" step="0.01"
                    inputmode="decimal"
-                   class="pay-input">
+                   class="pay-input{% if v.error %} field-invalid{% endif %}"
+                   data-balance="{{ v.balance }}"
+                   {% if v.error %}aria-invalid="true" aria-describedby="pay-err-{{ loop.index }}"{% endif %}>
+            <span class="field-error-bubble" id="pay-err-{{ loop.index }}" role="alert"
+                  {% if not v.error %}hidden{% endif %}>{{ v.error or "" }}</span>
           </td>
         </tr>
         {% endfor %}
@@ -71,9 +75,66 @@
     totalEl.textContent = total.toFixed(2);
   }
 
+  function bubbleFor(input) {
+    return input.parentElement.querySelector(".field-error-bubble");
+  }
+
+  function setError(input, msg) {
+    var bubble = bubbleFor(input);
+    input.classList.add("field-invalid");
+    input.setAttribute("aria-invalid", "true");
+    if (bubble) {
+      input.setAttribute("aria-describedby", bubble.id);
+      bubble.textContent = msg;
+      bubble.hidden = false;
+    }
+  }
+
+  function clearError(input) {
+    var bubble = bubbleFor(input);
+    input.classList.remove("field-invalid");
+    input.removeAttribute("aria-invalid");
+    input.removeAttribute("aria-describedby");
+    if (bubble) {
+      bubble.textContent = "";
+      bubble.hidden = true;
+    }
+  }
+
+  function liveValidate(input) {
+    var raw = input.value.trim();
+    if (raw === "") {
+      // A type=number field with non-numeric text reports value "" but badInput true.
+      if (input.validity && input.validity.badInput) setError(input, "not a number");
+      else clearError(input);
+      return;
+    }
+    var val = Number(raw);
+    var bal = parseFloat(input.dataset.balance);
+    if (!isFinite(val)) setError(input, "not a number");
+    else if (val < 0) setError(input, "cannot be negative");
+    else if (isFinite(bal) && val > bal) setError(input, "exceeds balance (" + input.dataset.balance + ")");
+    else clearError(input);
+  }
+
   inputs.forEach(function (input) {
-    input.addEventListener("input", recalc);
+    input.addEventListener("input", function () {
+      liveValidate(input);
+      recalc();
+    });
+    input.addEventListener("keydown", function (e) {
+      if (e.key !== "Tab") return;
+      if (!input.classList.contains("field-invalid")) return;
+      var bad = inputs.filter(function (i) { return i.classList.contains("field-invalid"); });
+      var idx = bad.indexOf(input);
+      var next = bad[(idx + (e.shiftKey ? -1 : 1) + bad.length) % bad.length];
+      e.preventDefault();
+      next.focus();
+    });
   });
+
+  var first = document.querySelector(".pay-input.field-invalid");
+  if (first) first.focus();
 })();
 </script>
 {% endblock %}

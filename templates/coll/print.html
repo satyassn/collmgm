@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Print Collection List — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Print Collection List</h2>
+
+{% if not reports %}
+  <p class="empty-state">No approved collection lists to print.</p>
+  <a class="btn btn-secondary" href="/menu">Back to Menu</a>
+{% else %}
+  {% if error %}
+  <p class="alert alert-error">{{ error }}</p>
+  {% endif %}
+  <p class="hint">Select up to 3 collection lists.</p>
+  <form method="post" action="/coll/print" target="_blank">
+    <ul class="report-list">
+      {% for r in reports %}
+      <li class="report-item">
+        <label class="print-pick">
+          <input type="checkbox" name="stems" value="{{ r.stem }}">
+          <span class="report-label">{{ r.label }}</span>
+          <span class="report-meta">{{ r.data.get("date", "") }}</span>
+        </label>
+      </li>
+      {% endfor %}
+    </ul>
+    <button type="submit" class="btn btn-primary">Print</button>
+    <a class="btn btn-secondary" href="/menu">Back to Menu</a>
+  </form>
+  <script>
+    // UX guard only — the server re-validates the 3-list cap.
+    (function () {
+      var boxes = document.querySelectorAll('input[name="stems"]');
+      boxes.forEach(function (box) {
+        box.addEventListener("change", function () {
+          var checked = document.querySelectorAll('input[name="stems"]:checked').length;
+          boxes.forEach(function (b) {
+            if (!b.checked) b.disabled = checked >= 3;
+          });
+        });
+      });
+    })();
+  </script>
+{% endif %}
+{% endblock %}

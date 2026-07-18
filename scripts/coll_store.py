@@ -170,6 +170,7 @@ def init_db():
         conn.commit()
         _backfill_beats_salesman(conn)
         _backfill_permissions(conn)
+        _backfill_coll_print_permission(conn)
         conn.commit()
         if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
             _migrate_schema_v1(conn)
@@ -302,6 +303,14 @@ def _backfill_permissions(conn):
     if count:
         return
     _migrate_csv_table(conn, "permissions", DATA_DIR / "permissions.csv", _P_FIELDS)
+
+
+def _backfill_coll_print_permission(conn):
+    """One-time additive grant of coll_print for DBs seeded before the key existed."""
+    conn.executemany(
+        "INSERT OR IGNORE INTO permissions (role, action_key) VALUES (?, ?)",
+        [("supervisor", "coll_print"), ("distributor", "coll_print")],
+    )
 
 
 def ensure_db():
@@ -1138,10 +1147,16 @@ def _build_html_column(report_data):
     )
 
 
-def write_print_collection_html(output_path, reports_data):
-    if not reports_data:
-        return
+def build_print_collection_html(reports_data, auto_print=False):
+    """Return the printable collection-list document as an HTML string.
 
+    auto_print embeds a window.print() call for web delivery; saved files
+    (CLI path) must never fire the print dialog on open.
+    """
+    if not reports_data:
+        return ""
+
+    auto_print_script = "<script>window.print();</script>\n" if auto_print else ""
     date_str = datetime.now().strftime("%Y-%m-%d")
     col_divs = "\n".join(
         f'<div class="col">\n{_build_html_column(r)}\n</div>'
@@ -1223,11 +1238,17 @@ def write_print_collection_html(output_path, reports_data):
 <div class="columns">
 {col_divs}
 </div>
-</body>
+{auto_print_script}</body>
 </html>"""
 
+    return html
+
+
+def write_print_collection_html(output_path, reports_data):
+    if not reports_data:
+        return
     with output_path.open("w", encoding="utf-8") as f:
-        f.write(html)
+        f.write(build_print_collection_html(reports_data))
 
 
 # ---------------------------------------------------------------------------

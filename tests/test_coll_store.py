@@ -783,5 +783,116 @@ class TestSchemaMigrationV1(unittest.TestCase):
         self.assertEqual(self._user_version(), 1)
 
 
+# ---------------------------------------------------------------------------
+# build_print_collection_html / write_print_collection_html
+# ---------------------------------------------------------------------------
+
+class TestBuildPrintCollectionHtml(unittest.TestCase):
+    def _report(self, beat="beat1", salesman="sm1", bills=("101",)):
+        return {
+            "selection_type": "beat_salesman",
+            "selection": [beat, salesman],
+            "date": "2026-01-01",
+            "stages": {"start": "confirmed", "submit": "", "post": ""},
+            "vouchers": [
+                {"bill_no": b, "date": "2026-01-01", "balance": "50.00",
+                 "payment": "", "payment_date": "", "beat": beat, "salesman": salesman}
+                for b in bills
+            ],
+        }
+
+    def test_contains_header_and_each_report_heading(self):
+        html = coll_store.build_print_collection_html(
+            [self._report("beat1", "sm1"), self._report("beat2", "sm2")])
+        self.assertIn("COLLECTION LIST", html)
+        self.assertIn("beat1 / sm1", html)
+        self.assertIn("beat2 / sm2", html)
+
+    def test_auto_print_flag_controls_script(self):
+        reports = [self._report()]
+        self.assertIn("window.print()",
+                      coll_store.build_print_collection_html(reports, auto_print=True))
+        self.assertNotIn("window.print()",
+                         coll_store.build_print_collection_html(reports))
+
+    def test_empty_reports_return_empty_string(self):
+        self.assertEqual(coll_store.build_print_collection_html([]), "")
+
+    def test_write_variant_writes_doc_without_auto_print(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "print_test.html"
+            coll_store.write_print_collection_html(out, [self._report()])
+            html = out.read_text(encoding="utf-8")
+            self.assertIn("COLLECTION LIST", html)
+            self.assertNotIn("window.print()", html)
+
+
+# ---------------------------------------------------------------------------
+# coll_print permission backfill in init_db
+# ---------------------------------------------------------------------------
+
+class TestCollPrintPermissionBackfill(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmpdir.name)
+        (self.tmp / "data").mkdir()
+        self._patch = patch.object(coll_store, "DATA_DIR", self.tmp / "data")
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmpdir.cleanup()
+
+    def _perm_rows(self):
+        conn = coll_store.get_db()
+        try:
+            return {(r["role"], r["action_key"])
+                    for r in conn.execute("SELECT role, action_key FROM permissions")}
+        finally:
+            conn.close()
+
+    def _exec(self, sql, params=()):
+        conn = coll_store.get_db()
+        try:
+            with conn:
+                conn.execute(sql, params)
+        finally:
+            conn.close()
+
+    def test_fresh_db_gets_coll_print(self):
+        coll_store.init_db()
+        rows = self._perm_rows()
+        self.assertIn(("supervisor", "coll_print"), rows)
+        self.assertIn(("distributor", "coll_print"), rows)
+        self.assertNotIn(("salesman", "coll_print"), rows)
+
+    def test_existing_seeded_db_gains_coll_print(self):
+        # Simulate an install seeded before the key existed.
+        coll_store.init_db()
+        self._exec("DELETE FROM permissions")
+        self._exec("INSERT INTO permissions (role, action_key) VALUES (?, ?)",
+                   ("salesman", "reports"))
+        coll_store.init_db()
+        rows = self._perm_rows()
+        self.assertIn(("supervisor", "coll_print"), rows)
+        self.assertIn(("distributor", "coll_print"), rows)
+        self.assertIn(("salesman", "reports"), rows)
+
+    def test_csv_seed_not_skipped_on_fresh_db(self):
+        # The coll_print backfill must run after the CSV seed; if it ran first,
+        # the non-empty table would make the seed a no-op on fresh installs.
+        csv_path = self.tmp / "data" / "permissions.csv"
+        csv_path.write_text("role,action_key\nsalesman,reports\nsupervisor,reports\n",
+                            encoding="utf-8")
+        coll_store.init_db()
+        rows = self._perm_rows()
+        self.assertIn(("salesman", "reports"), rows)
+        self.assertIn(("supervisor", "reports"), rows)
+        self.assertIn(("supervisor", "coll_print"), rows)
+        self.assertIn(("distributor", "coll_print"), rows)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,33 @@
+{# Voucher detail card — expects: voucher, installments, is_completed #}
+<div class="card voucher-card">
+  <h3>{{ voucher.bill_no }}
+    {% if is_completed %}<span class="badge badge-success">Completed</span>{% endif %}
+  </h3>
+  <dl class="detail-list">
+    <dt>Date</dt><dd>{{ voucher.date }}</dd>
+    <dt>Amount</dt><dd class="mono">{{ voucher.amount }}</dd>
+    <dt>Balance</dt><dd class="mono">{{ voucher.balance }}</dd>
+    <dt>Beat</dt><dd>{{ voucher.beat }}</dd>
+    <dt>Salesman</dt><dd>{{ voucher.salesman }}</dd>
+  </dl>
+
+  <h4>Installments</h4>
+  {% if installments %}
+  <table class="data-table">
+    <thead>
+      <tr><th>Date</th><th class="num">Amount</th><th>Salesman</th></tr>
+    </thead>
+    <tbody>
+      {% for inst in installments %}
+      <tr>
+        <td>{{ inst.date }}</td>
+        <td class="num mono">{{ inst.amount }}</td>
+        <td>{{ inst.salesman }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No installments collected yet.</p>
+  {% endif %}
+</div>

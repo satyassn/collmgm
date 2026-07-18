@@ -21,6 +21,12 @@
       <span>Submit Collections</span>
     </a>
   {% endif %}
+  {% if "coll_print" in perms %}
+    <a class="menu-card" href="/coll/print">
+      <span class="menu-icon">&#128424;</span>
+      <span>Print Collection List</span>
+    </a>
+  {% endif %}
   {% if "coll_approve_submit" in perms %}
     <a class="menu-card" href="/coll/approve-submit">
       <span class="menu-icon">&#128204;</span>
