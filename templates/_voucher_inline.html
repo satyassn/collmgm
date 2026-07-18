@@ -1,0 +1,14 @@
+{# Slim voucher expand for inline table rows — installment history only.
+   The voucher's amount/total/balance are already on the row card. #}
+<div class="inline-installments">
+  {% if installments %}
+    {% for inst in installments %}
+    <div class="inline-inst-row">
+      <span>{{ inst.date }}</span>
+      <span class="mono">{{ inst.amount }}</span>
+    </div>
+    {% endfor %}
+  {% else %}
+    <p class="muted">No installments collected yet.</p>
+  {% endif %}
+</div>

@@ -938,13 +938,15 @@ class TestVoucherDetail(ApiTestCase):
         self.assertIn("2026-02-01", body)   # installment date
         self.assertIn("40.00", body)        # installment amount
 
-    def test_fragment_returns_card_only(self):
+    def test_fragment_returns_slim_installments(self):
         opener = self._login("smA", "pwA")
         status, body = self._get(opener, "/voucher/100?fragment=1")
         self.assertEqual(status, 200)
-        self.assertIn("voucher-card", body)
-        self.assertIn("40.00", body)
-        self.assertNotIn("<header", body)   # no base.html chrome
+        self.assertIn("inline-installments", body)
+        self.assertIn("2026-02-01", body)       # installment date
+        self.assertIn("40.00", body)            # installment amount
+        self.assertNotIn("voucher-card", body)  # slim partial, not the full card
+        self.assertNotIn("<header", body)       # no base.html chrome
 
     def test_completed_voucher_shows_badge_and_archived_installments(self):
         self._add_completed_voucher("200", "beatA", "smA")

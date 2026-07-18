@@ -14,6 +14,8 @@
     <tr>
       <th>Bill No</th>
       <th>Voucher Date</th>
+      <th class="num">Amount</th>
+      <th class="num">Total Paid</th>
       <th class="num">Balance</th>
       <th class="num">Payment</th>
     </tr>
@@ -21,16 +23,18 @@
   <tbody>
     {% for v in vouchers %}
     <tr{% if v.get("payment") %} class="has-payment"{% endif %}>
-      <td class="mono" data-label="Bill No"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
-      <td data-label="Voucher Date">{{ v.get("voucher_date","") }}</td>
-      <td class="num mono" data-label="Balance">{{ v.balance }}</td>
-      <td class="num mono{% if not v.get('payment') %} muted{% endif %}" data-label="Payment">{{ v.get("payment","") or "—" }}</td>
+      <td class="mono"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
+      <td>{{ v.get("voucher_date","") }}</td>
+      <td class="num mono" data-label="Amt">{{ v.get("amount","") }}</td>
+      <td class="num mono" data-label="Total">{{ v.get("total_paid","") }}</td>
+      <td class="num mono" data-label="Bal">{{ v.balance }}</td>
+      <td class="num mono{% if not v.get('payment') %} muted{% endif %}" data-label="Paid">{{ v.get("payment","") or "—" }}</td>
     </tr>
     {% endfor %}
   </tbody>
   <tfoot>
     <tr>
-      <td colspan="3"><strong>Total collected</strong></td>
+      <td colspan="5"><strong>Total collected</strong></td>
       <td class="num mono"><strong>{{ total_collected }}</strong></td>
     </tr>
   </tfoot>

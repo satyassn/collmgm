@@ -402,6 +402,14 @@ input.pay-input {
   box-shadow: none;
   border: 1px solid var(--gray-200);
 }
+.inline-installments { font-size: 0.85rem; }
+.inline-inst-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 3px 0;
+  border-bottom: 1px solid var(--gray-100);
+}
+.inline-inst-row:last-child { border-bottom: none; }
 
 /* ---- Misc ---- */
 .step-label { font-size: 0.875rem; color: var(--gray-600); margin-bottom: 1rem; }
@@ -441,15 +449,21 @@ input.pay-input {
   .stack-table, .stack-table tbody, .stack-table tfoot,
   .stack-table tr, .stack-table td { display: block; width: 100%; }
   .stack-table { border: none; box-shadow: none; background: transparent; }
-  .stack-table tbody tr {
-    display: flex;
-    flex-wrap: wrap;
+  /* Card = 2-row grid: stats (Amt / Total / Bal) on top, bill/date/payment
+     below. Cell order in the DOM is bill, date, amt, total, bal, [pay]. */
+  .stack-table tbody tr:not(.voucher-detail-row) {
+    display: grid;
+    grid-template-columns: 1fr 1fr auto;
+    grid-template-areas:
+      "amt  total bal"
+      "bill date  pay";
     align-items: center;
+    column-gap: 10px;
     background: #fff;
     border: 1px solid var(--gray-200);
     border-radius: var(--radius);
     box-shadow: var(--shadow);
-    padding: 0.3rem 0.65rem;
+    padding: 0.3rem 0.65rem 0.4rem;
     margin-bottom: 0.4rem;
   }
   .stack-table tbody tr:hover { background: #fff; }
@@ -472,21 +486,41 @@ input.pay-input {
     color: var(--gray-600);
   }
 
-  /* Bill no + date share the card's first line; their values are
-     self-evident, so their labels are dropped. */
-  .stack-table tbody tr:not(.voucher-detail-row) > td:first-child {
-    flex: 1 1 auto;
-    width: auto;
+  .stack-table tbody tr:not(.voucher-detail-row) > td { width: auto; padding: 0; }
+  .stack-table tbody tr:not(.voucher-detail-row) > td:nth-child(1) {
+    grid-area: bill;
     font-weight: 600;
   }
   .stack-table tbody tr:not(.voucher-detail-row) > td:nth-child(2) {
-    flex: 0 0 auto;
-    width: auto;
+    grid-area: date;
     color: var(--gray-600);
     font-size: 0.85rem;
   }
-  .stack-table tbody tr:not(.voucher-detail-row) > td:first-child::before,
-  .stack-table tbody tr:not(.voucher-detail-row) > td:nth-child(2)::before { content: none; }
+  /* Stats row: small inline label + value, thin rule underneath */
+  .stack-table tbody tr:not(.voucher-detail-row) > td:nth-child(3),
+  .stack-table tbody tr:not(.voucher-detail-row) > td:nth-child(4),
+  .stack-table tbody tr:not(.voucher-detail-row) > td:nth-child(5) {
+    display: flex;
+    align-items: baseline;
+    justify-content: flex-start;
+    gap: 5px;
+    font-size: 0.82rem;
+    border-bottom: 1px solid var(--gray-100);
+    padding-bottom: 4px;
+    margin-bottom: 3px;
+  }
+  .stack-table tbody tr:not(.voucher-detail-row) > td:nth-child(3) { grid-area: amt; }
+  .stack-table tbody tr:not(.voucher-detail-row) > td:nth-child(4) { grid-area: total; }
+  .stack-table tbody tr:not(.voucher-detail-row) > td:nth-child(5) {
+    grid-area: bal;
+    justify-content: flex-end;
+    font-weight: 700;
+    font-size: 0.9rem;
+  }
+  .stack-table tbody tr:not(.voucher-detail-row) > td:nth-child(6) {
+    grid-area: pay;
+    justify-self: end;
+  }
 
   /* JS-inserted voucher detail row: its td has no data-label, so it renders
      as a plain full-width block inside the card list. */
@@ -518,7 +552,11 @@ input.pay-input {
 
   /* Error bubble: the left-of-input anchor has no room in a stacked card,
      so let it flow onto its own line below the input instead. */
-  .stack-table .pay-cell { flex-wrap: wrap; }
+  .stack-table .pay-cell {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
   .stack-table .field-error-bubble {
     position: static;
     transform: none;
@@ -538,7 +576,7 @@ input.pay-input {
   }
   .btn-sm { min-height: 40px; }
   input.pay-input {
-    min-height: 44px;
+    min-height: 38px;
     width: calc(10ch + 26px);
   }
   .action-row--sticky .btn { flex: 1 1 auto; }
@@ -557,4 +595,9 @@ input.pay-input {
     padding: 0.5rem 0.75rem;
     margin-bottom: 0.6rem;
   }
+
+  /* The [hidden] attribute's UA display:none loses to the display rules
+     above; restore it so the voucher-detail toggle can collapse rows.
+     Must stay after the grid rule (equal specificity, source order wins). */
+  .stack-table tbody tr[hidden] { display: none; }
 }

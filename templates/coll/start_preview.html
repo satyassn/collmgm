@@ -9,21 +9,25 @@
     <tr>
       <th>Bill No</th>
       <th>Voucher Date</th>
+      <th class="num">Amount</th>
+      <th class="num">Total Paid</th>
       <th class="num">Balance</th>
     </tr>
   </thead>
   <tbody>
     {% for v in vouchers %}
     <tr>
-      <td class="mono" data-label="Bill No"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
-      <td data-label="Voucher Date">{{ v.voucher_date }}</td>
-      <td class="num mono" data-label="Balance">{{ v.balance }}</td>
+      <td class="mono"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
+      <td>{{ v.voucher_date }}</td>
+      <td class="num mono" data-label="Amt">{{ v.amount }}</td>
+      <td class="num mono" data-label="Total">{{ v.total_paid }}</td>
+      <td class="num mono" data-label="Bal">{{ v.balance }}</td>
     </tr>
     {% endfor %}
   </tbody>
   <tfoot>
     <tr>
-      <td colspan="2"><strong>Total ({{ vouchers|length }} vouchers)</strong></td>
+      <td colspan="4"><strong>Total ({{ vouchers|length }} vouchers)</strong></td>
       <td class="num mono"><strong>{{ total_balance }}</strong></td>
     </tr>
   </tfoot>

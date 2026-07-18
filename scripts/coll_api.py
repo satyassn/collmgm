@@ -51,6 +51,7 @@ from coll_data import (
     load_beats,
     load_beats_pending_summary,
     load_salesmen,
+    load_voucher_amounts,
     query_pending_by_age,
     query_pending_by_amount,
     query_pending_by_beat,
@@ -97,6 +98,23 @@ def _r(url: str, code: int = 303):
 
 def _tmpl(name: str, request: Request, **ctx):
     return templates.TemplateResponse(request=request, name=name, context=ctx)
+
+
+def _enrich_vouchers(vouchers):
+    """Attach master voucher amount and derived total-paid for display.
+
+    Render-time only — never persisted, so the staged-report schema (and its
+    tamper validation) is unaffected. Bills missing from master show blanks.
+    """
+    amounts = load_voucher_amounts([v["bill_no"] for v in vouchers])
+    for v in vouchers:
+        amount = amounts.get(v["bill_no"].strip(), "")
+        v["amount"] = amount
+        try:
+            v["total_paid"] = str(Decimal(amount) - Decimal(v["balance"]))
+        except (InvalidOperation, ValueError, KeyError):
+            v["total_paid"] = ""
+    return vouchers
 
 
 def _require(request: Request, permission: str = None):
@@ -267,7 +285,7 @@ def _generate_collection_list_response(request, user, beat, salesman):
 
     total = sum(Decimal(v["balance"]) for v in vouchers)
     return _tmpl("coll/start_preview.html", request, user=user,
-                 beat=beat, salesman=salesman, vouchers=vouchers,
+                 beat=beat, salesman=salesman, vouchers=_enrich_vouchers(vouchers),
                  report_stem=outcome.json_path.stem, total_balance=total)
 
 
@@ -387,7 +405,7 @@ def coll_approve_start_review(request: Request, stem: str):
     vouchers = sorted(data.get("vouchers", []), key=lambda v: bill_no_sort_key(v["bill_no"]))
     total = sum(parse_decimal(v.get("balance")) for v in vouchers)
     return _tmpl("coll/approve_start_review.html", request, user=user,
-                 stem=stem, data=data, vouchers=vouchers,
+                 stem=stem, data=data, vouchers=_enrich_vouchers(vouchers),
                  beat=sel[0] if sel else "",
                  salesman=sel[1] if len(sel) > 1 else "",
                  total_balance=total)
@@ -460,7 +478,7 @@ def coll_submit_edit(request: Request, stem: str):
     total_collected = sum(parse_decimal(v.get("payment")) for v in vouchers)
     paid_count = sum(1 for v in vouchers if parse_decimal(v.get("payment")) > 0)
     return _tmpl("coll/submit_edit.html", request, user=user,
-                 stem=stem, data=data, vouchers=vouchers,
+                 stem=stem, data=data, vouchers=_enrich_vouchers(vouchers),
                  beat=sel[0] if sel else "",
                  salesman=sel[1] if len(sel) > 1 else "",
                  total_collected=total_collected, paid_count=paid_count)
@@ -499,7 +517,7 @@ async def coll_submit_save(request: Request, stem: str):
         total_collected = sum(parse_decimal(v.get("payment")) for v in vouchers)
         paid_count = sum(1 for v in vouchers if parse_decimal(v.get("payment")) > 0)
         return _tmpl("coll/submit_edit.html", request, user=user,
-                     stem=stem, data=data, vouchers=vouchers,
+                     stem=stem, data=data, vouchers=_enrich_vouchers(vouchers),
                      beat=beat, salesman=salesman,
                      total_collected=total_collected, paid_count=paid_count,
                      error=f"Nothing saved — {invalid} payment(s) need correction")
@@ -594,7 +612,7 @@ def coll_approve_submit_review(request: Request, stem: str):
     total_collected = sum(parse_decimal(v.get("payment")) for v in vouchers)
     paid_count = sum(1 for v in vouchers if parse_decimal(v.get("payment")) > 0)
     return _tmpl("coll/approve_submit_review.html", request, user=user,
-                 stem=stem, data=data, vouchers=vouchers,
+                 stem=stem, data=data, vouchers=_enrich_vouchers(vouchers),
                  beat=sel[0] if sel else "",
                  salesman=sel[1] if len(sel) > 1 else "",
                  total_collected=total_collected, paid_count=paid_count)
@@ -650,7 +668,7 @@ def coll_post_review(request: Request, stem: str):
     total_collected = sum(parse_decimal(v.get("payment")) for v in vouchers)
     paid_count = sum(1 for v in vouchers if parse_decimal(v.get("payment")) > 0)
     return _tmpl("coll/post_review.html", request, user=user,
-                 stem=stem, data=data, vouchers=vouchers,
+                 stem=stem, data=data, vouchers=_enrich_vouchers(vouchers),
                  beat=sel[0] if sel else "",
                  salesman=sel[1] if len(sel) > 1 else "",
                  total_collected=total_collected, paid_count=paid_count)
@@ -708,7 +726,9 @@ def voucher_detail(request: Request, bill_no: str, fragment: int = 0):
         return _tmpl("error.html", request, user=user,
                      message=f"No voucher found for: {bill_no.strip()}")
     voucher, installments, is_completed = result
-    template = "_voucher_card.html" if fragment else "voucher.html"
+    # Inline expand gets the slim installments-only partial; the standalone
+    # page (and Voucher Search's include) keep the full card.
+    template = "_voucher_inline.html" if fragment else "voucher.html"
     return _tmpl(template, request, user=user,
                  voucher=voucher, installments=installments, is_completed=is_completed)
 

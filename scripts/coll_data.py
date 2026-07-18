@@ -361,6 +361,16 @@ def search_voucher(bill_no):
     return None
 
 
+def load_voucher_amounts(bill_nos):
+    """Map bill_no -> amount string for the given bills (active vouchers only)."""
+    wanted = {b.strip() for b in bill_nos}
+    return {
+        row.get("bill_no", "").strip(): row.get("amount", "").strip()
+        for row in load_vouchers_raw()
+        if row.get("bill_no", "").strip() in wanted
+    }
+
+
 # --- Add-vouchers query ---
 
 def load_addv_pending_confirm_by_beat():
