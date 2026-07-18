@@ -286,7 +286,9 @@ input.pay-input {
   /* 10 chars of text (e.g. 1234567.89) + 16px padding + 2px border (border-box) */
   width: calc(10ch + 18px);
   padding: 6px 8px;
-  font-size: 0.9rem;
+  /* 16px minimum: iOS Safari auto-zooms the viewport when focusing any
+     input styled smaller than 16px */
+  font-size: 1rem;
   font-family: var(--font-mono);
   text-align: right;
   appearance: textfield;

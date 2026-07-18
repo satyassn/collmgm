@@ -33,11 +33,18 @@
     var sep = link.getAttribute("href").indexOf("?") === -1 ? "?" : "&";
     fetch(link.getAttribute("href") + sep + "fragment=1", { credentials: "same-origin" })
       .then(function (resp) {
+        if (resp.redirected) {
+          // Session expired: the request bounced to the login page. Navigate
+          // there instead of injecting a full HTML document into the row.
+          window.location.href = resp.url;
+          return null;
+        }
         return resp.text().then(function (text) {
           return { ok: resp.ok, text: text };
         });
       })
       .then(function (r) {
+        if (!r) return;
         // The 404 body is our own "Voucher not found" snippet — show it too.
         cell.innerHTML = r.text || "";
         if (!r.ok && !r.text) cell.textContent = "Could not load voucher details.";

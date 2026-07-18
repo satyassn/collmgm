@@ -125,9 +125,13 @@
     input.addEventListener("keydown", function (e) {
       if (e.key !== "Tab") return;
       if (!input.classList.contains("field-invalid")) return;
-      var bad = inputs.filter(function (i) { return i.classList.contains("field-invalid"); });
-      var idx = bad.indexOf(input);
-      var next = bad[(idx + (e.shiftKey ? -1 : 1) + bad.length) % bad.length];
+      // Jump to the next invalid field in the Tab direction, but never
+      // wrap: falling through to normal Tab order keeps Save reachable
+      // and avoids trapping focus on the last invalid field (WCAG 2.1.2).
+      var idx = inputs.indexOf(input);
+      var rest = e.shiftKey ? inputs.slice(0, idx).reverse() : inputs.slice(idx + 1);
+      var next = rest.filter(function (i) { return i.classList.contains("field-invalid"); })[0];
+      if (!next) return;
       e.preventDefault();
       next.focus();
     });

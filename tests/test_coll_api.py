@@ -11,6 +11,7 @@ Run:  python -m unittest discover -s tests -v
 """
 
 import json
+import re
 import socket
 import sys
 import tempfile
@@ -972,6 +973,37 @@ class TestVoucherDetail(ApiTestCase):
         self.assertEqual(status, 200)   # opener follows the 303 to /login
         self.assertIn('name="password"', body)
         self.assertNotIn("voucher-card", body)
+
+
+# ---------------------------------------------------------------------------
+# PWA static assets — manifest and service worker must reference real files
+# ---------------------------------------------------------------------------
+
+class PwaAssetTests(unittest.TestCase):
+    """A manifest icon that 404s breaks Android installability silently, and a
+    sw.js SHELL entry that 404s makes the whole install-event precache fail."""
+
+    STATIC = Path(__file__).resolve().parent.parent / "static"
+
+    def test_manifest_icons_exist_and_are_png(self):
+        manifest = json.loads((self.STATIC / "manifest.json").read_text(encoding="utf-8"))
+        icons = manifest.get("icons", [])
+        self.assertTrue(icons, "manifest.json declares no icons")
+        for icon in icons:
+            self.assertTrue(icon["src"].startswith("/static/"), icon["src"])
+            path = self.STATIC / icon["src"].rsplit("/", 1)[-1]
+            self.assertTrue(path.is_file(), f"manifest icon missing: {icon['src']}")
+            with path.open("rb") as f:
+                self.assertEqual(f.read(8), b"\x89PNG\r\n\x1a\n",
+                                 f"{path.name} is not a PNG")
+
+    def test_service_worker_references_exist(self):
+        sw = (self.STATIC / "sw.js").read_text(encoding="utf-8")
+        refs = re.findall(r"/static/([\w.\-]+)", sw)
+        self.assertTrue(refs, "sw.js references no static files")
+        for name in refs:
+            self.assertTrue((self.STATIC / name).is_file(),
+                            f"sw.js references missing file: /static/{name}")
 
 
 if __name__ == "__main__":
