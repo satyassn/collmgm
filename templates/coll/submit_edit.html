@@ -114,8 +114,11 @@
     }
     var val = Number(raw);
     var bal = parseFloat(input.dataset.balance);
-    if (!isFinite(val)) setError(input, "not a number");
+    var frac = raw.indexOf(".") === -1 ? "" : raw.slice(raw.indexOf(".") + 1);
+    if (!isFinite(val) || /e/i.test(raw)) setError(input, "not a number");
     else if (val < 0) setError(input, "cannot be negative");
+    else if (frac.length > 2) setError(input, "max 2 decimal places");
+    else if (/^0\d/.test(raw)) setError(input, "no leading zeros");
     else if (isFinite(bal) && val > bal) setError(input, "exceeds balance (" + input.dataset.balance + ")");
     else clearError(input);
   }
@@ -126,6 +129,20 @@
       recalc();
     });
     input.addEventListener("keydown", function (e) {
+      // type=number accepts these as float syntax; payments never need them.
+      if (e.key === "e" || e.key === "E" || e.key === "+" || e.key === "-") {
+        e.preventDefault();
+        return;
+      }
+      if (e.key === "Enter") {
+        // Advance to the next payment instead of the implicit form submit
+        // (which would trigger Save); blur on the last one.
+        e.preventDefault();
+        var nextInput = inputs[inputs.indexOf(input) + 1];
+        if (nextInput) nextInput.focus();
+        else input.blur();
+        return;
+      }
       if (e.key !== "Tab") return;
       if (!input.classList.contains("field-invalid")) return;
       // Jump to the next invalid field in the Tab direction, but never

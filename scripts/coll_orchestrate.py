@@ -9,6 +9,7 @@ caller of that module). Imports only from coll_store/coll_data, same
 constraint already enforced on coll_data.
 """
 
+import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from enum import Enum
@@ -352,6 +353,16 @@ def validate_payment(raw, balance):
     raw = (raw or "").strip()
     if not raw:
         return "", None
+    # Format gate ahead of the Decimal parse: plain decimal notation only.
+    # Rejects letters (incl. scientific-notation e/E), '+', multiple dots,
+    # >2 decimal places (never silently rounded), and leading zeros.
+    m = re.fullmatch(r"(-?)(\d*)(?:\.(\d*))?", raw)
+    if not m or (m.group(2) == "" and not m.group(3)):
+        return None, "not a number"
+    if m.group(3) and len(m.group(3)) > 2:
+        return None, "max 2 decimal places"
+    if len(m.group(2)) > 1 and m.group(2).startswith("0"):
+        return None, "no leading zeros"
     try:
         amount = Decimal(raw)
         if not amount.is_finite():

@@ -536,7 +536,7 @@ async def coll_submit_save(request: Request, stem: str):
                      message="Collections submitted for supervisor review.", back="/coll/submit")
 
     return _tmpl("message.html", request, user=user,
-                 message="Progress saved.", back=f"/coll/submit/{stem}")
+                 message="Progress saved.", back="/menu")
 
 
 # ---------------------------------------------------------------------------
