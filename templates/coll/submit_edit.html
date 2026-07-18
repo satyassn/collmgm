@@ -16,7 +16,7 @@
 
 <form method="post" action="/coll/submit/{{ stem }}">
   <div class="table-wrapper">
-    <table class="data-table payment-table">
+    <table class="data-table payment-table stack-table">
       <thead>
         <tr>
           <th>Bill No</th>
@@ -28,10 +28,10 @@
       <tbody>
         {% for v in vouchers %}
         <tr>
-          <td class="mono"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
-          <td>{{ v.get("voucher_date","") }}</td>
-          <td class="num mono">{{ v.balance }}</td>
-          <td class="pay-cell">
+          <td class="mono" data-label="Bill No"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
+          <td data-label="Voucher Date">{{ v.get("voucher_date","") }}</td>
+          <td class="num mono" data-label="Balance">{{ v.balance }}</td>
+          <td class="pay-cell" data-label="Payment">
             <input type="number" name="pay_{{ v.bill_no }}" id="pay-{{ loop.index }}"
                    value="{{ v.get('payment','') }}"
                    min="0" step="0.01"
@@ -48,7 +48,7 @@
     </table>
   </div>
 
-  <div class="action-row">
+  <div class="action-row action-row--sticky">
     <button type="submit" name="action" value="save" class="btn btn-secondary">Save</button>
     <button type="submit" name="action" value="submit" class="btn btn-primary"
             onclick="return confirm('Submit all payments for supervisor review?')">Submit for Review</button>

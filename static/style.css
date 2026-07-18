@@ -410,3 +410,120 @@ input.pay-input {
   font-size: 0.95rem;
   margin-bottom: 1rem;
 }
+
+/* ---- Sticky action bar ---- */
+/* Opt-in via .action-row--sticky on the workflow action rows. Sticky-bottom
+   is inert on short pages (it only pins once its natural position would fall
+   below the viewport), so this is safe at every width. */
+.action-row--sticky {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;                    /* below .field-error-bubble (z-index 10) */
+  background: var(--gray-50);    /* opaque: table must not show through */
+  border-top: 1px solid var(--gray-200);
+  /* bleed across main's 1rem side padding to the viewport edge */
+  margin-left: -1rem;
+  margin-right: -1rem;
+  padding: 0.75rem 1rem calc(0.75rem + env(safe-area-inset-bottom));
+}
+
+/* ---- Mobile (≤640px) ---- */
+@media (max-width: 640px) {
+
+  /* Stacked-card tables: opt-in via .stack-table alongside .data-table.
+     Rows become cards; cell labels come from data-label attributes so the
+     desktop table markup stays untouched above the breakpoint. */
+  .stack-table thead { display: none; }
+  .stack-table, .stack-table tbody, .stack-table tfoot,
+  .stack-table tr, .stack-table td { display: block; width: 100%; }
+  .stack-table { border: none; box-shadow: none; background: transparent; }
+  .stack-table tbody tr {
+    background: #fff;
+    border: 1px solid var(--gray-200);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 0.35rem 0.75rem;
+    margin-bottom: 0.5rem;
+  }
+  .stack-table tbody tr:hover { background: #fff; }
+  .stack-table tbody tr.has-payment,
+  .stack-table tbody tr.has-payment:hover { background: #f0fdf4; }
+  .stack-table td { border-bottom: none; padding: 5px 0; }
+  .stack-table td[data-label] {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+  }
+  .stack-table td[data-label]::before {
+    content: attr(data-label);
+    flex-shrink: 0;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    color: var(--gray-600);
+  }
+
+  /* JS-inserted voucher detail row: its td has no data-label, so it renders
+     as a plain full-width block inside the card list. */
+  .stack-table .voucher-detail-row {
+    background: var(--gray-50);
+    padding: 0.5rem 0.75rem;
+  }
+  .stack-table .voucher-detail-row td { padding: 0; background: transparent; }
+
+  /* tfoot totals collapse into one label/amount card */
+  .stack-table tfoot tr {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+    background: var(--gray-100);
+    border: 1px solid var(--gray-200);
+    border-radius: var(--radius);
+    padding: 0.6rem 0.75rem;
+    font-weight: 600;
+  }
+  .stack-table tfoot td {
+    display: block;
+    width: auto;
+    background: none;
+    border: none;
+    padding: 0;
+  }
+
+  /* Error bubble: the left-of-input anchor has no room in a stacked card,
+     so let it flow onto its own line below the input instead. */
+  .stack-table .pay-cell { flex-wrap: wrap; }
+  .stack-table .field-error-bubble {
+    position: static;
+    transform: none;
+    flex-basis: 100%;
+    width: auto;
+    max-width: none;
+    margin-top: 4px;
+  }
+  .stack-table .field-error-bubble::after { display: none; }
+
+  /* Touch targets (44px per WCAG/Apple guidance) */
+  .btn {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .btn-sm { min-height: 40px; }
+  input.pay-input {
+    min-height: 44px;
+    width: calc(10ch + 26px);
+  }
+  .action-row--sticky .btn { flex: 1 1 auto; }
+
+  /* Keep the live count/total visible while entering payments */
+  .summary-box {
+    position: sticky;
+    top: 0;
+    z-index: 4;
+  }
+}

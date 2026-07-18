@@ -4,6 +4,7 @@
 <h2 class="page-heading">Highest Balance</h2>
 <p class="meta-line">Showing {{ vouchers|length }} highest of {{ total_count }} pending vouchers</p>
 
+<div class="table-wrapper">
 <table class="data-table">
   <thead>
     <tr>
@@ -26,5 +27,6 @@
     {% endfor %}
   </tbody>
 </table>
+</div>
 <a class="btn btn-secondary" href="/reports">Back</a>
 {% endblock %}
