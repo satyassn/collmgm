@@ -114,10 +114,8 @@
     }
     var val = Number(raw);
     var bal = parseFloat(input.dataset.balance);
-    var frac = raw.indexOf(".") === -1 ? "" : raw.slice(raw.indexOf(".") + 1);
     if (!isFinite(val) || /e/i.test(raw)) setError(input, "not a number");
     else if (val < 0) setError(input, "cannot be negative");
-    else if (frac.length > 2) setError(input, "max 2 decimal places");
     else if (/^0\d/.test(raw)) setError(input, "no leading zeros");
     else if (isFinite(bal) && val > bal) setError(input, "exceeds balance (" + input.dataset.balance + ")");
     else clearError(input);
@@ -125,6 +123,11 @@
 
   inputs.forEach(function (input) {
     input.addEventListener("input", function () {
+      // Cap at 2 decimal places by trimming, not erroring: a third decimal
+      // digit (typed or pasted) is dropped on the spot. Caret APIs are
+      // unavailable on type=number, so trim the value itself.
+      var extra = input.value.match(/^(-?\d*\.\d\d)\d+$/);
+      if (extra) input.value = extra[1];
       liveValidate(input);
       recalc();
     });
