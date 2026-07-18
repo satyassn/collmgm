@@ -39,6 +39,10 @@ body {
   padding: 0 1rem;
   height: 52px;
   box-shadow: var(--shadow);
+  /* App-style fixed header: stays visible while content scrolls */
+  position: sticky;
+  top: 0;
+  z-index: 20;
 }
 .brand {
   font-weight: 700;
@@ -438,17 +442,20 @@ input.pay-input {
   .stack-table tr, .stack-table td { display: block; width: 100%; }
   .stack-table { border: none; box-shadow: none; background: transparent; }
   .stack-table tbody tr {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
     background: #fff;
     border: 1px solid var(--gray-200);
     border-radius: var(--radius);
     box-shadow: var(--shadow);
-    padding: 0.35rem 0.75rem;
-    margin-bottom: 0.5rem;
+    padding: 0.3rem 0.65rem;
+    margin-bottom: 0.4rem;
   }
   .stack-table tbody tr:hover { background: #fff; }
   .stack-table tbody tr.has-payment,
   .stack-table tbody tr.has-payment:hover { background: #f0fdf4; }
-  .stack-table td { border-bottom: none; padding: 5px 0; }
+  .stack-table td { border-bottom: none; padding: 3px 0; flex: 1 1 100%; }
   .stack-table td[data-label] {
     display: flex;
     justify-content: space-between;
@@ -464,6 +471,22 @@ input.pay-input {
     letter-spacing: .04em;
     color: var(--gray-600);
   }
+
+  /* Bill no + date share the card's first line; their values are
+     self-evident, so their labels are dropped. */
+  .stack-table tbody tr:not(.voucher-detail-row) > td:first-child {
+    flex: 1 1 auto;
+    width: auto;
+    font-weight: 600;
+  }
+  .stack-table tbody tr:not(.voucher-detail-row) > td:nth-child(2) {
+    flex: 0 0 auto;
+    width: auto;
+    color: var(--gray-600);
+    font-size: 0.85rem;
+  }
+  .stack-table tbody tr:not(.voucher-detail-row) > td:first-child::before,
+  .stack-table tbody tr:not(.voucher-detail-row) > td:nth-child(2)::before { content: none; }
 
   /* JS-inserted voucher detail row: its td has no data-label, so it renders
      as a plain full-width block inside the card list. */
@@ -520,10 +543,18 @@ input.pay-input {
   }
   .action-row--sticky .btn { flex: 1 1 auto; }
 
-  /* Keep the live count/total visible while entering payments */
+  /* Tighter page chrome so more cards fit per screen */
+  main { padding-top: 0.75rem; }
+  .page-heading { font-size: 1.1rem; margin-bottom: 0.75rem; }
+  .meta-line { margin-bottom: 0.5rem; }
+
+  /* Keep the live count/total visible while entering payments,
+     docked below the 52px sticky topbar */
   .summary-box {
     position: sticky;
-    top: 0;
+    top: 52px;
     z-index: 4;
+    padding: 0.5rem 0.75rem;
+    margin-bottom: 0.6rem;
   }
 }
