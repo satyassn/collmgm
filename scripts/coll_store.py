@@ -189,6 +189,25 @@ _CORRECTIONS_COLUMNS = ["id", "kind", "bill_no", "report_stem", "origin_stage",
 
 _SCHEMA += f"CREATE TABLE IF NOT EXISTS corrections ({_CORRECTIONS_BODY});\n"
 
+# Voucher amendments (added after schema v1, alongside corrections — same
+# "deliberately NOT in _TABLE_DDL_V1" rationale). A raw, distributor-only
+# full-state edit of one voucher + its installments, committed as one atomic
+# transaction. No status column: unlike corrections there is no separate
+# 'open' request phase — a row exists iff the edit committed, and it IS the
+# audit trail (old_json/new_json hold the full before/after voucher +
+# installments state, not a per-field diff).
+_AMENDMENTS_BODY = """
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    bill_no     TEXT NOT NULL CHECK (bill_no <> ''),
+    old_json    TEXT NOT NULL,
+    new_json    TEXT NOT NULL,
+    note        TEXT NOT NULL DEFAULT '',
+    amended_by  TEXT NOT NULL,
+    amended_at  TEXT NOT NULL
+"""
+
+_SCHEMA += f"CREATE TABLE IF NOT EXISTS amendments ({_AMENDMENTS_BODY});\n"
+
 
 class MigrationError(ValueError):
     """Existing rows violate the new schema constraints; the migration
@@ -211,6 +230,7 @@ def init_db():
         _backfill_permissions(conn)
         _backfill_coll_print_permission(conn)
         _backfill_correction_permissions(conn)
+        _backfill_amendment_permission(conn)
         conn.commit()
         _migrate_corrections_kinds(conn)
         if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
@@ -364,6 +384,14 @@ def _backfill_correction_permissions(conn):
         "INSERT OR IGNORE INTO permissions (role, action_key) VALUES (?, ?)",
         [("supervisor", "raise_correction"), ("distributor", "raise_correction"),
          ("distributor", "apply_correction")],
+    )
+
+
+def _backfill_amendment_permission(conn):
+    """One-time additive grant of amend_voucher for DBs seeded before it existed."""
+    conn.executemany(
+        "INSERT OR IGNORE INTO permissions (role, action_key) VALUES (?, ?)",
+        [("distributor", "amend_voucher")],
     )
 
 
@@ -794,6 +822,12 @@ class CorrectionConflict(ValueError):
     the distributor to reject (or the requester to withdraw and re-raise)."""
 
 
+class AmendmentConflict(ValueError):
+    """The amendment's load-time snapshot no longer matches current master
+    data — someone else changed this voucher since the form was opened.
+    Nothing commits; the caller reloads and re-renders with current data."""
+
+
 def _correction_dict(row):
     d = dict(row)
     d["old"] = json.loads(d["old_json"]) if d["old_json"] else None
@@ -1029,6 +1063,193 @@ def apply_installment_correction(corr_id, resolved_by, resolution_note="", now=N
     finally:
         conn.close()
     return load_correction(corr_id)
+
+
+# ---------------------------------------------------------------------------
+# Voucher amendments
+# ---------------------------------------------------------------------------
+
+def _amendment_dict(row):
+    d = dict(row)
+    d["old"] = json.loads(d["old_json"]) if d["old_json"] else None
+    d["new"] = json.loads(d["new_json"]) if d["new_json"] else None
+    del d["old_json"], d["new_json"]
+    return d
+
+
+def load_amendment(aid):
+    """Return one amendment as a dict (old/new decoded), or None."""
+    if not _db_path().exists():
+        return None
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT * FROM amendments WHERE id = ?", (aid,)).fetchone()
+    finally:
+        conn.close()
+    return _amendment_dict(row) if row else None
+
+
+def load_amendments(bill_no=None, limit=None):
+    """Return amendments (most recent first), optionally filtered to one
+    bill_no and capped at `limit` rows."""
+    if not _db_path().exists():
+        return []
+    sql = "SELECT * FROM amendments"
+    params = []
+    if bill_no:
+        sql += " WHERE bill_no = ?"
+        params.append(bill_no)
+    sql += " ORDER BY id DESC"
+    if limit:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    conn = get_db()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    return [_amendment_dict(r) for r in rows]
+
+
+def _validate_amendment_amount(raw, label):
+    """Strict finite positive Decimal, quantized 2dp, as a string — or raises
+    ValueError with `label` for context. Last-gate backstop; the API
+    pre-validates for friendly errors."""
+    try:
+        d = Decimal(str(raw))
+    except (InvalidOperation, ValueError, TypeError):
+        raise ValueError(f"{label}: invalid amount {raw!r}")
+    if not d.is_finite() or d <= 0:
+        raise ValueError(f"{label}: invalid amount {raw!r}")
+    return str(d.quantize(Decimal("0.01")))
+
+
+def apply_voucher_amendment(bill_no, snapshot, new_state, amended_by, note="", now=None):
+    """Apply a full-state edit of one voucher + its installments as ONE
+    atomic transaction: re-check the load-time snapshot (AmendmentConflict on
+    drift), validate every field, mutate, recompute the balance (ValueError +
+    rollback if negative — `_recompute_voucher_balance` is the same function
+    corrections use, so both paths share the one recompute policy), and write
+    the audit row — all inside the same `with conn:` block, so any failure
+    leaves master data and the audit trail untouched.
+
+    snapshot / new_state shape: {"voucher": {date,amount,balance,beat,salesman},
+    "installments": [{id,date,amount,salesman}, ...]}. Installment identity is
+    by surrogate `id` throughout (duplicate rows are legal — coll_store.py
+    load_installments_for_bill docstring): present in new_state -> UPDATE;
+    id None -> INSERT (created_by=amended_by); present in snapshot but absent
+    from new_state -> DELETE. Voucher balance is never taken from new_state —
+    always recomputed. Returns the new amendment dict.
+    """
+    now = now or datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    conn = get_db()
+    try:
+        with conn:
+            vrow = conn.execute(
+                "SELECT date, amount, balance, beat, salesman FROM vouchers"
+                " WHERE bill_no = ?", (bill_no,)).fetchone()
+            if vrow is None:
+                raise ValueError(f"voucher {bill_no} not found in master")
+            current_insts = {
+                r["id"]: {"date": r["date"], "amount": r["amount"], "salesman": r["salesman"]}
+                for r in conn.execute(
+                    "SELECT id, date, amount, salesman FROM installments WHERE bill_no = ?",
+                    (bill_no,))}
+
+            snap_v = snapshot.get("voucher") or {}
+            if dict(vrow) != {"date": snap_v.get("date"), "amount": snap_v.get("amount"),
+                              "balance": snap_v.get("balance"), "beat": snap_v.get("beat"),
+                              "salesman": snap_v.get("salesman")}:
+                raise AmendmentConflict(
+                    f"voucher {bill_no} changed since this amendment was loaded —"
+                    " reload and try again")
+            snap_insts = {
+                i.get("id"): {"date": i.get("date"), "amount": i.get("amount"),
+                              "salesman": i.get("salesman")}
+                for i in snapshot.get("installments") or []}
+            if current_insts != snap_insts:
+                raise AmendmentConflict(
+                    f"an installment on voucher {bill_no} changed since this"
+                    " amendment was loaded — reload and try again")
+
+            new_v = new_state.get("voucher") or {}
+            new_date = (new_v.get("date") or "").strip()
+            new_amount = _validate_amendment_amount(new_v.get("amount"), f"voucher {bill_no} amount")
+            new_beat = (new_v.get("beat") or "").strip()
+            new_salesman = (new_v.get("salesman") or "").strip()
+            if not new_date:
+                raise ValueError(f"voucher {bill_no}: date is required")
+            if conn.execute("SELECT 1 FROM beats WHERE name = ?", (new_beat,)).fetchone() is None:
+                raise ValueError(f"unknown beat {new_beat!r}")
+            if conn.execute(
+                    "SELECT 1 FROM users WHERE name = ? AND role = 'salesman'",
+                    (new_salesman,)).fetchone() is None:
+                raise ValueError(f"unknown salesman {new_salesman!r}")
+
+            validated_rows = []
+            for r in (new_state.get("installments") or []):
+                rid = r.get("id")
+                rdate = (r.get("date") or "").strip()
+                ramount = _validate_amendment_amount(r.get("amount"), "installment amount")
+                rsalesman = (r.get("salesman") or "").strip()
+                if not rdate:
+                    raise ValueError("installment date is required")
+                if conn.execute(
+                        "SELECT 1 FROM users WHERE name = ? AND role = 'salesman'",
+                        (rsalesman,)).fetchone() is None:
+                    raise ValueError(f"unknown salesman {rsalesman!r} on an installment")
+                validated_rows.append((rid, rdate, ramount, rsalesman))
+
+            kept_ids = {rid for rid, *_ in validated_rows if rid is not None}
+            unknown_ids = kept_ids - set(current_insts)
+            if unknown_ids:
+                raise AmendmentConflict(
+                    f"installment id(s) {sorted(unknown_ids)} on voucher {bill_no}"
+                    " no longer exist — reload and try again")
+
+            conn.execute(
+                "UPDATE vouchers SET date = ?, amount = ?, beat = ?, salesman = ?"
+                " WHERE bill_no = ?",
+                (new_date, new_amount, new_beat, new_salesman, bill_no))
+
+            removed_ids = set(current_insts) - kept_ids
+            if removed_ids:
+                ph = ",".join("?" * len(removed_ids))
+                conn.execute(
+                    f"DELETE FROM installments WHERE bill_no = ? AND id IN ({ph})",
+                    (bill_no, *removed_ids))
+            for rid, rdate, ramount, rsalesman in validated_rows:
+                if rid is None:
+                    conn.execute(
+                        "INSERT INTO installments"
+                        " (bill_no, date, amount, salesman, created_by, created_at)"
+                        " VALUES (?, ?, ?, ?, ?, ?)",
+                        (bill_no, rdate, ramount, rsalesman, amended_by, now))
+                else:
+                    conn.execute(
+                        "UPDATE installments SET date = ?, amount = ?, salesman = ?"
+                        " WHERE id = ? AND bill_no = ?",
+                        (rdate, ramount, rsalesman, rid, bill_no))
+
+            _recompute_voucher_balance(conn, bill_no)
+
+            after_v = conn.execute(
+                "SELECT date, amount, balance, beat, salesman FROM vouchers"
+                " WHERE bill_no = ?", (bill_no,)).fetchone()
+            after_insts = [dict(r) for r in conn.execute(
+                "SELECT id, date, amount, salesman FROM installments WHERE bill_no = ?"
+                " ORDER BY id", (bill_no,))]
+            new_json = json.dumps({"voucher": dict(after_v), "installments": after_insts})
+            old_json = json.dumps(snapshot)
+
+            cur = conn.execute(
+                "INSERT INTO amendments (bill_no, old_json, new_json, note,"
+                " amended_by, amended_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (bill_no, old_json, new_json, note or "", amended_by, now))
+            aid = cur.lastrowid
+    finally:
+        conn.close()
+    return load_amendment(aid)
 
 
 def write_new_vouchers(vouchers):

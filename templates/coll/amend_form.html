@@ -1,0 +1,178 @@
+{% extends "base.html" %}
+{% block title %}Voucher Amendment — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Voucher Amendment</h2>
+<p class="meta-line"><strong>Voucher:</strong> <span class="mono">{{ bill_no }}</span>
+  &nbsp;|&nbsp; <strong>Current Balance:</strong> <span class="mono">{{ voucher.balance }}</span></p>
+
+{% if error %}<p class="alert alert-error">{{ error }}</p>{% endif %}
+
+<form method="post" action="/coll/amend/{{ bill_no | urlencode }}" class="card" id="amend-form">
+  <input type="hidden" name="snapshot" value='{{ snapshot_json }}'>
+
+  <fieldset>
+    <legend class="group-heading">Voucher</legend>
+    <label class="field-label">Date
+      <input type="date" name="v_date" value="{{ voucher.date }}" required>
+    </label>
+    <label class="field-label">Amount
+      <input type="text" name="v_amount" id="v-amount" inputmode="decimal" class="mono"
+             value="{{ voucher.amount }}" autocomplete="off" required>
+    </label>
+    <label class="field-label">Beat
+      <select name="v_beat" required>
+        {% for b in beats %}
+        <option value="{{ b }}" {% if b == voucher.beat %}selected{% endif %}>{{ b }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="field-label">Salesman
+      <select name="v_salesman" required>
+        {% for s in salesmen %}
+        <option value="{{ s }}" {% if s == voucher.salesman %}selected{% endif %}>{{ s }}</option>
+        {% endfor %}
+      </select>
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend class="group-heading">Installments</legend>
+    <div class="table-wrapper">
+      <table class="data-table amend-inst-table" id="inst-table">
+        <thead>
+          <tr><th>Date</th><th class="num">Amount</th><th>Salesman</th><th>Delete</th></tr>
+        </thead>
+        <tbody>
+          {% for row in installments %}
+          {% set token = row.get('token', row.id) %}
+          <tr>
+            <td data-label="Date">
+              <input type="date" name="inst_date_{{ token }}" value="{{ row.date }}">
+            </td>
+            <td data-label="Amount">
+              <input type="text" inputmode="decimal" class="mono inst-amount"
+                     name="inst_amount_{{ token }}" value="{{ row.amount }}" autocomplete="off">
+            </td>
+            <td data-label="Salesman">
+              <select name="inst_salesman_{{ token }}">
+                {% for s in salesmen %}
+                <option value="{{ s }}" {% if s == row.salesman %}selected{% endif %}>{{ s }}</option>
+                {% endfor %}
+              </select>
+            </td>
+            <td data-label="Delete">
+              <input type="checkbox" class="inst-delete" name="inst_delete_{{ token }}"
+                     {% if row.get('_deleted') %}checked{% endif %}
+                     aria-label="Delete installment dated {{ row.date }}">
+              <input type="hidden" name="inst_row" value="{{ token }}">
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <button type="button" class="btn btn-sm btn-secondary" id="add-inst-btn">Add Installment</button>
+  </fieldset>
+
+  <template id="inst-row-template">
+    <tr>
+      <td data-label="Date"><input type="date" name="inst_date___TOKEN__"></td>
+      <td data-label="Amount">
+        <input type="text" inputmode="decimal" class="mono inst-amount"
+               name="inst_amount___TOKEN__" autocomplete="off">
+      </td>
+      <td data-label="Salesman">
+        <select name="inst_salesman___TOKEN__">
+          {% for s in salesmen %}<option value="{{ s }}">{{ s }}</option>{% endfor %}
+        </select>
+      </td>
+      <td data-label="Delete">
+        <input type="checkbox" class="inst-delete" name="inst_delete___TOKEN__"
+               aria-label="Delete this installment">
+        <input type="hidden" name="inst_row" value="__TOKEN__">
+      </td>
+    </tr>
+  </template>
+
+  <div class="summary-box">
+    <span>Balance after this amendment</span>
+    <span class="summary-total mono balance-preview" id="balance-preview">{{ voucher.balance }}</span>
+  </div>
+
+  <label class="field-label">Note (why is this being amended?)
+    <textarea name="note" rows="2" maxlength="500"></textarea>
+  </label>
+
+  <div class="action-row">
+    <button type="submit" class="btn btn-primary" id="amend-submit-btn"
+            onclick="return confirm('Apply this amendment?')">Apply Amendment</button>
+    <a class="btn btn-secondary" href="/coll/amend">Cancel</a>
+  </div>
+</form>
+
+{% if history %}
+<h3 class="group-heading">Amendment History</h3>
+<ul class="report-list">
+  {% for a in history %}
+  <li class="report-item">
+    <span class="report-label">Amended by {{ a.amended_by }}</span>
+    <span class="report-meta">{{ a.amended_at[:10] }}{% if a.note %} · {{ a.note }}{% endif %}</span>
+    <a class="btn btn-sm btn-secondary" href="/coll/amendments/{{ a.id }}">View</a>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+<script>
+(function () {
+  var table = document.getElementById("inst-table");
+  var tbody = table.tBodies[0];
+  var template = document.getElementById("inst-row-template");
+  var addBtn = document.getElementById("add-inst-btn");
+  var amountInput = document.getElementById("v-amount");
+  var preview = document.getElementById("balance-preview");
+  var submitBtn = document.getElementById("amend-submit-btn");
+  // Seed past any tokens already on the page (an error re-render preserves
+  // rows the user added before the failed submit) so a freshly-added row
+  // can never collide with one of those preserved "newN" field names.
+  var counter = 0;
+  Array.prototype.forEach.call(tbody.querySelectorAll('input[name="inst_row"]'), function (el) {
+    var m = /^new(\d+)$/.exec(el.value);
+    if (m) counter = Math.max(counter, parseInt(m[1], 10));
+  });
+
+  function recalc() {
+    var amt = parseFloat(amountInput.value);
+    if (isNaN(amt)) amt = 0;
+    var total = 0;
+    Array.prototype.forEach.call(tbody.rows, function (tr) {
+      var delBox = tr.querySelector(".inst-delete");
+      if (delBox && delBox.checked) return;
+      var amtInput = tr.querySelector(".inst-amount");
+      var v = amtInput ? parseFloat(amtInput.value) : NaN;
+      if (!isNaN(v)) total += v;
+    });
+    var balance = amt - total;
+    preview.textContent = balance.toFixed(2);
+    preview.classList.toggle("negative", balance < 0);
+    submitBtn.disabled = balance < 0;
+  }
+
+  addBtn.addEventListener("click", function () {
+    counter += 1;
+    var token = "new" + counter;
+    var row = template.content.firstElementChild.cloneNode(true);
+    Array.prototype.forEach.call(row.querySelectorAll("[name]"), function (el) {
+      el.name = el.name.replace("__TOKEN__", token);
+    });
+    tbody.appendChild(row);
+    recalc();
+  });
+
+  amountInput.addEventListener("input", recalc);
+  tbody.addEventListener("input", recalc);
+  tbody.addEventListener("change", recalc);
+  recalc();
+})();
+</script>
+{% endblock %}

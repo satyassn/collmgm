@@ -1108,5 +1108,268 @@ class TestCorrections(StoreTestCase):
         self.assertEqual(len(coll_store.load_corrections()), 2)
 
 
+class TestAmendments(StoreTestCase):
+    def _seed_master(self, beat="b1", salesman="s1"):
+        self._insert_rows("beats", [{"name": beat, "salesman": salesman}])
+        self._insert_rows("users", [{"name": salesman, "role": "salesman", "password_hash": ""}])
+
+    def _snapshot(self, bill_no):
+        v = self._query(
+            "SELECT date, amount, balance, beat, salesman FROM vouchers WHERE bill_no = ?",
+            (bill_no,))[0]
+        insts = self._query(
+            "SELECT id, date, amount, salesman FROM installments WHERE bill_no = ?"
+            " ORDER BY id", (bill_no,))
+        return {"voucher": v, "installments": insts}
+
+    def test_table_created_for_preexisting_db(self):
+        conn = coll_store.get_db()
+        try:
+            conn.execute("DROP TABLE amendments")
+            conn.commit()
+        finally:
+            conn.close()
+        coll_store.init_db()
+        self.assertEqual(self._query("SELECT COUNT(*) AS n FROM amendments")[0]["n"], 0)
+
+    def test_amend_voucher_permission_backfill(self):
+        rows = {(r["role"], r["action_key"])
+                for r in self._query("SELECT role, action_key FROM permissions")}
+        self.assertIn(("distributor", "amend_voucher"), rows)
+
+    def test_fields_only_amendment(self):
+        self._seed_master(beat="b1", salesman="s1")
+        self._seed_master(beat="b2", salesman="s2")
+        self._insert_rows("vouchers", [self._v_row("1", balance="80.00")])
+        self._insert_rows("installments", [self._i_row("1", amount="20.00")])
+        snap = self._snapshot("1")
+        iid = snap["installments"][0]["id"]
+        new_state = {"voucher": {"date": "2026-02-01", "amount": "150.00",
+                                 "beat": "b2", "salesman": "s2"},
+                    "installments": [{"id": iid, "date": "2026-01-01",
+                                      "amount": "20.00", "salesman": "s1"}]}
+        amd = coll_store.apply_voucher_amendment("1", snap, new_state, "dist", note="fix")
+        row = self._query(
+            "SELECT date, amount, balance, beat, salesman FROM vouchers")[0]
+        self.assertEqual(row, {"date": "2026-02-01", "amount": "150.00",
+                               "balance": "130.00", "beat": "b2", "salesman": "s2"})
+        self.assertEqual((amd["bill_no"], amd["amended_by"], amd["note"]),
+                         ("1", "dist", "fix"))
+        self.assertEqual(amd["old"], snap)
+        self.assertEqual(amd["new"]["voucher"]["balance"], "130.00")
+
+    def test_edit_installment(self):
+        self._seed_master()
+        self._insert_rows("vouchers", [self._v_row("1", balance="80.00")])
+        self._insert_rows("installments", [self._i_row("1", amount="20.00")])
+        snap = self._snapshot("1")
+        iid = snap["installments"][0]["id"]
+        new_state = {"voucher": snap["voucher"],
+                    "installments": [{"id": iid, "date": "2026-01-05",
+                                      "amount": "40.00", "salesman": "s1"}]}
+        coll_store.apply_voucher_amendment("1", snap, new_state, "dist")
+        inst = self._query("SELECT date, amount FROM installments")[0]
+        self.assertEqual(inst, {"date": "2026-01-05", "amount": "40.00"})
+        self.assertEqual(self._query("SELECT balance FROM vouchers")[0]["balance"], "60.00")
+
+    def test_delete_installment(self):
+        self._seed_master()
+        self._insert_rows("vouchers", [self._v_row("1", balance="80.00")])
+        self._insert_rows("installments", [self._i_row("1", amount="20.00")])
+        snap = self._snapshot("1")
+        new_state = {"voucher": snap["voucher"], "installments": []}
+        coll_store.apply_voucher_amendment("1", snap, new_state, "dist")
+        self.assertEqual(self._query("SELECT COUNT(*) AS n FROM installments")[0]["n"], 0)
+        self.assertEqual(self._query("SELECT balance FROM vouchers")[0]["balance"], "100.00")
+
+    def test_add_installment(self):
+        self._seed_master()
+        self._insert_rows("vouchers", [self._v_row("1", balance="100.00")])
+        snap = self._snapshot("1")
+        new_state = {"voucher": snap["voucher"],
+                    "installments": [{"id": None, "date": "2026-01-05",
+                                      "amount": "30.00", "salesman": "s1"}]}
+        coll_store.apply_voucher_amendment("1", snap, new_state, "dist")
+        rows = self._query("SELECT amount, date, created_by FROM installments")
+        self.assertEqual((rows[0]["amount"], rows[0]["date"], rows[0]["created_by"]),
+                         ("30.00", "2026-01-05", "dist"))
+        self.assertEqual(self._query("SELECT balance FROM vouchers")[0]["balance"], "70.00")
+
+    def test_everything_at_once(self):
+        self._seed_master(beat="b1", salesman="s1")
+        self._seed_master(beat="b2", salesman="s2")
+        self._insert_rows("vouchers", [self._v_row("1", balance="60.00")])
+        self._insert_rows("installments", [
+            self._i_row("1", amount="20.00"), self._i_row("1", amount="20.00")])
+        snap = self._snapshot("1")
+        keep_id, drop_id = snap["installments"][0]["id"], snap["installments"][1]["id"]
+        new_state = {
+            "voucher": {"date": "2026-03-01", "amount": "200.00", "beat": "b2", "salesman": "s2"},
+            "installments": [
+                {"id": keep_id, "date": "2026-01-01", "amount": "35.00", "salesman": "s1"},
+                {"id": None, "date": "2026-01-10", "amount": "15.00", "salesman": "s2"},
+            ]}
+        coll_store.apply_voucher_amendment("1", snap, new_state, "dist")
+        self.assertEqual(self._query(
+            "SELECT COUNT(*) AS n FROM installments WHERE id = ?", (drop_id,))[0]["n"], 0)
+        remaining = self._query("SELECT id, amount FROM installments ORDER BY id")
+        self.assertEqual(len(remaining), 2)
+        self.assertIn((keep_id, "35.00"), [(r["id"], r["amount"]) for r in remaining])
+        row = self._query("SELECT amount, balance, beat, salesman FROM vouchers")[0]
+        self.assertEqual(row, {"amount": "200.00", "balance": "150.00",
+                               "beat": "b2", "salesman": "s2"})
+
+    def test_duplicate_rows_delete_exactly_one(self):
+        self._seed_master()
+        self._insert_rows("vouchers", [self._v_row("1", balance="80.00")])
+        self._insert_rows("installments", [
+            self._i_row("1", amount="10.00"), self._i_row("1", amount="10.00")])
+        snap = self._snapshot("1")
+        keep_id = snap["installments"][0]["id"]
+        new_state = {"voucher": snap["voucher"],
+                    "installments": [{"id": keep_id, "date": "2026-01-01",
+                                      "amount": "10.00", "salesman": "s1"}]}
+        coll_store.apply_voucher_amendment("1", snap, new_state, "dist")
+        remaining = self._query("SELECT id FROM installments")
+        self.assertEqual([r["id"] for r in remaining], [keep_id])
+
+    def test_conflict_voucher_field_drifted(self):
+        self._seed_master()
+        self._insert_rows("vouchers", [self._v_row("1", balance="80.00")])
+        snap = self._snapshot("1")
+        snap["voucher"]["balance"] = "999.00"  # stale, doesn't match live row
+        new_state = {"voucher": snap["voucher"], "installments": []}
+        with self.assertRaises(coll_store.AmendmentConflict):
+            coll_store.apply_voucher_amendment("1", snap, new_state, "dist")
+        self.assertEqual(self._query("SELECT balance FROM vouchers")[0]["balance"], "80.00")
+        self.assertEqual(self._query("SELECT COUNT(*) AS n FROM amendments")[0]["n"], 0)
+
+    def test_conflict_installment_edited_out_of_band(self):
+        self._seed_master()
+        self._insert_rows("vouchers", [self._v_row("1", balance="80.00")])
+        self._insert_rows("installments", [self._i_row("1", amount="20.00")])
+        snap = self._snapshot("1")
+        iid = snap["installments"][0]["id"]
+        self._insert_rows("installments", [
+            {"id": iid, "bill_no": "1", "date": "2026-01-01", "amount": "99.00",
+             "salesman": "s1", "created_by": "app", "created_at": "t"}])
+        new_state = {"voucher": snap["voucher"],
+                    "installments": [{"id": iid, "date": "2026-01-01",
+                                      "amount": "30.00", "salesman": "s1"}]}
+        with self.assertRaises(coll_store.AmendmentConflict):
+            coll_store.apply_voucher_amendment("1", snap, new_state, "dist")
+        self.assertEqual(self._query("SELECT amount FROM installments")[0]["amount"], "99.00")
+        self.assertEqual(self._query("SELECT COUNT(*) AS n FROM amendments")[0]["n"], 0)
+
+    def test_conflict_installment_removed_out_of_band(self):
+        self._seed_master()
+        self._insert_rows("vouchers", [self._v_row("1", balance="80.00")])
+        self._insert_rows("installments", [self._i_row("1", amount="20.00")])
+        snap = self._snapshot("1")
+        iid = snap["installments"][0]["id"]
+        conn = coll_store.get_db()
+        conn.execute("DELETE FROM installments WHERE id = ?", (iid,))
+        conn.commit()
+        conn.close()
+        new_state = {"voucher": snap["voucher"], "installments": []}
+        with self.assertRaises(coll_store.AmendmentConflict):
+            coll_store.apply_voucher_amendment("1", snap, new_state, "dist")
+        self.assertEqual(self._query("SELECT COUNT(*) AS n FROM amendments")[0]["n"], 0)
+
+    def test_conflict_installment_added_out_of_band(self):
+        self._seed_master()
+        self._insert_rows("vouchers", [self._v_row("1", balance="100.00")])
+        snap = self._snapshot("1")
+        self._insert_rows("installments", [self._i_row("1", amount="10.00")])
+        new_state = {"voucher": snap["voucher"], "installments": []}
+        with self.assertRaises(coll_store.AmendmentConflict):
+            coll_store.apply_voucher_amendment("1", snap, new_state, "dist")
+        self.assertEqual(self._query("SELECT COUNT(*) AS n FROM installments")[0]["n"], 1)
+        self.assertEqual(self._query("SELECT COUNT(*) AS n FROM amendments")[0]["n"], 0)
+
+    def test_conflict_unknown_installment_id_in_new_state(self):
+        self._seed_master()
+        self._insert_rows("vouchers", [self._v_row("1", balance="80.00")])
+        self._insert_rows("installments", [self._i_row("1", amount="20.00")])
+        snap = self._snapshot("1")  # matches live data exactly
+        bogus_id = snap["installments"][0]["id"] + 999
+        new_state = {"voucher": snap["voucher"],
+                    "installments": [{"id": bogus_id, "date": "2026-01-01",
+                                      "amount": "20.00", "salesman": "s1"}]}
+        with self.assertRaises(coll_store.AmendmentConflict):
+            coll_store.apply_voucher_amendment("1", snap, new_state, "dist")
+        self.assertEqual(self._query("SELECT COUNT(*) AS n FROM amendments")[0]["n"], 0)
+
+    def test_negative_balance_aborts_atomically(self):
+        self._seed_master()
+        self._insert_rows("vouchers", [self._v_row("1", balance="80.00")])
+        self._insert_rows("installments", [self._i_row("1", amount="20.00")])
+        snap = self._snapshot("1")
+        new_state = {"voucher": {**snap["voucher"], "amount": "10.00"},  # < installments
+                    "installments": snap["installments"]}
+        with self.assertRaises(ValueError):
+            coll_store.apply_voucher_amendment("1", snap, new_state, "dist")
+        self.assertEqual(self._query("SELECT amount, balance FROM vouchers")[0],
+                         {"amount": "100.00", "balance": "80.00"})
+        self.assertEqual(self._query("SELECT COUNT(*) AS n FROM amendments")[0]["n"], 0)
+
+    def test_bad_amount_aborts_atomically(self):
+        self._seed_master()
+        self._insert_rows("vouchers", [self._v_row("1", balance="100.00")])
+        snap = self._snapshot("1")
+        new_state = {"voucher": {**snap["voucher"], "amount": "not-a-number"},
+                    "installments": []}
+        with self.assertRaises(ValueError):
+            coll_store.apply_voucher_amendment("1", snap, new_state, "dist")
+        self.assertEqual(self._query("SELECT amount FROM vouchers")[0]["amount"], "100.00")
+        self.assertEqual(self._query("SELECT COUNT(*) AS n FROM amendments")[0]["n"], 0)
+
+    def test_unknown_beat_aborts_atomically(self):
+        self._seed_master()
+        self._insert_rows("vouchers", [self._v_row("1", balance="100.00")])
+        snap = self._snapshot("1")
+        new_state = {"voucher": {**snap["voucher"], "beat": "nosuchbeat"},
+                    "installments": []}
+        with self.assertRaises(ValueError):
+            coll_store.apply_voucher_amendment("1", snap, new_state, "dist")
+        self.assertEqual(self._query("SELECT beat FROM vouchers")[0]["beat"], "b1")
+        self.assertEqual(self._query("SELECT COUNT(*) AS n FROM amendments")[0]["n"], 0)
+
+    def test_non_salesman_aborts_atomically(self):
+        self._seed_master()
+        self._insert_rows("vouchers", [self._v_row("1", balance="100.00")])
+        snap = self._snapshot("1")
+        new_state = {"voucher": {**snap["voucher"], "salesman": "nosuchsalesman"},
+                    "installments": []}
+        with self.assertRaises(ValueError):
+            coll_store.apply_voucher_amendment("1", snap, new_state, "dist")
+        self.assertEqual(self._query("SELECT salesman FROM vouchers")[0]["salesman"], "s1")
+        self.assertEqual(self._query("SELECT COUNT(*) AS n FROM amendments")[0]["n"], 0)
+
+    def test_missing_voucher_raises(self):
+        with self.assertRaises(ValueError):
+            coll_store.apply_voucher_amendment(
+                "nosuch", {"voucher": {}, "installments": []},
+                {"voucher": {}, "installments": []}, "dist")
+
+    def test_load_amendments_filters_and_orders(self):
+        self._seed_master()
+        self._insert_rows("vouchers", [self._v_row("1", balance="100.00"),
+                                       self._v_row("2", balance="100.00")])
+        snap1 = self._snapshot("1")
+        coll_store.apply_voucher_amendment(
+            "1", snap1, {"voucher": {**snap1["voucher"], "amount": "150.00"},
+                        "installments": []}, "dist")
+        snap2 = self._snapshot("2")
+        coll_store.apply_voucher_amendment(
+            "2", snap2, {"voucher": {**snap2["voucher"], "amount": "150.00"},
+                        "installments": []}, "dist")
+        all_amds = coll_store.load_amendments()
+        self.assertEqual([a["bill_no"] for a in all_amds], ["2", "1"])
+        self.assertEqual([a["bill_no"] for a in coll_store.load_amendments(bill_no="1")], ["1"])
+        self.assertEqual(len(coll_store.load_amendments(limit=1)), 1)
+        self.assertIsNone(coll_store.load_amendment(9999))
+
+
 if __name__ == "__main__":
     unittest.main()

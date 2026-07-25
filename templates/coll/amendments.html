@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Amendment History — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Amendment History</h2>
+
+{% if not history %}
+  <p class="empty-state">No amendments recorded yet.</p>
+{% else %}
+<ul class="report-list">
+  {% for a in history %}
+  <li class="report-item">
+    <span class="report-label"><span class="mono">{{ a.bill_no }}</span></span>
+    <span class="report-meta">{{ a.amended_by }} · {{ a.amended_at[:10] }}{% if a.note %} · {{ a.note }}{% endif %}</span>
+    <a class="btn btn-sm btn-secondary" href="/coll/amendments/{{ a.id }}">View</a>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+<a class="btn btn-secondary" href="/coll/amend">Back</a>
+{% endblock %}

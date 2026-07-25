@@ -53,6 +53,8 @@ Its state is encoded entirely in the `stages` sub-dict — the canonical single 
 
 **Correction loop (web-only):** when the physical cross-check reveals wrong master data, the supervisor raises a structured correction request from the voucher's expanded detail (edit/delete/add installment, or edit voucher amount — see `schema.md` `corrections` table). While a request is **open**: that voucher cannot be verified, and web approval of the whole list is blocked. The distributor resolves it from **Correction Requests** (menu): *Apply* changes master data + recomputes the balance atomically and refreshes the staged display balance; *Reject* (with note) unblocks the voucher unchanged. A correction applied while a report is mid-submit is safe by design — approve-submit and post re-validate payments against CURRENT master balance, and the existing Return actions are the remedy when a payment no longer fits.
 
+**Voucher Amendment (web-only, iteration4):** the distributor's raw editor (**Amend Voucher**, menu) shares the same mid-flight-edit safety model as the correction loop above — amending a voucher that's sitting in an active staging report is allowed with no stage-based block, because the same CURRENT-master revalidation + Return remedy applies. It refreshes the same staged display fields a correction does (`balance`/`voucher_date`/`salesman`) in every report holding the bill, but never `beat` — beat changes apply starting with the next generated list, not to reports already in flight. **Gate:** the editor is unreachable while any open master-data correction exists on the bill — the distributor is redirected to resolve it first (Apply or Reject) — since amending could otherwise invalidate that correction's snapshot; an open `collection_amount` request doesn't gate (see `schema.md` `amendments` table).
+
 ---
 
 ### 2. START / confirmed
@@ -161,6 +163,7 @@ Its state is encoded entirely in the `stages` sub-dict — the canonical single 
 | View Corrections (web)    |              | ✓          | ✓           |
 | Apply/Reject Correction — master-data kinds (web) | | | ✓           |
 | Apply/Reject Correction — collection amount (web) | | ✓ | ✓         |
+| Amend Voucher (web)       |              |            | ✓           |
 
 `(own beat)` / `(own)` are enforced server-side, not just hidden in the UI: a salesman is
 restricted to beats they're assigned (`beats.salesman` column) and to reports whose

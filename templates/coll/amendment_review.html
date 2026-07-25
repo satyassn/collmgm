@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Amendment #{{ amendment.id }} — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Amendment #{{ amendment.id }}</h2>
+<p class="meta-line">
+  <strong>Voucher:</strong> <span class="mono">{{ amendment.bill_no }}</span>
+  &nbsp;|&nbsp; <strong>Amended by:</strong> {{ amendment.amended_by }} on {{ amendment.amended_at[:10] }}
+</p>
+{% if amendment.note %}<p><strong>Note:</strong> {{ amendment.note }}</p>{% endif %}
+
+<div class="table-wrapper">
+<table class="data-table">
+  <thead><tr><th></th><th>Before</th><th>After</th></tr></thead>
+  <tbody>
+    <tr><td>Date</td><td>{{ amendment.old.voucher.date }}</td><td>{{ amendment.new.voucher.date }}</td></tr>
+    <tr><td>Amount</td><td class="num mono">{{ amendment.old.voucher.amount }}</td><td class="num mono">{{ amendment.new.voucher.amount }}</td></tr>
+    <tr><td>Balance</td><td class="num mono">{{ amendment.old.voucher.balance }}</td><td class="num mono">{{ amendment.new.voucher.balance }}</td></tr>
+    <tr><td>Beat</td><td>{{ amendment.old.voucher.beat }}</td><td>{{ amendment.new.voucher.beat }}</td></tr>
+    <tr><td>Salesman</td><td>{{ amendment.old.voucher.salesman }}</td><td>{{ amendment.new.voucher.salesman }}</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3 class="group-heading">Installments Before</h3>
+{% if amendment.old.installments %}
+<table class="data-table">
+  <thead><tr><th>Date</th><th class="num">Amount</th><th>Salesman</th></tr></thead>
+  <tbody>
+    {% for i in amendment.old.installments %}
+    <tr><td>{{ i.date }}</td><td class="num mono">{{ i.amount }}</td><td>{{ i.salesman }}</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">None.</p>
+{% endif %}
+
+<h3 class="group-heading">Installments After</h3>
+{% if amendment.new.installments %}
+<table class="data-table">
+  <thead><tr><th>Date</th><th class="num">Amount</th><th>Salesman</th></tr></thead>
+  <tbody>
+    {% for i in amendment.new.installments %}
+    <tr><td>{{ i.date }}</td><td class="num mono">{{ i.amount }}</td><td>{{ i.salesman }}</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p class="muted">None.</p>
+{% endif %}
+
+<a class="btn btn-secondary" href="/coll/amendments">Back</a>
+{% endblock %}

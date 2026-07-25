@@ -989,6 +989,102 @@ class TestApplyCorrectionRequest(DbTestCase):
             coll_orchestrate.apply_correction_request(cid, "archive", "dist")
 
 
+class TestAmendVoucher(DbTestCase):
+    """Orchestration around the store's atomic amendment: staged-field
+    refresh (balance/voucher_date/salesman, never beat)."""
+
+    def _seed(self, beat="beat1", salesman="sm1"):
+        self._insert_voucher("1", balance="80.00", beat=beat, salesman=salesman)
+        conn = coll_store.get_db()
+        try:
+            conn.execute("INSERT INTO beats (name, salesman) VALUES (?, ?)", (beat, salesman))
+            conn.execute(
+                "INSERT INTO users (name, role, password_hash) VALUES (?, 'salesman', '')",
+                (salesman,))
+            conn.execute(
+                "INSERT INTO installments (bill_no, date, amount, salesman, created_by, created_at)"
+                " VALUES ('1', '2026-01-01', '20.00', ?, 'app', 't')", (salesman,))
+            conn.commit()
+            inst_id = conn.execute("SELECT id FROM installments").fetchone()["id"]
+        finally:
+            conn.close()
+        snapshot = {"voucher": {"date": "2026-01-01", "amount": "100.00", "balance": "80.00",
+                                "beat": beat, "salesman": salesman},
+                    "installments": [{"id": inst_id, "date": "2026-01-01", "amount": "20.00",
+                                      "salesman": salesman}]}
+        report = {
+            "stages": {"start": "new", "submit": "", "post": ""},
+            "selection_type": "beat_salesman", "selection": [beat, salesman],
+            "vouchers": [{"bill_no": "1", "date": "2026-07-25", "voucher_date": "2026-01-01",
+                          "balance": "80.00", "payment": "", "beat": beat, "salesman": salesman}],
+        }
+        path = self._write_staging_json("coll-amendtest.json", report)
+        return snapshot, inst_id, path
+
+    def _add_salesman(self, name):
+        conn = coll_store.get_db()
+        conn.execute("INSERT INTO users (name, role, password_hash) VALUES (?, 'salesman', '')",
+                     (name,))
+        conn.commit()
+        conn.close()
+
+    def test_wrapper_returns_amendment_and_refreshes_staged_fields(self):
+        snapshot, inst_id, path = self._seed()
+        self._add_salesman("sm2")
+        new_state = {"voucher": {"date": "2026-02-01", "amount": "150.00",
+                                 "beat": "beat1", "salesman": "sm2"},
+                    "installments": [{"id": inst_id, "date": "2026-01-01",
+                                      "amount": "20.00", "salesman": "sm1"}]}
+        amd = coll_orchestrate.amend_voucher("1", snapshot, new_state, "dist", note="fixed")
+        self.assertEqual((amd["bill_no"], amd["amended_by"]), ("1", "dist"))
+        rows = self._query("SELECT amount, balance, salesman FROM vouchers WHERE bill_no = '1'")
+        self.assertEqual(rows[0], {"amount": "150.00", "balance": "130.00", "salesman": "sm2"})
+        staged = json.loads(path.read_text(encoding="utf-8"))
+        v = staged["vouchers"][0]
+        self.assertEqual((v["balance"], v["voucher_date"], v["salesman"]),
+                         ("130.00", "2026-02-01", "sm2"))
+        self.assertTrue(path.with_suffix(".txt").exists())
+
+    def test_beat_not_refreshed_in_staged_report(self):
+        snapshot, inst_id, path = self._seed()
+        conn = coll_store.get_db()
+        conn.execute("INSERT INTO beats (name, salesman) VALUES ('beat2', 'sm1')")
+        conn.commit()
+        conn.close()
+        new_state = {"voucher": {"date": "2026-01-01", "amount": "100.00",
+                                 "beat": "beat2", "salesman": "sm1"},
+                    "installments": [{"id": inst_id, "date": "2026-01-01",
+                                      "amount": "20.00", "salesman": "sm1"}]}
+        coll_orchestrate.amend_voucher("1", snapshot, new_state, "dist")
+        self.assertEqual(self._query("SELECT beat FROM vouchers WHERE bill_no = '1'")[0]["beat"],
+                         "beat2")  # master DID change
+        staged = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(staged["vouchers"][0]["beat"], "beat1")  # staged report untouched
+
+    def test_no_active_report_is_not_an_error(self):
+        self._insert_voucher("1", balance="100.00")
+        conn = coll_store.get_db()
+        conn.execute("INSERT INTO beats (name, salesman) VALUES ('beat1', 'sm1')")
+        conn.commit()
+        conn.close()
+        self._add_salesman("sm1")
+        snapshot = {"voucher": {"date": "2026-01-01", "amount": "100.00", "balance": "100.00",
+                                "beat": "beat1", "salesman": "sm1"}, "installments": []}
+        new_state = {"voucher": {"date": "2026-01-01", "amount": "120.00",
+                                 "beat": "beat1", "salesman": "sm1"}, "installments": []}
+        amd = coll_orchestrate.amend_voucher("1", snapshot, new_state, "dist")
+        self.assertEqual(amd["bill_no"], "1")
+
+    def test_conflict_propagates_and_nothing_is_staged_refreshed(self):
+        snapshot, inst_id, path = self._seed()
+        stale = {**snapshot, "voucher": {**snapshot["voucher"], "balance": "999.00"}}
+        new_state = {"voucher": stale["voucher"], "installments": stale["installments"]}
+        with self.assertRaises(coll_store.AmendmentConflict):
+            coll_orchestrate.amend_voucher("1", stale, new_state, "dist")
+        staged = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(staged["vouchers"][0]["balance"], "80.00")
+
+
 class TestCollectionCorrectionApply(DbTestCase):
     """collection_amount corrections edit the STAGED report (payment), not
     master data — with sidecar + TXT kept in sync and stage/snapshot guards."""

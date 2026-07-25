@@ -427,6 +427,8 @@ input.pay-input {
 }
 .summary-total { font-size: 1rem; }
 
+.balance-preview.negative { color: var(--red); font-weight: 700; }
+
 /* ---- Groups / picks ---- */
 .group-heading {
   font-size: 1rem;
@@ -687,4 +689,39 @@ input.pay-input {
      above; restore it so the voucher-detail toggle can collapse rows.
      Must stay after the grid rule (equal specificity, source order wins). */
   .stack-table tbody tr[hidden] { display: none; }
+
+  /* Voucher Amendment installment grid (Date/Amount/Salesman/Delete): its
+     own mapping, not .stack-table — that class's nth-child rules above are
+     tuned for the 6-col voucher/payment tables' bill/date/amt/total/bal/pay
+     shape and would misplace a differently-shaped 4-col editable grid. Same
+     data-label labeling technique, scoped to its own class instead. */
+  .amend-inst-table thead { display: none; }
+  .amend-inst-table, .amend-inst-table tbody,
+  .amend-inst-table tr, .amend-inst-table td { display: block; width: 100%; }
+  .amend-inst-table { border: none; box-shadow: none; background: transparent; }
+  .amend-inst-table tr {
+    background: #fff;
+    border: 1px solid var(--gray-200);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 0.4rem 0.65rem;
+    margin-bottom: 0.4rem;
+  }
+  .amend-inst-table td { border-bottom: none; padding: 3px 0; }
+  .amend-inst-table td[data-label] {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+  }
+  .amend-inst-table td[data-label]::before {
+    content: attr(data-label);
+    flex-shrink: 0;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    color: var(--gray-600);
+  }
+  .amend-inst-table input, .amend-inst-table select { max-width: 60%; }
 }

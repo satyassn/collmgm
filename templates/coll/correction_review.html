@@ -67,6 +67,7 @@
 
 {% if corr.status == 'open' and can_apply %}
 <form method="post" action="/coll/corrections/{{ corr.id }}" class="card">
+  <input type="hidden" name="next" value="{{ back }}">
   <label class="field-label">Resolution note (optional)
     <textarea name="resolution_note" rows="2" maxlength="500"></textarea>
   </label>
@@ -75,12 +76,12 @@
             onclick="return confirm('Apply this correction to master data?')">Apply</button>
     <button type="submit" name="action" value="reject" class="btn btn-danger"
             onclick="return confirm('Reject this correction request?')">Reject</button>
-    <a class="btn btn-secondary" href="/coll/corrections">Back</a>
+    <a class="btn btn-secondary" href="{{ back }}">Back</a>
   </div>
 </form>
 {% else %}
 <div class="action-row">
-  <a class="btn btn-secondary" href="/coll/corrections">Back</a>
+  <a class="btn btn-secondary" href="{{ back }}">Back</a>
 </div>
 {% endif %}
 {% endblock %}
