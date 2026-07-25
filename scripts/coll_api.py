@@ -6,6 +6,7 @@ Run via:  run_server.bat
        or uvicorn scripts.coll_api:app --host 0.0.0.0 --port 8100 --reload
 """
 
+import json
 import re
 import secrets
 import sys
@@ -31,9 +32,11 @@ from coll_orchestrate import (
     compute_payment_dates, record_submit_payments, validate_payment,
     validate_staged_report, format_submit_validation_errors,
     post_confirmed_report, return_post_stage,
+    amend_voucher,
 )
 from coll_store import (
     STAGING_DIR,
+    AmendmentConflict,
     CorrectionConflict,
     _load_installments,
     _load_pending_start_reports,
@@ -44,6 +47,8 @@ from coll_store import (
     ensure_db,
     insert_correction,
     list_staging_reports,
+    load_amendment,
+    load_amendments,
     load_correction,
     load_corrections,
     load_permissions,
@@ -1236,7 +1241,7 @@ def coll_corrections(request: Request):
 
 
 @app.get("/coll/corrections/{cid}", response_class=HTMLResponse)
-def coll_correction_review(request: Request, cid: int):
+def coll_correction_review(request: Request, cid: int, next: str = ""):
     user, err = _require(request, "raise_correction")
     if err:
         return err
@@ -1252,21 +1257,26 @@ def coll_correction_review(request: Request, cid: int):
         _, _, sv = _find_active_report_for_bill(corr["bill_no"])
         if sv is not None:
             staged_payment = (sv.get("payment") or "").strip()
+    # `next` lets a caller other than the Correction Requests list (e.g. the
+    # amend gate below) send the distributor back to itself once resolved.
+    back = _safe_from(next) if next else "/coll/corrections"
     return _tmpl("coll/correction_review.html", request, user=user,
                  corr=corr, voucher=voucher, installments=installments,
-                 staged_payment=staged_payment,
+                 staged_payment=staged_payment, back=back,
                  kinds=_KIND_LABELS, can_apply=_can_act_on(corr, user))
 
 
 @app.post("/coll/corrections/{cid}", response_class=HTMLResponse)
 def coll_correction_action(request: Request, cid: int,
                            action: str = Form(default=""),
-                           resolution_note: str = Form(default="")):
+                           resolution_note: str = Form(default=""),
+                           next: str = Form(default="/coll/corrections")):
     # Resolution authority is per kind (_can_act_on), not one permission key:
     # supervisors may resolve collection_amount requests but not master kinds.
     user, err = _require(request)
     if err:
         return err
+    back = _safe_from(next)
     corr = load_correction(cid)
     if corr is None:
         return _tmpl("error.html", request, user=user, message="Correction request not found.")
@@ -1274,7 +1284,7 @@ def coll_correction_action(request: Request, cid: int,
         return _tmpl("error.html", request, user=user,
                      message="You don't have permission for this action.")
     if action not in ("apply", "reject"):
-        return _r("/coll/corrections")
+        return _r(back)
     try:
         apply_correction_request(cid, action, user.name, resolution_note.strip())
     except CorrectionConflict as e:
@@ -1285,7 +1295,217 @@ def coll_correction_action(request: Request, cid: int,
             if corr["kind"] == "collection_amount"
             else "Correction applied — master data updated and staged balances refreshed.")
            if action == "apply" else "Correction rejected.")
-    return _tmpl("message.html", request, user=user, message=msg, back="/coll/corrections")
+    return _tmpl("message.html", request, user=user, message=msg, back=back)
+
+
+# ---------------------------------------------------------------------------
+# Voucher Amendment
+# ---------------------------------------------------------------------------
+
+def _load_amend_target(request, user, bill_no):
+    """Resolve an active (non-completed) voucher for amendment, or an error page."""
+    result = search_voucher(bill_no)
+    if result is None:
+        return None, _tmpl("error.html", request, user=user,
+                           message=f"No voucher found for: {bill_no.strip()}")
+    voucher, installments, is_completed = result
+    if is_completed:
+        return None, _tmpl("error.html", request, user=user,
+                           message="Completed vouchers cannot be amended.")
+    return (voucher, installments), None
+
+
+def _amend_snapshot(voucher, installments):
+    """The exact {voucher, installments} shape re-checked verbatim at apply
+    time (coll_store.apply_voucher_amendment) — round-trips through a hidden
+    form field, so it must carry only what that check compares."""
+    return {"voucher": {"date": voucher["date"], "amount": voucher["amount"],
+                        "balance": voucher["balance"], "beat": voucher["beat"],
+                        "salesman": voucher["salesman"]},
+           "installments": [{"id": i["id"], "date": i["date"], "amount": i["amount"],
+                             "salesman": i["salesman"]} for i in installments]}
+
+
+def _render_amend_form(request, user, bill_no, voucher, installments, snapshot, error=None):
+    try:
+        beats = load_beats()
+        salesmen = load_salesmen()
+    except Exception as e:
+        return _tmpl("error.html", request, user=user, message=str(e))
+    history = load_amendments(bill_no=bill_no, limit=10)
+    return _tmpl("coll/amend_form.html", request, user=user,
+                 bill_no=bill_no, voucher=voucher, installments=installments,
+                 beats=beats, salesmen=salesmen,
+                 snapshot_json=json.dumps(snapshot), history=history, error=error)
+
+
+@app.get("/coll/amend", response_class=HTMLResponse)
+def coll_amend_pick(request: Request, q: str = ""):
+    user, err = _require(request, "amend_voucher")
+    if err:
+        return err
+    error = None
+    if q.strip():
+        bill_no = q.strip()
+        result = search_voucher(bill_no)
+        if result is None:
+            error = f"No voucher found for: {bill_no}"
+        elif result[2]:
+            error = "Completed vouchers cannot be amended."
+        else:
+            return _r(f"/coll/amend/{bill_no}")
+    return _tmpl("coll/amend_pick.html", request, user=user, q=q, error=error)
+
+
+@app.get("/coll/amend/{bill_no}", response_class=HTMLResponse)
+def coll_amend_form(request: Request, bill_no: str):
+    user, err = _require(request, "amend_voucher")
+    if err:
+        return err
+    target, err = _load_amend_target(request, user, bill_no)
+    if err:
+        return err
+    voucher, installments = target
+
+    # Gate (iteration4 decision 4): every open MASTER-DATA correction on this
+    # bill must be resolved before the raw editor is reachable — an
+    # amendment could make its snapshot stale. collection_amount requests
+    # don't gate: they concern only this cycle's staged payment, which an
+    # amendment never touches. Bounce straight to the oldest one; the
+    # existing correction routes send the distributor back here via `next`.
+    opens = open_corrections_for_bills([bill_no]).get(bill_no, [])
+    blocking = [c for c in opens if c["kind"] in _MASTER_KIND_LABELS]
+    if blocking:
+        return _r(f"/coll/corrections/{blocking[0]['id']}?next=/coll/amend/{bill_no}")
+
+    snapshot = _amend_snapshot(voucher, installments)
+    return _render_amend_form(request, user, bill_no, voucher, installments, snapshot)
+
+
+@app.post("/coll/amend/{bill_no}", response_class=HTMLResponse)
+async def coll_amend_submit(request: Request, bill_no: str):
+    user, err = _require(request, "amend_voucher")
+    if err:
+        return err
+    target, err = _load_amend_target(request, user, bill_no)
+    if err:
+        return err
+    voucher, installments = target
+
+    form = await request.form()
+    snapshot_raw = form.get("snapshot", "")
+    try:
+        snapshot = json.loads(snapshot_raw)
+    except (ValueError, TypeError):
+        return _render_amend_form(
+            request, user, bill_no, voucher, installments,
+            _amend_snapshot(voucher, installments),
+            error="Could not read the loaded form state — reload and try again.")
+
+    try:
+        beats_list = load_beats()
+        salesmen_list = load_salesmen()
+    except Exception as e:
+        return _tmpl("error.html", request, user=user, message=str(e))
+
+    v_date_raw = (form.get("v_date") or "").strip()
+    v_amount_raw = (form.get("v_amount") or "").strip()
+    v_beat = (form.get("v_beat") or "").strip()
+    v_salesman = (form.get("v_salesman") or "").strip()
+    note = (form.get("note") or "").strip()
+
+    # Row encoding: one token per installment row (existing rows: the
+    # installment's own id; new rows added client-side: new1, new2, ...).
+    # Fields are named by that token, so a variable row count round-trips
+    # without parallel-array misalignment.
+    submitted_installments = []
+    for k in form.getlist("inst_row"):
+        submitted_installments.append({
+            "id": int(k) if k.isdigit() else None,
+            "token": k,  # preserves the field-name suffix across an error re-render
+            "date": (form.get(f"inst_date_{k}") or "").strip(),
+            "amount": (form.get(f"inst_amount_{k}") or "").strip(),
+            "salesman": (form.get(f"inst_salesman_{k}") or "").strip(),
+            "_deleted": bool(form.get(f"inst_delete_{k}")),
+        })
+    submitted_voucher = {**voucher, "date": v_date_raw, "amount": v_amount_raw,
+                         "beat": v_beat, "salesman": v_salesman}
+
+    def rerender(error):
+        return _render_amend_form(request, user, bill_no, submitted_voucher,
+                                  submitted_installments, snapshot, error=error)
+
+    v_date = _valid_past_date(v_date_raw)
+    if v_date is None:
+        return rerender("Voucher date is required and cannot be in the future.")
+    v_amount = _valid_amount(v_amount_raw)
+    if v_amount is None:
+        return rerender("Voucher amount must be a positive number.")
+    if v_beat not in beats_list:
+        return rerender(f"Unknown beat: {v_beat}")
+    if v_salesman not in salesmen_list:
+        return rerender(f"Unknown salesman: {v_salesman}")
+
+    new_installments = []
+    for row in submitted_installments:
+        if row["_deleted"]:
+            continue
+        rdate = _valid_past_date(row["date"])
+        if rdate is None:
+            return rerender("Every installment needs a valid, non-future date.")
+        ramount = _valid_amount(row["amount"])
+        if ramount is None:
+            return rerender("Every installment amount must be a positive number.")
+        if row["salesman"] not in salesmen_list:
+            return rerender(f"Unknown salesman on an installment: {row['salesman']}")
+        new_installments.append({"id": row["id"], "date": rdate, "amount": ramount,
+                                 "salesman": row["salesman"]})
+
+    new_state = {"voucher": {"date": v_date, "amount": v_amount,
+                             "beat": v_beat, "salesman": v_salesman},
+                "installments": new_installments}
+
+    try:
+        amendment = amend_voucher(bill_no, snapshot, new_state, user.name, note)
+    except AmendmentConflict:
+        fresh = search_voucher(bill_no)
+        if fresh is None or fresh[2]:
+            return _tmpl("error.html", request, user=user,
+                         message="This voucher changed while you were editing and is"
+                                 " no longer available for amendment.")
+        fresh_voucher, fresh_installments, _completed = fresh
+        return _render_amend_form(
+            request, user, bill_no, fresh_voucher, fresh_installments,
+            _amend_snapshot(fresh_voucher, fresh_installments),
+            error="This voucher changed while you were editing — showing the current"
+                  " data below; please re-enter your changes.")
+    except ValueError as e:
+        return rerender(str(e))
+
+    balance = amendment["new"]["voucher"]["balance"]
+    return _tmpl("message.html", request, user=user,
+                 message=f"Amendment applied — new balance {balance}.",
+                 back="/coll/amend")
+
+
+@app.get("/coll/amendments", response_class=HTMLResponse)
+def coll_amendments(request: Request):
+    user, err = _require(request, "amend_voucher")
+    if err:
+        return err
+    history = load_amendments(limit=50)
+    return _tmpl("coll/amendments.html", request, user=user, history=history)
+
+
+@app.get("/coll/amendments/{aid}", response_class=HTMLResponse)
+def coll_amendment_review(request: Request, aid: int):
+    user, err = _require(request, "amend_voucher")
+    if err:
+        return err
+    amendment = load_amendment(aid)
+    if amendment is None:
+        return _tmpl("error.html", request, user=user, message="Amendment not found.")
+    return _tmpl("coll/amendment_review.html", request, user=user, amendment=amendment)
 
 
 # ---------------------------------------------------------------------------

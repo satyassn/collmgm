@@ -27,3 +27,4 @@ distributor,manage_users
 distributor,manage_beats
 distributor,raise_correction
 distributor,apply_correction
+distributor,amend_voucher

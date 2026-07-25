@@ -53,6 +53,32 @@ TL;DR: Define a proof-of-concept data schema, validation rules, and operational 
     distributor) — or by Return-to-salesman, which auto-settles the request
     when the resubmitted payment matches the requested value.
 
+- `amendments` (SQLite only, no CSV counterpart — added iteration4 with
+  explicit approval)
+  - columns: `id` (INTEGER PK AUTOINCREMENT), `bill_no`, `old_json` / `new_json`
+    (full before/after `{"voucher": {...}, "installments": [...]}` state, not
+    a per-field diff), `note`, `amended_by`, `amended_at`.
+  - Purpose: the distributor's raw, single-voucher editor ("Amend Voucher") —
+    all voucher fields (`date`/`amount`/`beat`/`salesman`; `bill_no` is the
+    immutable PK) plus full control of that voucher's installments (edit,
+    delete, add), submitted as one atomic transaction. No `status` column:
+    unlike `corrections` there is no separate raise→review lifecycle — a row
+    exists iff the edit committed, written inside the same transaction as the
+    master change, and it IS the audit trail (rows are never deleted).
+    Committing re-checks a load-time snapshot (`AmendmentConflict` on drift,
+    mirroring `CorrectionConflict`), validates every field, mutates, and
+    recomputes the balance (`amount − SUM(installments)`, negative refused —
+    same `_recompute_voucher_balance` corrections use).
+  - Gate: `GET /coll/amend/{bill_no}` refuses to render the editor while any
+    open **master-data** correction (`installment_amount` / `installment_delete`
+    / `installment_add` / `voucher_amount`) exists on that bill — it redirects
+    straight to that correction's review page instead, since an amendment
+    could make its snapshot stale. An open `collection_amount` request does
+    not gate (it concerns only the current cycle's staged payment, which an
+    amendment never touches).
+  - Permission key: `amend_voucher` (distributor only) gates the menu card,
+    every `/coll/amend*` route, and the amendment history screens.
+
 - CSV conventions (applies to all files):
   - Delimiter: comma `,`.
   - Header row required; UTF-8 encoded.

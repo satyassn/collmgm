@@ -45,6 +45,12 @@
       <span>Correction Requests</span>
     </a>
   {% endif %}
+  {% if "amend_voucher" in perms %}
+    <a class="menu-card" href="/coll/amend">
+      <span class="menu-icon">&#9998;</span>
+      <span>Amend Voucher</span>
+    </a>
+  {% endif %}
   <a class="menu-card" href="/reports">
     <span class="menu-icon">&#128202;</span>
     <span>Reports</span>

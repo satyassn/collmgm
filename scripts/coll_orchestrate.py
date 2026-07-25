@@ -31,6 +31,7 @@ from coll_store import (
     apply_installment_correction, resolve_correction,
     mark_correction_applied, open_corrections_for_bills,
     CorrectionConflict, load_correction,
+    apply_voucher_amendment,
 )
 
 
@@ -641,15 +642,20 @@ def return_post_stage(report_path, report_data):
 # Correction requests
 # ---------------------------------------------------------------------------
 
-def _refresh_staged_balances(bill_no):
-    """After a correction changed master data, refresh the staged display
-    balance for `bill_no` in every active staging report (and regenerate the
-    TXT sidecar to match).
+def _refresh_staged_voucher_fields(bill_no):
+    """After a correction or amendment changed master data, refresh the
+    staged display fields for `bill_no` in every active staging report (and
+    regenerate the TXT sidecar to match): `balance`, `voucher_date`, and
+    `salesman`.
 
     Display-only: validation always reads CURRENT master balance, so a crash
-    between the atomic DB apply and this refresh merely leaves a stale number
+    between the atomic DB apply and this refresh merely leaves stale numbers
     on screen — nothing wrong can be approved or posted. Hence best-effort
-    per report.
+    per report. Deliberately NOT `beat`: the report's identity IS its beat
+    selection (beat lock, TXT header) — a beat change applies starting with
+    the next generated list, not retroactively to reports already in flight.
+    Also NOT `payment`/`payment_date` — those are the salesman's own staged
+    entry for this cycle, untouched by a master-data change.
     """
     row = load_vouchers_by_bill_nos([bill_no]).get(bill_no)
     if row is None:
@@ -664,6 +670,8 @@ def _refresh_staged_balances(bill_no):
         for v in vouchers:
             if isinstance(v, dict) and v.get("bill_no") == bill_no:
                 v["balance"] = row["balance"]
+                v["voucher_date"] = row["date"]
+                v["salesman"] = row["salesman"]
                 hit = True
         if not hit:
             continue
@@ -819,9 +827,31 @@ def apply_correction_request(corr_id, action, resolved_by, resolution_note=None)
         if corr["kind"] == "collection_amount":
             return _apply_collection_correction(corr, resolved_by, resolution_note)
         corr = apply_installment_correction(corr_id, resolved_by, resolution_note or "")
-        _refresh_staged_balances(corr["bill_no"])
+        _refresh_staged_voucher_fields(corr["bill_no"])
         return corr
     if action in ("reject", "withdraw"):
         return resolve_correction(corr_id, "rejected" if action == "reject" else "withdrawn",
                                   resolved_by, resolution_note or "")
     raise ValueError(f"unknown correction action {action!r}")
+
+
+def amend_voucher(bill_no, snapshot, new_state, amended_by, note=""):
+    """Apply a distributor raw edit of one voucher + its installments, then
+    refresh the staged display fields everywhere it's currently in flight.
+
+    Thin wrapper: coll_store.apply_voucher_amendment does the atomic
+    master-data change + audit write; this only adds the same staged-refresh
+    step apply_correction_request already does for corrections, so both
+    master-data write paths keep staging displays in sync the same way. No
+    stage-based block, same rationale as apply_correction_request:
+    validate_staged_report/post always re-read CURRENT master, so an
+    amendment that invalidates a staged payment is caught there and remedied
+    by the existing Return flow.
+
+    Returns the new amendment dict. Raises ValueError (missing voucher, bad
+    field, negative balance) or coll_store.AmendmentConflict (load-time
+    snapshot went stale).
+    """
+    amendment = apply_voucher_amendment(bill_no, snapshot, new_state, amended_by, note or "")
+    _refresh_staged_voucher_fields(bill_no)
+    return amendment

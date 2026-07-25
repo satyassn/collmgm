@@ -50,6 +50,8 @@ Five sequential steps per beat:
 
 **Correction requests (web-only, iteration3):** during an approval review a supervisor may raise a structured correction (plus a free-text note). Requests live in the SQLite `corrections` table (see `schema.md`). Which kinds are raiseable is stage-restricted: the **Approve Collection List** review offers the four master-data kinds (`installment_amount` / `installment_delete` / `installment_add` / `voucher_amount` — resolved only by the distributor; Apply = atomic master change + balance recompute); the **Approve Collections** review offers only `collection_amount` (this cycle's staged payment — resolved by supervisor OR distributor via `coll_approve_submit`, or by Return-to-salesman, which auto-settles the request when the resubmitted payment matches). An **open** request blocks web approval of any staging report containing that `bill_no` (and disables that voucher's verification checkbox); **applied** requests stay listed on the Correction Requests screen — linking to the workflow they gate — until that report posts or is cancelled (derived at render time, nothing stored). The CLI ignores corrections entirely.
 
+**Voucher Amendment (web-only, iteration4):** the distributor's raw, single-voucher editor ("Amend Voucher") — all voucher fields plus full control of that voucher's installments (edit/delete/add), submitted as one atomic transaction with an optimistic-concurrency snapshot check (`AmendmentConflict`) and balance reconciliation. Audited in the SQLite `amendments` table (see `schema.md`) — every applied edit is a permanent before/after record, no approval step. **Gate:** the editor refuses to open while any open master-data correction exists on the bill (redirects to that correction's review page instead, since an amendment could invalidate its snapshot); an open `collection_amount` request does not gate. **Revalidation/Return safety:** amending a voucher mid-flight in an active staging report is allowed — no stage-based block — because `validate_staged_report` and posting always re-check every payment against CURRENT master data, so an amendment that invalidates a staged payment surfaces there and is remedied by the existing Return flow, exactly like corrections. **Staged-display refresh caveat:** an applied amendment refreshes the staged `balance`/`voucher_date`/`salesman` display fields in any report that currently holds the bill, but deliberately **not** `beat` — the report's identity is its beat selection (beat lock, TXT header), so a beat change only takes effect starting with the next generated list. The CLI ignores amendments entirely.
+
 ### Report JSON schema (staging)
 
 ```json
@@ -88,7 +90,7 @@ staging/              — active collection reports (JSON + TXT pairs)
 archive/              — finalized collection reports (JSON + TXT pairs)
 ```
 
-Master data actually lives in `data/collmgm.db` (SQLite; CSVs are the schema source of truth and first-run seed). The DB additionally holds `permissions` and the `corrections` table (correction requests + audit trail — no CSV counterpart; see `schema.md`).
+Master data actually lives in `data/collmgm.db` (SQLite; CSVs are the schema source of truth and first-run seed). The DB additionally holds `permissions`, the `corrections` table (correction requests + audit trail), and the `amendments` table (Voucher Amendment audit trail) — neither has a CSV counterpart; see `schema.md`.
 
 CSV conventions: comma delimiter, UTF-8, ISO 8601 dates, `Decimal` for amounts (never float).
 

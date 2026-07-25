@@ -1343,6 +1343,333 @@ class TestCorrections(ApiTestCase):
                                    "from": self.from_path})
         self.assertEqual(coll_store.load_correction(cid)["status"], "withdrawn")
 
+    # -- `next` passthrough (iteration4 decision 4: lets the amend gate send
+    #    the distributor back to itself once a blocking correction resolves)
+
+    def test_next_param_round_trips_through_resolution(self):
+        sup = self._login("sup", "pwS")
+        self._raise_voucher_amount(sup)
+        cid = self._corrections()[0]["id"]
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, f"/coll/corrections/{cid}?next=/coll/amend/900")
+        self.assertIn('href="/coll/amend/900"', body)
+        status, body = self._post(dist, f"/coll/corrections/{cid}",
+                                  {"action": "apply", "next": "/coll/amend/900"})
+        self.assertIn("Correction applied", body)
+        self.assertIn('href="/coll/amend/900"', body)
+
+    def test_next_defaults_to_corrections_list(self):
+        sup = self._login("sup", "pwS")
+        self._raise_voucher_amount(sup)
+        cid = self._corrections()[0]["id"]
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, f"/coll/corrections/{cid}")
+        self.assertIn('href="/coll/corrections"', body)
+
+    def test_next_falls_back_safely_for_off_site_value(self):
+        sup = self._login("sup", "pwS")
+        self._raise_voucher_amount(sup)
+        cid = self._corrections()[0]["id"]
+        dist = self._login("dist", "pwD")
+        status, body = self._post(dist, f"/coll/corrections/{cid}",
+                                  {"action": "apply", "next": "https://evil.example/"})
+        self.assertIn('href="/menu"', body)
+
+
+# ---------------------------------------------------------------------------
+# Voucher Amendment (iteration4): distributor-only raw editor, gated on any
+# open master-data correction for the bill.
+# ---------------------------------------------------------------------------
+
+class TestAmendVoucher(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self._add_user("dist", "distributor", "pwD")
+        self._add_user("sup", "supervisor", "pwS")
+        self._add_user("smA", "salesman", "pwA")
+        self._add_user("smB", "salesman", "pwB")
+        self._add_beat("beatA", "smA")
+        self._add_beat("beatB", "smB")
+        self._seed_voucher("900", "beatA", "smA", amount="100.00", balance="80.00")
+        self.inst_id = self._add_installment("900", amount="20.00", salesman="smA")
+
+    def _seed_voucher(self, bill_no, beat, salesman, amount, balance):
+        conn = coll_store.get_db()
+        try:
+            conn.execute(
+                "INSERT INTO vouchers (bill_no, date, amount, balance, beat, salesman,"
+                " created_by, created_at) VALUES (?, '2026-01-01', ?, ?, ?, ?, 'test', 't')",
+                (bill_no, amount, balance, beat, salesman))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _add_installment(self, bill_no, date="2026-01-01", amount="20.00", salesman="smA"):
+        conn = coll_store.get_db()
+        try:
+            cur = conn.execute(
+                "INSERT INTO installments (bill_no, date, amount, salesman, created_by, created_at)"
+                " VALUES (?, ?, ?, ?, 'test', 't')", (bill_no, date, amount, salesman))
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+    def _snapshot(self, bill_no):
+        conn = coll_store.get_db()
+        try:
+            v = dict(conn.execute(
+                "SELECT date, amount, balance, beat, salesman FROM vouchers WHERE bill_no = ?",
+                (bill_no,)).fetchone())
+            insts = [dict(r) for r in conn.execute(
+                "SELECT id, date, amount, salesman FROM installments WHERE bill_no = ?"
+                " ORDER BY id", (bill_no,))]
+        finally:
+            conn.close()
+        return {"voucher": v, "installments": insts}
+
+    def _post_amend(self, opener, bill_no, snapshot, voucher, installments, note=""):
+        data = [("v_date", voucher["date"]), ("v_amount", voucher["amount"]),
+                ("v_beat", voucher["beat"]), ("v_salesman", voucher["salesman"]),
+                ("note", note), ("snapshot", json.dumps(snapshot))]
+        for row in installments:
+            token = str(row["id"]) if row.get("id") is not None else row["token"]
+            data.append(("inst_row", token))
+            data.append((f"inst_date_{token}", row["date"]))
+            data.append((f"inst_amount_{token}", row["amount"]))
+            data.append((f"inst_salesman_{token}", row["salesman"]))
+            if row.get("delete"):
+                data.append((f"inst_delete_{token}", "on"))
+        return self._post(opener, f"/coll/amend/{bill_no}", data)
+
+    def _raise_voucher_amount(self, opener, from_path, new_amount="120.00"):
+        return self._post(opener, "/coll/correct/900",
+                          {"action": "raise", "kind": "voucher_amount",
+                           "new_amount": new_amount, "note": "n", "from": from_path})
+
+    # -- basic access / rendering --
+
+    def test_menu_card_distributor_only(self):
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, "/menu")
+        self.assertIn("Amend Voucher", body)
+        sup = self._login("sup", "pwS")
+        status, body = self._get(sup, "/menu")
+        self.assertNotIn("Amend Voucher", body)
+
+    def test_other_roles_refused(self):
+        for name, pw in (("sup", "pwS"), ("smA", "pwA")):
+            opener = self._login(name, pw)
+            status, body = self._get(opener, "/coll/amend")
+            self.assertIn("permission", body)
+            status, body = self._get(opener, "/coll/amend/900")
+            self.assertIn("permission", body)
+            status, body = self._post(opener, "/coll/amend/900", {})
+            self.assertIn("permission", body)
+
+    def test_form_renders_fields_and_history(self):
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, "/coll/amend/900")
+        self.assertEqual(status, 200)
+        self.assertIn("Voucher Amendment", body)
+        self.assertIn('value="100.00"', body)
+        self.assertIn('value="20.00"', body)
+        self.assertIn(f'name="inst_date_{self.inst_id}"', body)
+        self.assertIn("beatA", body)
+        self.assertIn("smA", body)
+        self.assertIn('name="snapshot"', body)
+
+    def test_unknown_bill_refused(self):
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, "/coll/amend/nosuch")
+        self.assertIn("No voucher found", body)
+
+    def test_completed_voucher_refused(self):
+        conn = coll_store.get_db()
+        conn.execute(
+            "INSERT INTO completed_vouchers (bill_no, date, amount, balance, beat, salesman,"
+            " created_by, created_at) VALUES"
+            " ('901', '2026-01-01', '50.00', '0.00', 'beatA', 'smA', 't', 't')")
+        conn.commit()
+        conn.close()
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, "/coll/amend/901")
+        self.assertIn("cannot be amended", body)
+
+    # -- happy path + staged refresh --
+
+    def test_post_happy_path_updates_master_and_staged(self):
+        stem = "coll20260101-beat_salesman-beatA_smA"
+        report_path = self._write_staging_report(
+            stem, "beatA", "smA", start="confirmed", submit="",
+            vouchers=[{"bill_no": "900", "date": "2026-01-01", "balance": "80.00",
+                       "payment": "", "payment_date": "", "beat": "beatA", "salesman": "smA"}])
+        dist = self._login("dist", "pwD")
+        snap = self._snapshot("900")
+        voucher = {"date": "2026-02-01", "amount": "150.00", "beat": "beatB", "salesman": "smB"}
+        installments = [{"id": self.inst_id, "date": "2026-01-01",
+                         "amount": "20.00", "salesman": "smA"}]
+        status, body = self._post_amend(dist, "900", snap, voucher, installments, note="fixed")
+        self.assertIn("Amendment applied", body)
+        conn = coll_store.get_db()
+        row = dict(conn.execute(
+            "SELECT amount, balance, beat, salesman FROM vouchers WHERE bill_no = '900'"
+        ).fetchone())
+        conn.close()
+        self.assertEqual(row, {"amount": "150.00", "balance": "130.00",
+                               "beat": "beatB", "salesman": "smB"})
+        staged = json.loads(report_path.read_text(encoding="utf-8"))
+        v = staged["vouchers"][0]
+        self.assertEqual(v["balance"], "130.00")
+        self.assertEqual(v["salesman"], "smB")
+        self.assertEqual(v["beat"], "beatA")  # NOT refreshed — decision 7
+        amds = coll_store.load_amendments(bill_no="900")
+        self.assertEqual(len(amds), 1)
+        self.assertEqual(amds[0]["note"], "fixed")
+
+    def test_validation_failure_preserves_submitted_values(self):
+        dist = self._login("dist", "pwD")
+        snap = self._snapshot("900")
+        voucher = {"date": "2026-02-01", "amount": "not-a-number",
+                  "beat": "beatA", "salesman": "smA"}
+        installments = [{"id": self.inst_id, "date": "2026-01-01",
+                         "amount": "20.00", "salesman": "smA"}]
+        status, body = self._post_amend(dist, "900", snap, voucher, installments)
+        self.assertIn("must be a positive number", body)
+        self.assertIn('value="not-a-number"', body)
+        self.assertEqual(coll_store.load_amendments(bill_no="900"), [])
+
+    def test_unknown_beat_rejected(self):
+        dist = self._login("dist", "pwD")
+        snap = self._snapshot("900")
+        voucher = {"date": "2026-02-01", "amount": "100.00",
+                  "beat": "nosuchbeat", "salesman": "smA"}
+        installments = [{"id": self.inst_id, "date": "2026-01-01",
+                         "amount": "20.00", "salesman": "smA"}]
+        status, body = self._post_amend(dist, "900", snap, voucher, installments)
+        self.assertIn("Unknown beat", body)
+        self.assertEqual(coll_store.load_amendments(bill_no="900"), [])
+
+    def test_conflict_reloads_current_data(self):
+        dist = self._login("dist", "pwD")
+        snap = self._snapshot("900")
+        conn = coll_store.get_db()
+        conn.execute("UPDATE vouchers SET amount = '999.00', balance = '979.00'"
+                    " WHERE bill_no = '900'")
+        conn.commit()
+        conn.close()
+        voucher = {"date": "2026-01-01", "amount": "100.00", "beat": "beatA", "salesman": "smA"}
+        installments = [{"id": self.inst_id, "date": "2026-01-01",
+                         "amount": "20.00", "salesman": "smA"}]
+        status, body = self._post_amend(dist, "900", snap, voucher, installments)
+        self.assertIn("changed while you were editing", body)
+        self.assertIn('value="999.00"', body)
+        self.assertEqual(coll_store.load_amendments(bill_no="900"), [])
+
+    def test_combined_add_delete_edit_via_tokens(self):
+        second_id = self._add_installment("900", amount="15.00", salesman="smA")
+        dist = self._login("dist", "pwD")
+        snap = self._snapshot("900")
+        voucher = {"date": "2026-01-01", "amount": "100.00", "beat": "beatA", "salesman": "smA"}
+        installments = [
+            {"id": self.inst_id, "date": "2026-01-01", "amount": "35.00", "salesman": "smA"},
+            {"id": second_id, "date": "2026-01-01", "amount": "15.00",
+             "salesman": "smA", "delete": True},
+            {"id": None, "token": "new1", "date": "2026-01-05",
+             "amount": "10.00", "salesman": "smA"},
+        ]
+        status, body = self._post_amend(dist, "900", snap, voucher, installments)
+        self.assertIn("Amendment applied", body)
+        conn = coll_store.get_db()
+        rows = {r["id"]: r["amount"] for r in conn.execute(
+            "SELECT id, amount FROM installments WHERE bill_no = '900'")}
+        conn.close()
+        self.assertNotIn(second_id, rows)
+        self.assertEqual(rows[self.inst_id], "35.00")
+        self.assertEqual(len(rows), 2)
+
+    # -- correction gate (decision 4) --
+
+    def test_amend_blocked_by_open_master_correction(self):
+        stem = "coll20260101-beat_salesman-beatA_smA"
+        self._write_staging_report(
+            stem, "beatA", "smA", start="new", submit="",
+            vouchers=[{"bill_no": "900", "date": "2026-01-01", "balance": "80.00",
+                       "payment": "", "payment_date": "", "beat": "beatA", "salesman": "smA"}])
+        sup = self._login("sup", "pwS")
+        self._raise_voucher_amount(sup, f"/coll/approve-start/{stem}")
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, "/coll/amend/900")
+        self.assertIn("Correction Request #", body)
+        self.assertNotIn('name="v_amount"', body)
+
+    def test_resolving_blocking_correction_unlocks_amend(self):
+        stem = "coll20260101-beat_salesman-beatA_smA"
+        self._write_staging_report(
+            stem, "beatA", "smA", start="new", submit="",
+            vouchers=[{"bill_no": "900", "date": "2026-01-01", "balance": "80.00",
+                       "payment": "", "payment_date": "", "beat": "beatA", "salesman": "smA"}])
+        sup = self._login("sup", "pwS")
+        self._raise_voucher_amount(sup, f"/coll/approve-start/{stem}")
+        cid = coll_store.load_corrections()[0]["id"]
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, "/coll/amend/900")
+        self.assertIn(f'action="/coll/corrections/{cid}"', body)
+        status, body = self._post(dist, f"/coll/corrections/{cid}",
+                                  {"action": "apply", "next": "/coll/amend/900"})
+        self.assertIn("Correction applied", body)
+        status, body = self._get(dist, "/coll/amend/900")
+        self.assertIn("Voucher Amendment", body)
+        self.assertIn('name="v_amount"', body)
+        self.assertNotIn("Correction Request #", body)
+
+    def test_two_open_corrections_resolve_one_then_other(self):
+        stem = "coll20260101-beat_salesman-beatA_smA"
+        self._write_staging_report(
+            stem, "beatA", "smA", start="new", submit="",
+            vouchers=[{"bill_no": "900", "date": "2026-01-01", "balance": "80.00",
+                       "payment": "", "payment_date": "", "beat": "beatA", "salesman": "smA"}])
+        sup = self._login("sup", "pwS")
+        self._raise_voucher_amount(sup, f"/coll/approve-start/{stem}", new_amount="120.00")
+        self._post(sup, "/coll/correct/900",
+                  {"action": "raise", "kind": "installment_amount",
+                   "installment_id": str(self.inst_id), "new_amount": "25.00",
+                   "from": f"/coll/approve-start/{stem}"})
+        corrs = coll_store.load_corrections()
+        self.assertEqual(len(corrs), 2)
+        first_id, second_id = sorted(c["id"] for c in corrs)
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, "/coll/amend/900")
+        self.assertIn(f'action="/coll/corrections/{first_id}"', body)
+        self._post(dist, f"/coll/corrections/{first_id}",
+                  {"action": "reject", "next": "/coll/amend/900"})
+        status, body = self._get(dist, "/coll/amend/900")
+        self.assertIn(f'action="/coll/corrections/{second_id}"', body)
+        self._post(dist, f"/coll/corrections/{second_id}",
+                  {"action": "reject", "next": "/coll/amend/900"})
+        status, body = self._get(dist, "/coll/amend/900")
+        self.assertIn("Voucher Amendment", body)
+        self.assertIn('name="v_amount"', body)
+
+    def test_collection_amount_correction_does_not_gate_amend(self):
+        stem = "coll20260101-beat_salesman-beatA_smA"
+        self._write_staging_report(
+            stem, "beatA", "smA", start="confirmed", submit="submitted",
+            vouchers=[{"bill_no": "900", "date": "2026-01-01", "balance": "80.00",
+                       "payment": "10.00", "payment_date": "2026-01-01",
+                       "beat": "beatA", "salesman": "smA"}])
+        sup = self._login("sup", "pwS")
+        self._post(sup, "/coll/correct/900",
+                  {"action": "raise", "kind": "collection_amount",
+                   "new_amount": "15.00", "note": "n",
+                   "from": f"/coll/approve-submit/{stem}"})
+        self.assertEqual(coll_store.load_corrections()[0]["kind"], "collection_amount")
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, "/coll/amend/900")
+        self.assertIn("Voucher Amendment", body)
+        self.assertIn('name="v_amount"', body)
+        self.assertNotIn("Correction Request #", body)
+
 
 # ---------------------------------------------------------------------------
 # Collection-amount corrections at Approve Collections: the only kind
