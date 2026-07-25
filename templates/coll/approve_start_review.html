@@ -4,7 +4,9 @@
 <h2 class="page-heading">Approve Collection List</h2>
 <p class="meta-line"><strong>Beat:</strong> {{ beat }} &nbsp;|&nbsp; <strong>Salesman:</strong> {{ salesman }} &nbsp;|&nbsp; <strong>Date:</strong> {{ data.get("date","") }}</p>
 
-<table class="data-table stack-table">
+{% if error %}<p class="alert alert-error">{{ error }}</p>{% endif %}
+
+<table class="data-table stack-table" data-accordion>
   <thead>
     <tr>
       <th>Bill No</th>
@@ -12,16 +14,25 @@
       <th class="num">Amount</th>
       <th class="num">Total Paid</th>
       <th class="num">Balance</th>
+      <th class="verify-col">Verified</th>
     </tr>
   </thead>
   <tbody>
     {% for v in vouchers %}
-    <tr>
-      <td class="mono"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
+    <tr data-bill="{{ v.bill_no }}"
+        class="{% if v.correction_open %}row-correction{% elif v.verified %}row-verified{% endif %}">
+      <td class="mono">
+        <a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}?correct=/coll/approve-start/{{ stem }}">{{ v.bill_no }}</a>
+        {% if v.correction_open %}<span class="badge badge-warn">Correction pending</span>
+        {% elif v.correction_applied %}<span class="badge badge-ok">Correction applied</span>{% endif %}
+      </td>
       <td>{{ v.get("voucher_date","") }}</td>
       <td class="num mono" data-label="Amt">{{ v.get("amount","") }}</td>
       <td class="num mono" data-label="Total">{{ v.get("total_paid","") }}</td>
       <td class="num mono" data-label="Bal">{{ v.balance }}</td>
+      <td class="verify-cell"><input type="checkbox" class="verify-box"
+          {% if v.verified %}checked{% endif %}{% if v.correction_open %} disabled{% endif %}
+          aria-label="Verified {{ v.bill_no }}"></td>
     </tr>
     {% endfor %}
   </tbody>
@@ -29,16 +40,172 @@
     <tr>
       <td colspan="4"><strong>Total ({{ vouchers|length }} vouchers)</strong></td>
       <td class="num mono"><strong>{{ total_balance }}</strong></td>
+      <td class="verify-cell"></td>
     </tr>
   </tfoot>
 </table>
 
+{% if open_corrections %}
+<p class="alert alert-warn">
+  {{ open_corrections }} correction request{{ 's' if open_corrections != 1 }} block{{ 's' if open_corrections == 1 }} approval —
+  <a href="/coll/corrections">View corrections</a>
+</p>
+{% endif %}
+
+<div class="summary-box verify-summary">
+  <span id="verify-progress">Verified {{ verified_count }} / {{ vouchers|length }}</span>
+  <label class="count-verify">
+    <input type="checkbox" id="count-verified"{% if count_verified %} checked{% endif %}>
+    Count matches physical bundle ({{ vouchers|length }})
+  </label>
+</div>
+<p class="alert alert-error" id="verify-error" hidden></p>
+
 <form method="post" action="/coll/approve-start/{{ stem }}" class="action-row action-row--sticky">
-  <button type="submit" name="action" value="approve" class="btn btn-primary">Approve</button>
+  <button type="submit" name="action" value="approve" class="btn btn-primary"
+          id="approve-btn"{% if not all_verified %} disabled{% endif %}>Approve</button>
   <button type="submit" name="action" value="return" class="btn btn-warning"
           onclick="return confirm('Return this list? Salesman must regenerate.')">Return</button>
   <button type="submit" name="action" value="cancel" class="btn btn-danger"
           onclick="return confirm('Cancel and delete this collection list?')">Cancel</button>
   <a class="btn btn-secondary" href="/coll/approve-start">Back</a>
 </form>
+
+<script>
+(function () {
+  var table = document.querySelector("table[data-accordion]");
+  if (!table) return;
+  var tbody = table.tBodies[0];
+  var countBox = document.getElementById("count-verified");
+  var approveBtn = document.getElementById("approve-btn");
+  var progress = document.getElementById("verify-progress");
+  var errorBox = document.getElementById("verify-error");
+  var totalRows = tbody.querySelectorAll(".verify-box").length;
+  var hasOpenCorrections = {{ 1 if open_corrections else 0 }};
+  var queue = Promise.resolve();  // serialize saves: one read-modify-write at a time
+
+  function voucherRows() {
+    return Array.prototype.filter.call(tbody.rows, function (r) {
+      return !r.classList.contains("voucher-detail-row");
+    });
+  }
+
+  function updateGate() {
+    var boxes = tbody.querySelectorAll(".verify-box");
+    var checked = tbody.querySelectorAll(".verify-box:checked").length;
+    progress.textContent = "Verified " + checked + " / " + totalRows;
+    approveBtn.disabled = !(checked === boxes.length && countBox.checked
+                            && !hasOpenCorrections);
+  }
+
+  function detailOf(row) {
+    var next = row.nextElementSibling;
+    return (next && next.classList.contains("voucher-detail-row")) ? next : null;
+  }
+
+  function activate(row) {
+    var prev = tbody.querySelector("tr.row-active");
+    if (prev && prev !== row) prev.classList.remove("row-active");
+    row.classList.add("row-active");
+    var detail = detailOf(row);
+    if (!detail || detail.hidden) {
+      var link = row.querySelector("a.voucher-link");
+      if (link) link.click();  // accordion mode closes any other open detail
+    }
+  }
+
+  function showError(msg) {
+    errorBox.textContent = msg;
+    errorBox.hidden = false;
+  }
+
+  function save(params, revert) {
+    queue = queue.then(function () {
+      return fetch("/coll/approve-start/{{ stem }}/verify", {
+        method: "POST",
+        credentials: "same-origin",
+        body: new URLSearchParams(params),
+      }).then(function (resp) {
+        if (resp.redirected) { window.location.href = resp.url; return; }
+        if (!resp.ok) {
+          revert();
+          updateGate();
+          showError(resp.status === 409
+            ? "This list is no longer awaiting approval — reload the page."
+            : "Could not save verification — check the connection and retry.");
+        }
+      }).catch(function () {
+        revert();
+        updateGate();
+        showError("Could not save verification — check the connection and retry.");
+      });
+    });
+  }
+
+  tbody.addEventListener("click", function (e) {
+    if (e.target.closest(".verify-cell")) return;   // checkbox taps never expand
+    var row = e.target.closest("tr");
+    if (!row || row.classList.contains("voucher-detail-row")) return;
+    if (e.target.closest("a.voucher-link")) {
+      // voucher_detail.js handles the toggle; just track the active row.
+      var prev = tbody.querySelector("tr.row-active");
+      if (prev && prev !== row) prev.classList.remove("row-active");
+      row.classList.add("row-active");
+      return;
+    }
+    activate(row);
+  });
+
+  tbody.addEventListener("change", function (e) {
+    var box = e.target.closest(".verify-box");
+    if (!box) return;
+    var row = box.closest("tr");
+    var on = box.checked;
+    errorBox.hidden = true;
+    row.classList.toggle("row-verified", on);
+    updateGate();
+    save({ bill_no: row.dataset.bill, verified: on ? "1" : "0" }, function () {
+      box.checked = !on;
+      row.classList.toggle("row-verified", !on);
+    });
+    if (!on) return;
+    // Auto-advance: collapse this row's detail, open the next unverified one.
+    var detail = detailOf(row);
+    if (detail && !detail.hidden) {
+      var link = row.querySelector("a.voucher-link");
+      if (link) link.click();
+    }
+    var rows = voucherRows();
+    var start = rows.indexOf(row);
+    var next = null;
+    for (var i = 1; i <= rows.length; i++) {
+      var cand = rows[(start + i) % rows.length];
+      var candBox = cand.querySelector(".verify-box");
+      // Skip disabled boxes (open correction) — they cannot be verified yet.
+      if (candBox && !candBox.checked && !candBox.disabled) { next = cand; break; }
+    }
+    if (next) {
+      activate(next);
+      next.scrollIntoView({ behavior: "smooth", block: "center" });
+    } else {
+      countBox.focus();
+      countBox.closest(".verify-summary").scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  });
+
+  countBox.addEventListener("change", function () {
+    var on = countBox.checked;
+    errorBox.hidden = true;
+    updateGate();
+    save({ count: on ? "1" : "0" }, function () { countBox.checked = !on; });
+  });
+
+  // bfcache: a back/forward restore would show checkbox state stale vs server.
+  window.addEventListener("pageshow", function (e) {
+    if (e.persisted) window.location.reload();
+  });
+
+  updateGate();
+})();
+</script>
 {% endblock %}

@@ -150,6 +150,45 @@ _SCHEMA = "".join(
     for table, body in _TABLE_DDL_V1.items()
 )
 
+# Correction requests (added after schema v1). Deliberately NOT in
+# _TABLE_DDL_V1: that dict drives the v1 constraint rebuild, which must never
+# touch a table that post-dates v1. CREATE IF NOT EXISTS via init_db() covers
+# fresh and already-installed DBs alike — no version bump needed for a purely
+# additive table (widening the kind CHECK later is handled by
+# _migrate_corrections_kinds). old_json/new_json hold the raise-time snapshot
+# and the requested change as JSON (shape varies by kind). The four
+# master-data kinds edit SQLite tables; 'collection_amount' edits the staged
+# report's payment instead. Resolved rows are kept forever: they are the
+# audit trail of correction-driven changes.
+_CORRECTIONS_BODY = """
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind            TEXT NOT NULL CHECK (kind IN
+                      ('installment_amount','installment_delete',
+                       'installment_add','voucher_amount',
+                       'collection_amount')),
+    bill_no         TEXT NOT NULL CHECK (bill_no <> ''),
+    report_stem     TEXT NOT NULL DEFAULT '',
+    origin_stage    TEXT NOT NULL DEFAULT '',
+    installment_id  INTEGER,
+    old_json        TEXT,
+    new_json        TEXT,
+    note            TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN
+                      ('open','applied','rejected','withdrawn')),
+    requested_by    TEXT NOT NULL,
+    requested_at    TEXT NOT NULL,
+    resolved_by     TEXT,
+    resolved_at     TEXT,
+    resolution_note TEXT
+"""
+
+_CORRECTIONS_COLUMNS = ["id", "kind", "bill_no", "report_stem", "origin_stage",
+                        "installment_id", "old_json", "new_json", "note", "status",
+                        "requested_by", "requested_at",
+                        "resolved_by", "resolved_at", "resolution_note"]
+
+_SCHEMA += f"CREATE TABLE IF NOT EXISTS corrections ({_CORRECTIONS_BODY});\n"
+
 
 class MigrationError(ValueError):
     """Existing rows violate the new schema constraints; the migration
@@ -171,7 +210,9 @@ def init_db():
         _backfill_beats_salesman(conn)
         _backfill_permissions(conn)
         _backfill_coll_print_permission(conn)
+        _backfill_correction_permissions(conn)
         conn.commit()
+        _migrate_corrections_kinds(conn)
         if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
             _migrate_schema_v1(conn)
     finally:
@@ -311,6 +352,39 @@ def _backfill_coll_print_permission(conn):
         "INSERT OR IGNORE INTO permissions (role, action_key) VALUES (?, ?)",
         [("supervisor", "coll_print"), ("distributor", "coll_print")],
     )
+
+
+def _backfill_correction_permissions(conn):
+    """Additive grant of the correction-request keys for DBs seeded before
+    they existed. raise_correction doubles as the view permission for the
+    corrections list; apply_correction gates the distributor's Apply/Reject
+    on the master-data kinds (collection_amount is gated on the existing
+    coll_approve_submit key instead)."""
+    conn.executemany(
+        "INSERT OR IGNORE INTO permissions (role, action_key) VALUES (?, ?)",
+        [("supervisor", "raise_correction"), ("distributor", "raise_correction"),
+         ("distributor", "apply_correction")],
+    )
+
+
+def _migrate_corrections_kinds(conn):
+    """Rebuild the corrections table when its kind CHECK predates a newer
+    kind value. Self-detecting via the stored CREATE SQL — SQLite cannot
+    widen a CHECK in place, and CREATE IF NOT EXISTS is a no-op on DBs that
+    already made the table with the old constraint. Pure widening: every
+    existing row satisfies the new CHECK, so the copy cannot fail."""
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'corrections'"
+    ).fetchone()
+    if row is None or "collection_amount" in (row["sql"] or ""):
+        return
+    cols = ", ".join(_CORRECTIONS_COLUMNS)
+    with conn:
+        conn.execute("DROP TABLE IF EXISTS corrections_new")
+        conn.execute(f"CREATE TABLE corrections_new ({_CORRECTIONS_BODY})")
+        conn.execute(f"INSERT INTO corrections_new ({cols}) SELECT {cols} FROM corrections")
+        conn.execute("DROP TABLE corrections")
+        conn.execute("ALTER TABLE corrections_new RENAME TO corrections")
 
 
 def ensure_db():
@@ -484,14 +558,17 @@ def load_users_raw():
 
 
 def load_installments_for_bill(bill_no, completed=False):
-    """Return list of installment dicts for a bill_no from installments or completed_installments."""
+    """Return list of installment dicts for a bill_no from installments or
+    completed_installments. Includes the surrogate `id` — the only unique row
+    identity (duplicate bill_no/date/amount rows are legal) — so correction
+    requests can target one specific installment."""
     if not _db_path().exists():
         return []
     table = "completed_installments" if completed else "installments"
     conn = get_db()
     try:
         rows = conn.execute(
-            f"SELECT bill_no, date, amount, salesman, created_by, created_at"
+            f"SELECT id, bill_no, date, amount, salesman, created_by, created_at"
             f" FROM {table} WHERE bill_no = ?",
             (bill_no,),
         ).fetchall()
@@ -705,6 +782,253 @@ def apply_post_to_db(vouchers, created_by="app"):
         return completed
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Correction requests
+# ---------------------------------------------------------------------------
+
+class CorrectionConflict(ValueError):
+    """The correction's raise-time snapshot no longer matches current master
+    data — the request is stale. Apply refuses; the request stays open for
+    the distributor to reject (or the requester to withdraw and re-raise)."""
+
+
+def _correction_dict(row):
+    d = dict(row)
+    d["old"] = json.loads(d["old_json"]) if d["old_json"] else None
+    d["new"] = json.loads(d["new_json"]) if d["new_json"] else None
+    del d["old_json"], d["new_json"]
+    return d
+
+
+def insert_correction(record):
+    """Insert a new open correction request; returns its id.
+
+    `record` keys: kind, bill_no, requested_by, requested_at, and optionally
+    report_stem, origin_stage, installment_id, old, new (dicts, stored as
+    JSON), note. Validation of the requested values is the caller's job.
+    """
+    conn = get_db()
+    try:
+        with conn:
+            cur = conn.execute(
+                "INSERT INTO corrections (kind, bill_no, report_stem, origin_stage,"
+                " installment_id, old_json, new_json, note, status,"
+                " requested_by, requested_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)",
+                (record["kind"], record["bill_no"],
+                 record.get("report_stem", ""), record.get("origin_stage", ""),
+                 record.get("installment_id"),
+                 json.dumps(record["old"]) if record.get("old") is not None else None,
+                 json.dumps(record["new"]) if record.get("new") is not None else None,
+                 record.get("note", ""),
+                 record["requested_by"], record["requested_at"]))
+            return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def load_correction(cid):
+    """Return one correction request as a dict (old/new decoded), or None."""
+    if not _db_path().exists():
+        return None
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT * FROM corrections WHERE id = ?", (cid,)).fetchone()
+    finally:
+        conn.close()
+    return _correction_dict(row) if row else None
+
+
+def load_corrections(statuses=None, limit=None):
+    """Return correction requests (most recent first), optionally filtered
+    by an iterable of statuses and capped at `limit` rows."""
+    if not _db_path().exists():
+        return []
+    sql = "SELECT * FROM corrections"
+    params = []
+    statuses = list(statuses or [])
+    if statuses:
+        sql += " WHERE status IN (%s)" % ",".join("?" * len(statuses))
+        params.extend(statuses)
+    sql += " ORDER BY id DESC"
+    if limit:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    conn = get_db()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    return [_correction_dict(r) for r in rows]
+
+
+def open_corrections_for_bills(bill_nos):
+    """Return dict[bill_no -> list of open correction dicts] for the given bills."""
+    unique = sorted({b for b in bill_nos if b})
+    if not unique or not _db_path().exists():
+        return {}
+    conn = get_db()
+    try:
+        ph = ",".join("?" * len(unique))
+        rows = conn.execute(
+            f"SELECT * FROM corrections WHERE status = 'open' AND bill_no IN ({ph})"
+            f" ORDER BY id",
+            unique).fetchall()
+    finally:
+        conn.close()
+    result = {}
+    for r in rows:
+        result.setdefault(r["bill_no"], []).append(_correction_dict(r))
+    return result
+
+
+def mark_correction_applied(cid, resolved_by, resolution_note="", now=None):
+    """Flip an open request to 'applied' (one open-only UPDATE).
+
+    For kinds whose change lives OUTSIDE this database (collection_amount
+    edits the staged report JSON) — the master-data kinds flip status inside
+    apply_installment_correction's transaction instead. Raises ValueError if
+    the request is missing or no longer open. Returns the updated dict.
+    """
+    now = now or datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    conn = get_db()
+    try:
+        with conn:
+            cur = conn.execute(
+                "UPDATE corrections SET status = 'applied', resolved_by = ?,"
+                " resolved_at = ?, resolution_note = ? WHERE id = ? AND status = 'open'",
+                (resolved_by, now, resolution_note or "", cid))
+            if cur.rowcount == 0:
+                raise ValueError(f"correction {cid} is not open")
+    finally:
+        conn.close()
+    return load_correction(cid)
+
+
+def resolve_correction(cid, status, resolved_by, resolution_note="", now=None):
+    """Stamp a reject/withdraw resolution on an open request (one UPDATE).
+
+    Raises ValueError if the request is missing or no longer open. For
+    'applied' use apply_installment_correction (master-data kinds) or
+    mark_correction_applied (staged-data kinds).
+    """
+    if status not in ("rejected", "withdrawn"):
+        raise ValueError(f"resolve_correction cannot set status {status!r}")
+    now = now or datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    conn = get_db()
+    try:
+        with conn:
+            cur = conn.execute(
+                "UPDATE corrections SET status = ?, resolved_by = ?, resolved_at = ?,"
+                " resolution_note = ? WHERE id = ? AND status = 'open'",
+                (status, resolved_by, now, resolution_note or "", cid))
+            if cur.rowcount == 0:
+                raise ValueError(f"correction {cid} is not open")
+    finally:
+        conn.close()
+    return load_correction(cid)
+
+
+def _recompute_voucher_balance(conn, bill_no):
+    """Recompute balance = voucher.amount − SUM(installments) from scratch on
+    an open connection. Raises ValueError on a missing voucher or a negative
+    result (the enclosing transaction rolls back). Returns the new Decimal."""
+    vrow = conn.execute(
+        "SELECT amount FROM vouchers WHERE bill_no = ?", (bill_no,)).fetchone()
+    if vrow is None:
+        raise ValueError(f"voucher {bill_no} not found in master")
+    paid = Decimal("0")
+    for r in conn.execute(
+            "SELECT amount FROM installments WHERE bill_no = ?", (bill_no,)):
+        paid += Decimal(r["amount"])
+    new_balance = (Decimal(vrow["amount"]) - paid).quantize(Decimal("0.01"))
+    if new_balance < 0:
+        raise ValueError(
+            f"correction would leave voucher {bill_no} with a negative balance"
+            f" ({new_balance}) — refused")
+    conn.execute("UPDATE vouchers SET balance = ? WHERE bill_no = ?",
+                 (str(new_balance), bill_no))
+    return new_balance
+
+
+def apply_installment_correction(corr_id, resolved_by, resolution_note="", now=None):
+    """Apply one open correction to master data and mark it applied — a
+    single transaction, so any failure leaves both the master tables and the
+    request status untouched.
+
+    Steps: re-check the raise-time snapshot against the current row
+    (CorrectionConflict on drift), perform the change for the request's kind,
+    recompute the voucher balance from scratch (ValueError + rollback if it
+    would go negative — zero is fine; the voucher stays active and completes
+    naturally at the next post), then flip status to 'applied'.
+    Returns the updated correction dict.
+    """
+    now = now or datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    conn = get_db()
+    try:
+        with conn:
+            row = conn.execute(
+                "SELECT * FROM corrections WHERE id = ?", (corr_id,)).fetchone()
+            if row is None or row["status"] != "open":
+                raise ValueError(f"correction {corr_id} is not open")
+            corr = _correction_dict(row)
+            kind, bill_no = corr["kind"], corr["bill_no"]
+            old, new = corr["old"] or {}, corr["new"] or {}
+
+            if kind in ("installment_amount", "installment_delete"):
+                inst = conn.execute(
+                    "SELECT date, amount FROM installments WHERE id = ? AND bill_no = ?",
+                    (corr["installment_id"], bill_no)).fetchone()
+                if (inst is None or inst["amount"] != old.get("amount")
+                        or inst["date"] != old.get("date")):
+                    raise CorrectionConflict(
+                        f"correction {corr_id}: the installment no longer matches"
+                        " the requested snapshot — master data changed since the"
+                        " request was raised")
+                if kind == "installment_amount":
+                    conn.execute("UPDATE installments SET amount = ? WHERE id = ?",
+                                 (new["amount"], corr["installment_id"]))
+                else:
+                    conn.execute("DELETE FROM installments WHERE id = ?",
+                                 (corr["installment_id"],))
+            elif kind == "installment_add":
+                vrow = conn.execute(
+                    "SELECT salesman FROM vouchers WHERE bill_no = ?",
+                    (bill_no,)).fetchone()
+                if vrow is None:
+                    raise ValueError(f"voucher {bill_no} not found in master")
+                conn.execute(
+                    "INSERT INTO installments"
+                    " (bill_no, date, amount, salesman, created_by, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (bill_no, new["date"], new["amount"], vrow["salesman"],
+                     resolved_by, now))
+            elif kind == "voucher_amount":
+                vrow = conn.execute(
+                    "SELECT amount FROM vouchers WHERE bill_no = ?",
+                    (bill_no,)).fetchone()
+                if vrow is None:
+                    raise ValueError(f"voucher {bill_no} not found in master")
+                if vrow["amount"] != old.get("amount"):
+                    raise CorrectionConflict(
+                        f"correction {corr_id}: the voucher amount no longer"
+                        " matches the requested snapshot — master data changed"
+                        " since the request was raised")
+                conn.execute("UPDATE vouchers SET amount = ? WHERE bill_no = ?",
+                             (new["amount"], bill_no))
+            else:
+                raise ValueError(f"correction {corr_id}: unknown kind {kind!r}")
+
+            _recompute_voucher_balance(conn, bill_no)
+            conn.execute(
+                "UPDATE corrections SET status = 'applied', resolved_by = ?,"
+                " resolved_at = ?, resolution_note = ? WHERE id = ?",
+                (resolved_by, now, resolution_note or "", corr_id))
+    finally:
+        conn.close()
+    return load_correction(corr_id)
 
 
 def write_new_vouchers(vouchers):

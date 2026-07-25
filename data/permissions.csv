@@ -11,6 +11,7 @@ supervisor,add_vouchers
 supervisor,import_vouchers
 supervisor,reports
 supervisor,coll_print
+supervisor,raise_correction
 distributor,coll_start
 distributor,coll_approve_start
 distributor,coll_submit
@@ -24,3 +25,5 @@ distributor,reports
 distributor,coll_print
 distributor,manage_users
 distributor,manage_beats
+distributor,raise_correction
+distributor,apply_correction

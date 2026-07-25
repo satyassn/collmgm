@@ -49,6 +49,10 @@ Its state is encoded entirely in the `stages` sub-dict — the canonical single 
 **Actor:** Salesman, supervisor, or distributor via **Generate Collection List**.  
 **Next:** Supervisor approves (`y`) → START / confirmed; or Returns (`r`) → file deleted, salesman regenerates; or Cancels (`c`) → file deleted.
 
+**Web-only verification gate:** on the web Approve Collection List screen the supervisor must tick a verification checkbox per voucher (cross-checked against the physical voucher) plus a bundle-count checkbox before Approve unlocks; state persists in a transient top-level `verification` key in the report JSON (enforced in `coll_api` only — the CLI approve flow is unchanged, and `apply_start_approval` pops the key on approve from either entry point).
+
+**Correction loop (web-only):** when the physical cross-check reveals wrong master data, the supervisor raises a structured correction request from the voucher's expanded detail (edit/delete/add installment, or edit voucher amount — see `schema.md` `corrections` table). While a request is **open**: that voucher cannot be verified, and web approval of the whole list is blocked. The distributor resolves it from **Correction Requests** (menu): *Apply* changes master data + recomputes the balance atomically and refreshes the staged display balance; *Reject* (with note) unblocks the voucher unchanged. A correction applied while a report is mid-submit is safe by design — approve-submit and post re-validate payments against CURRENT master balance, and the existing Return actions are the remedy when a payment no longer fits.
+
 ---
 
 ### 2. START / confirmed
@@ -90,6 +94,10 @@ Its state is encoded entirely in the `stages` sub-dict — the canonical single 
 
 **Actor:** Salesman via **Submit Collections → complete all → submit**.  
 **Next:** Supervisor approves via **Approve Collections → y** → SUBMIT / confirmed; or Returns (`r`) → SUBMIT / returned.
+
+**Web-only correction loop (this stage):** from the web Approve Collections review the supervisor may raise a correction against ONLY the collection amount entered this cycle (never the voucher amount or past installments — those kinds belong to the Approve Collection List stage). While open, it blocks web approval (Return stays available). Resolution: supervisor or distributor applies it (rewrites the staged payment + sidecar + TXT), rejects it, or the supervisor Returns the report — a resubmitted payment matching the requested value auto-settles the request ("matched after salesman revision"). The CLI is unaffected.
+
+**Web-only verification gate (this stage):** mirrors the morning Approve Collection List screen — a per-voucher checkbox plus a "returned vouchers reconciled against my notes" checkbox must all be ticked before Approve unlocks. Gate order on approve: data-validity check (existing tamper defense) → open corrections → verification. Enforced in `coll_api` only; the CLI approve flow is unaffected. State is popped from the report JSON on either approve or return (a returned report is not deleted, so stale checkmarks must not resurface when the salesman resubmits).
 
 ---
 
@@ -149,6 +157,10 @@ Its state is encoded entirely in the `stages` sub-dict — the canonical single 
 | Return Collections        |              | ✓          | ✓           |
 | Post Collections          |              |            | ✓           |
 | Return to Supervisor      |              |            | ✓           |
+| Raise Correction (web)    |              | ✓          | ✓           |
+| View Corrections (web)    |              | ✓          | ✓           |
+| Apply/Reject Correction — master-data kinds (web) | | | ✓           |
+| Apply/Reject Correction — collection amount (web) | | ✓ | ✓         |
 
 `(own beat)` / `(own)` are enforced server-side, not just hidden in the UI: a salesman is
 restricted to beats they're assigned (`beats.salesman` column) and to reports whose

@@ -894,5 +894,219 @@ class TestCollPrintPermissionBackfill(unittest.TestCase):
         self.assertIn(("distributor", "coll_print"), rows)
 
 
+# ---------------------------------------------------------------------------
+# Correction requests — table, CRUD, and the atomic apply
+# ---------------------------------------------------------------------------
+
+class TestCorrections(StoreTestCase):
+    def _corr(self, **overrides):
+        record = {"kind": "voucher_amount", "bill_no": "1",
+                  "old": {"amount": "100.00"}, "new": {"amount": "120.00"},
+                  "note": "physical voucher shows 120",
+                  "requested_by": "sup", "requested_at": "2026-07-18T10:00:00"}
+        record.update(overrides)
+        return coll_store.insert_correction(record)
+
+    def _inst_id(self, bill_no):
+        return self._query("SELECT id FROM installments WHERE bill_no = ?",
+                           (bill_no,))[0]["id"]
+
+    def test_table_created_for_preexisting_db(self):
+        # Simulate a DB from before the corrections table existed.
+        conn = coll_store.get_db()
+        try:
+            conn.execute("DROP TABLE corrections")
+            conn.commit()
+        finally:
+            conn.close()
+        coll_store.init_db()
+        self.assertEqual(self._query("SELECT COUNT(*) AS n FROM corrections")[0]["n"], 0)
+
+    def test_correction_permission_backfill(self):
+        rows = {(r["role"], r["action_key"])
+                for r in self._query("SELECT role, action_key FROM permissions")}
+        self.assertIn(("supervisor", "raise_correction"), rows)
+        self.assertIn(("distributor", "raise_correction"), rows)
+        self.assertIn(("distributor", "apply_correction"), rows)
+        self.assertNotIn(("salesman", "raise_correction"), rows)
+
+    def test_insert_and_load_roundtrip(self):
+        cid = self._corr(report_stem="collX", origin_stage="start")
+        corr = coll_store.load_correction(cid)
+        self.assertEqual(corr["status"], "open")
+        self.assertEqual(corr["old"], {"amount": "100.00"})
+        self.assertEqual(corr["new"], {"amount": "120.00"})
+        self.assertEqual(corr["report_stem"], "collX")
+        self.assertEqual(corr["origin_stage"], "start")
+        self.assertIsNone(corr["resolved_by"])
+
+    def test_load_corrections_filters_and_orders(self):
+        first = self._corr()
+        second = self._corr(bill_no="2", old={"amount": "100.00"})
+        coll_store.resolve_correction(first, "rejected", "dist", "no")
+        self.assertEqual([c["id"] for c in coll_store.load_corrections()],
+                         [second, first])
+        self.assertEqual([c["id"] for c in coll_store.load_corrections(statuses=["open"])],
+                         [second])
+        self.assertEqual(len(coll_store.load_corrections(limit=1)), 1)
+
+    def test_open_corrections_for_bills(self):
+        cid = self._corr(bill_no="7")
+        self._corr(bill_no="8")
+        coll_store.resolve_correction(self._corr(bill_no="7"), "withdrawn", "sup")
+        open_map = coll_store.open_corrections_for_bills(["7", "9"])
+        self.assertEqual(list(open_map.keys()), ["7"])
+        self.assertEqual([c["id"] for c in open_map["7"]], [cid])
+
+    def test_resolve_correction_guards(self):
+        cid = self._corr()
+        with self.assertRaises(ValueError):
+            coll_store.resolve_correction(cid, "applied", "dist")  # wrong path
+        coll_store.resolve_correction(cid, "rejected", "dist", "wrong request")
+        corr = coll_store.load_correction(cid)
+        self.assertEqual((corr["status"], corr["resolved_by"], corr["resolution_note"]),
+                         ("rejected", "dist", "wrong request"))
+        with self.assertRaises(ValueError):
+            coll_store.resolve_correction(cid, "rejected", "dist")  # no longer open
+
+    def test_apply_installment_amount_edit_recomputes_balance(self):
+        self._insert_rows("vouchers", [self._v_row("1", balance="80.00")])
+        self._insert_rows("installments", [self._i_row("1", amount="20.00")])
+        cid = self._corr(kind="installment_amount", installment_id=self._inst_id("1"),
+                         old={"date": "2026-01-01", "amount": "20.00"},
+                         new={"amount": "50.00"})
+        corr = coll_store.apply_installment_correction(cid, "dist")
+        self.assertEqual(corr["status"], "applied")
+        self.assertEqual(corr["resolved_by"], "dist")
+        self.assertEqual(self._query("SELECT amount FROM installments")[0]["amount"], "50.00")
+        self.assertEqual(self._query("SELECT balance FROM vouchers")[0]["balance"], "50.00")
+
+    def test_apply_installment_delete(self):
+        self._insert_rows("vouchers", [self._v_row("1", balance="80.00")])
+        self._insert_rows("installments", [self._i_row("1", amount="20.00")])
+        cid = self._corr(kind="installment_delete", installment_id=self._inst_id("1"),
+                         old={"date": "2026-01-01", "amount": "20.00"}, new=None)
+        coll_store.apply_installment_correction(cid, "dist")
+        self.assertEqual(self._query("SELECT COUNT(*) AS n FROM installments")[0]["n"], 0)
+        self.assertEqual(self._query("SELECT balance FROM vouchers")[0]["balance"], "100.00")
+
+    def test_apply_installment_add(self):
+        self._insert_rows("vouchers", [self._v_row("1", balance="100.00")])
+        cid = self._corr(kind="installment_add", old=None,
+                         new={"date": "2026-01-05", "amount": "30.00"})
+        coll_store.apply_installment_correction(cid, "dist")
+        rows = self._query("SELECT * FROM installments")
+        self.assertEqual((rows[0]["amount"], rows[0]["date"], rows[0]["created_by"]),
+                         ("30.00", "2026-01-05", "dist"))
+        self.assertEqual(self._query("SELECT balance FROM vouchers")[0]["balance"], "70.00")
+
+    def test_apply_voucher_amount_edit(self):
+        self._insert_rows("vouchers", [self._v_row("1", balance="80.00")])
+        self._insert_rows("installments", [self._i_row("1", amount="20.00")])
+        cid = self._corr(kind="voucher_amount",
+                         old={"amount": "100.00"}, new={"amount": "120.00"})
+        coll_store.apply_installment_correction(cid, "dist")
+        row = self._query("SELECT amount, balance FROM vouchers")[0]
+        self.assertEqual((row["amount"], row["balance"]), ("120.00", "100.00"))
+
+    def test_stale_snapshot_raises_conflict_and_changes_nothing(self):
+        self._insert_rows("vouchers", [self._v_row("1", balance="80.00")])
+        self._insert_rows("installments", [self._i_row("1", amount="20.00")])
+        cid = self._corr(kind="installment_amount", installment_id=self._inst_id("1"),
+                         old={"date": "2026-01-01", "amount": "25.00"},  # drifted
+                         new={"amount": "50.00"})
+        with self.assertRaises(coll_store.CorrectionConflict):
+            coll_store.apply_installment_correction(cid, "dist")
+        self.assertEqual(coll_store.load_correction(cid)["status"], "open")
+        self.assertEqual(self._query("SELECT amount FROM installments")[0]["amount"], "20.00")
+
+    def test_negative_balance_aborts_atomically(self):
+        self._insert_rows("vouchers", [self._v_row("1", balance="80.00")])
+        self._insert_rows("installments", [self._i_row("1", amount="20.00")])
+        cid = self._corr(kind="installment_add", old=None,
+                         new={"date": "2026-01-05", "amount": "90.00"})  # 20+90 > 100
+        with self.assertRaises(ValueError):
+            coll_store.apply_installment_correction(cid, "dist")
+        # Atomic: neither the insert nor the status flip survived.
+        self.assertEqual(self._query("SELECT COUNT(*) AS n FROM installments")[0]["n"], 1)
+        self.assertEqual(coll_store.load_correction(cid)["status"], "open")
+        self.assertEqual(self._query("SELECT balance FROM vouchers")[0]["balance"], "80.00")
+
+    def test_apply_requires_open_request(self):
+        self._insert_rows("vouchers", [self._v_row("1", balance="100.00")])
+        cid = self._corr(kind="voucher_amount",
+                         old={"amount": "100.00"}, new={"amount": "120.00"})
+        coll_store.apply_installment_correction(cid, "dist")
+        with self.assertRaises(ValueError):
+            coll_store.apply_installment_correction(cid, "dist")
+
+    def test_zero_balance_is_allowed_and_voucher_stays_active(self):
+        self._insert_rows("vouchers", [self._v_row("1", balance="80.00")])
+        self._insert_rows("installments", [self._i_row("1", amount="20.00")])
+        cid = self._corr(kind="installment_add", old=None,
+                         new={"date": "2026-01-05", "amount": "80.00"})  # exactly settles
+        coll_store.apply_installment_correction(cid, "dist")
+        self.assertEqual(self._query("SELECT balance FROM vouchers")[0]["balance"], "0.00")
+        self.assertEqual(self._query("SELECT COUNT(*) AS n FROM completed_vouchers")[0]["n"], 0)
+
+    def test_installments_select_includes_id(self):
+        self._insert_rows("vouchers", [self._v_row("1")])
+        self._insert_rows("installments", [self._i_row("1")])
+        rows = coll_store.load_installments_for_bill("1")
+        self.assertIn("id", rows[0])
+
+    def test_mark_correction_applied_open_only(self):
+        cid = self._corr()
+        corr = coll_store.mark_correction_applied(cid, "sup", "fixed directly")
+        self.assertEqual((corr["status"], corr["resolved_by"], corr["resolution_note"]),
+                         ("applied", "sup", "fixed directly"))
+        with self.assertRaises(ValueError):
+            coll_store.mark_correction_applied(cid, "sup")
+
+    def test_kind_check_widened_for_preexisting_table(self):
+        # Simulate a DB whose corrections table predates 'collection_amount'
+        # (the CHECK is baked in — CREATE IF NOT EXISTS cannot widen it).
+        import sqlite3
+        conn = coll_store.get_db()
+        try:
+            conn.execute("DROP TABLE corrections")
+            conn.execute("""CREATE TABLE corrections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL CHECK (kind IN
+                  ('installment_amount','installment_delete',
+                   'installment_add','voucher_amount')),
+                bill_no TEXT NOT NULL CHECK (bill_no <> ''),
+                report_stem TEXT NOT NULL DEFAULT '',
+                origin_stage TEXT NOT NULL DEFAULT '',
+                installment_id INTEGER,
+                old_json TEXT, new_json TEXT,
+                note TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'open' CHECK (status IN
+                  ('open','applied','rejected','withdrawn')),
+                requested_by TEXT NOT NULL, requested_at TEXT NOT NULL,
+                resolved_by TEXT, resolved_at TEXT, resolution_note TEXT)""")
+            conn.execute(
+                "INSERT INTO corrections (kind, bill_no, status, requested_by, requested_at)"
+                " VALUES ('voucher_amount', '1', 'open', 'sup', 't')")
+            conn.commit()
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO corrections (kind, bill_no, status, requested_by, requested_at)"
+                    " VALUES ('collection_amount', '1', 'open', 'sup', 't')")
+        finally:
+            conn.close()
+
+        coll_store.init_db()  # rebuild widens the CHECK, keeps rows
+
+        cid = self._corr(kind="collection_amount", bill_no="9",
+                         old={"payment": "10.00"}, new={"payment": "20.00"})
+        self.assertEqual(coll_store.load_correction(cid)["kind"], "collection_amount")
+        survivors = self._query("SELECT kind, status FROM corrections WHERE bill_no = '1'")
+        self.assertEqual(survivors, [{"kind": "voucher_amount", "status": "open"}])
+        # Idempotent: a second init_db must not rebuild again (no error, rows intact).
+        coll_store.init_db()
+        self.assertEqual(len(coll_store.load_corrections()), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

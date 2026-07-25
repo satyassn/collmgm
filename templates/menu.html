@@ -39,6 +39,12 @@
       <span>Post Collections</span>
     </a>
   {% endif %}
+  {% if "raise_correction" in perms %}
+    <a class="menu-card" href="/coll/corrections">
+      <span class="menu-icon">&#128295;</span>
+      <span>Correction Requests</span>
+    </a>
+  {% endif %}
   <a class="menu-card" href="/reports">
     <span class="menu-icon">&#128202;</span>
     <span>Reports</span>

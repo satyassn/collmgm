@@ -23,10 +23,14 @@ from coll_store import (
     ensure_staging_dir, sanitize_filename_component,
     acquire_beat_lock, release_beat_lock, cancel_staging_report,
     acquire_post_claim, release_post_claim,
-    _save_installments, _installments_path,
+    _save_installments, _load_installments, _installments_path,
     apply_post_to_db,
     archive_files,
     write_finalize_checkpoint, clear_finalize_checkpoint, read_finalize_checkpoint,
+    list_staging_reports,
+    apply_installment_correction, resolve_correction,
+    mark_correction_applied, open_corrections_for_bills,
+    CorrectionConflict, load_correction,
 )
 
 
@@ -80,6 +84,16 @@ def prepare_submit_review(report_path, report_data):
     return report_data
 
 
+def format_submit_validation_errors(errors):
+    """Render validate_staged_report's error list as the message shown to
+    the supervisor. Shared by apply_submit_approval and the web handler's
+    pre-check (coll_api checks data validity before its own web-only gates —
+    corrections/verification — so a genuinely bad payment is never masked by
+    a "please verify" message)."""
+    return ("Cannot approve — report failed validation: " + "; ".join(errors)
+            + ". Return the report to the salesman for correction.")
+
+
 def apply_submit_approval(report_path, report_data, action: Literal["approve", "return"]):
     """Approve or return a submit-confirmed-pending report.
 
@@ -90,6 +104,14 @@ def apply_submit_approval(report_path, report_data, action: Literal["approve", "
     (ValidationError otherwise) so bad or stale staged data stops at the
     supervisor gate — 'return' is deliberately exempt, since returning is
     the remedy for bad data.
+
+    Web-only verification bookkeeping (see set_submit_verification) is popped
+    on EITHER action from every entry point (CLI included): on approve it
+    must never ride through post into the archived report; on return the
+    report is NOT deleted (unlike a start-stage return), so a stale
+    verification state would otherwise resurface — already checked — on the
+    resubmitted report's next review.
+
     Persists report_data via save_report_json; raises on I/O failure —
     caller decides how to surface it (print vs error.html).
     """
@@ -99,12 +121,59 @@ def apply_submit_approval(report_path, report_data, action: Literal["approve", "
     if action == "approve":
         errors = validate_staged_report(report_data)
         if errors:
-            raise ValidationError(
-                "Cannot approve — report failed validation: " + "; ".join(errors)
-                + ". Return the report to the salesman for correction.")
+            raise ValidationError(format_submit_validation_errors(errors))
+    report_data.pop("verification", None)
     report_data.setdefault("stages", {})["submit"] = "confirmed" if action == "approve" else "returned"
     save_report_json(report_path, report_data)
     return report_data
+
+
+def set_submit_verification(report_path, report_data, bill_no=None, verified=False,
+                            count_verified=None):
+    """Record physical-voucher verification state on a submit-stage report.
+
+    Web-only bookkeeping for the Approve Collections screen: the mirror of
+    set_start_verification, for the evening cross-check of returned physical
+    vouchers + collected amounts against the supervisor's handout notes.
+    Same top-level "verification" shape ({"bill_nos": [...], "count": bool}) —
+    free to reuse because apply_start_approval already popped it earlier in
+    this report's life, and apply_submit_approval pops it again on exit from
+    this stage (approve OR return).
+
+    Requires stages.submit == 'submitted' (StageError otherwise). `bill_no`,
+    when given, must belong to the report (ValueError otherwise). The count
+    checkbox here means "returned vouchers reconciled against my notes" —
+    unlike the start-stage bundle count it does NOT assert the returned count
+    equals the voucher count: a missing voucher can legitimately mean the
+    customer paid it off in full (see docs). Persists via save_report_json.
+    """
+    _require_stage(report_data,
+                   report_data.get("stages", {}).get("submit") == "submitted", "verified")
+    ver = report_data.setdefault("verification", {})
+    ver.setdefault("bill_nos", [])
+    ver.setdefault("count", False)
+    if bill_no is not None:
+        if bill_no not in {v.get("bill_no") for v in report_data.get("vouchers", [])}:
+            raise ValueError(f"{bill_no}: not in this report")
+        marked = set(ver["bill_nos"])
+        (marked.add if verified else marked.discard)(bill_no)
+        ver["bill_nos"] = sorted(marked, key=bill_no_sort_key)
+    if count_verified is not None:
+        ver["count"] = bool(count_verified)
+    save_report_json(report_path, report_data)
+    return report_data
+
+
+def is_submit_verification_complete(report_data):
+    """True when every voucher in the report is marked verified AND the
+    reconciliation checkbox is ticked. Pure query — deliberately not
+    consulted by apply_submit_approval, so the CLI approve flow stays
+    checkbox-free."""
+    ver = report_data.get("verification", {})
+    marked = set(ver.get("bill_nos", []))
+    return (bool(ver.get("count"))
+            and all(v.get("bill_no") in marked
+                    for v in report_data.get("vouchers", [])))
 
 
 # ---------------------------------------------------------------------------
@@ -216,10 +285,61 @@ def apply_start_approval(report_path, report_data, action: Literal["approve", "r
     _require_stage(report_data, report_data.get("stages", {}).get("start") == "new",
                    {"approve": "approved", "return": "returned", "cancel": "cancelled"}[action])
     if action == "approve":
+        # Web-only verification bookkeeping ends its life here: popped on every
+        # approve entry point (CLI included) so the key can never ride through
+        # submit/post into the archived report JSON. Cleanup, not a gate — the
+        # hard verification gate is enforced by the web handler only.
+        report_data.pop("verification", None)
         return approve_start_stage(report_path, report_data)
     beat_name = report_data.get("selection", [None])[0]
     cancel_staging_report(report_path, beat_name)
     return report_data
+
+
+def set_start_verification(report_path, report_data, bill_no=None, verified=False,
+                           count_verified=None):
+    """Record physical-voucher verification state on a start-stage report.
+
+    Web-only bookkeeping for the Approve Collection List screen: the
+    supervisor ticks each voucher after checking it against the physical
+    voucher pulled from the locker, plus one count checkbox for the bundle
+    total. State lives under a top-level "verification" key so the voucher
+    dicts stay at the documented schema:
+
+        {"bill_nos": [<verified bill_nos, sorted>], "count": bool}
+
+    Requires stages.start == 'new' (StageError otherwise). `bill_no`, when
+    given, must belong to the report (ValueError otherwise) — this also
+    rejects stale toggles from a tab left open across a list regeneration.
+    Exactly the caller's choice of `bill_no` and/or `count_verified` is
+    applied; persists via save_report_json and returns report_data.
+    """
+    _require_stage(report_data,
+                   report_data.get("stages", {}).get("start") == "new", "verified")
+    ver = report_data.setdefault("verification", {})
+    ver.setdefault("bill_nos", [])
+    ver.setdefault("count", False)
+    if bill_no is not None:
+        if bill_no not in {v.get("bill_no") for v in report_data.get("vouchers", [])}:
+            raise ValueError(f"{bill_no}: not in this report")
+        marked = set(ver["bill_nos"])
+        (marked.add if verified else marked.discard)(bill_no)
+        ver["bill_nos"] = sorted(marked, key=bill_no_sort_key)
+    if count_verified is not None:
+        ver["count"] = bool(count_verified)
+    save_report_json(report_path, report_data)
+    return report_data
+
+
+def is_start_verification_complete(report_data):
+    """True when every voucher in the report is marked verified AND the
+    bundle-count checkbox is ticked. Pure query — deliberately not consulted
+    by apply_start_approval, so the CLI approve flow stays checkbox-free."""
+    ver = report_data.get("verification", {})
+    marked = set(ver.get("bill_nos", []))
+    return (bool(ver.get("count"))
+            and all(v.get("bill_no") in marked
+                    for v in report_data.get("vouchers", [])))
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +396,7 @@ def record_submit_payments(report_path, report_data, vouchers, submit_for_review
     if submit_for_review and vouchers:
         write_collection_text(report_path.with_suffix(".txt"), beats or [], salesmen or [],
                               vouchers, stage="submit", status="submitted")
+        settle_collection_corrections(report_data)
     return report_data
 
 
@@ -514,3 +635,193 @@ def return_post_stage(report_path, report_data):
     report_data.setdefault("stages", {})["submit"] = "submitted"
     save_report_json(report_path, report_data)
     return report_data
+
+
+# ---------------------------------------------------------------------------
+# Correction requests
+# ---------------------------------------------------------------------------
+
+def _refresh_staged_balances(bill_no):
+    """After a correction changed master data, refresh the staged display
+    balance for `bill_no` in every active staging report (and regenerate the
+    TXT sidecar to match).
+
+    Display-only: validation always reads CURRENT master balance, so a crash
+    between the atomic DB apply and this refresh merely leaves a stale number
+    on screen — nothing wrong can be approved or posted. Hence best-effort
+    per report.
+    """
+    row = load_vouchers_by_bill_nos([bill_no]).get(bill_no)
+    if row is None:
+        return  # settled/archived by the correction path is impossible; be safe
+    for path in list_staging_reports():
+        try:
+            data = load_report_json(path)
+        except Exception:
+            continue
+        vouchers = data.get("vouchers", [])
+        hit = False
+        for v in vouchers:
+            if isinstance(v, dict) and v.get("bill_no") == bill_no:
+                v["balance"] = row["balance"]
+                hit = True
+        if not hit:
+            continue
+        try:
+            save_report_json(path, data)
+            sel = data.get("selection", [])
+            beat = sel[0] if len(sel) > 0 else ""
+            salesman = sel[1] if len(sel) > 1 else ""
+            stages = data.get("stages", {})
+            if stages.get("submit"):
+                stage, status = "submit", stages["submit"]
+            else:
+                stage, status = "start", stages.get("start") or "new"
+            write_collection_text(path.with_suffix(".txt"),
+                                  [beat] if beat else [], [salesman] if salesman else [],
+                                  vouchers, stage=stage, status=status)
+        except Exception:
+            pass
+
+
+def _find_active_report_for_bill(bill_no):
+    """Return (path, data, voucher_dict) for the active staging report
+    containing bill_no, or (None, None, None). The beat lock guarantees at
+    most one active report can contain a given voucher."""
+    for path in list_staging_reports():
+        try:
+            data = load_report_json(path)
+        except Exception:
+            continue
+        for v in data.get("vouchers", []):
+            if isinstance(v, dict) and v.get("bill_no") == bill_no:
+                return path, data, v
+    return None, None, None
+
+
+def _apply_collection_correction(corr, resolved_by, resolution_note=None):
+    """Apply a collection_amount correction: rewrite the staged payment for
+    one voucher in the report awaiting Collections approval.
+
+    Unlike the master-data kinds this edits the staging JSON (+ TXT +
+    installments sidecar — the sidecar is what a returned report replays to
+    the salesman, so skipping it would resurrect the wrong payment), then
+    flips the request status. The two stores cannot share a transaction:
+    JSON is written first, status last — a crash between leaves an open
+    request whose snapshot no longer matches, which surfaces as an explicit
+    CorrectionConflict on retry for the resolver to reject with a note.
+
+    Guards: the report must still be at stages.submit == 'submitted' (with
+    the salesman -> they revise directly; approved/posted -> stale request);
+    the staged payment must still match the raise-time snapshot; a non-empty
+    corrected value must validate against the CURRENT master balance. An
+    empty (or zero) corrected value clears the collection entry.
+    """
+    bill_no = corr["bill_no"]
+    path, data, v = _find_active_report_for_bill(bill_no)
+    if path is None:
+        raise ValueError(
+            f"correction {corr['id']}: no active collection report contains"
+            f" voucher {bill_no} — the request is stale")
+    submit = data.get("stages", {}).get("submit") or ""
+    if submit != "submitted":
+        if submit in ("", "inprogress", "returned"):
+            raise ValueError(
+                f"correction {corr['id']}: the report is with the salesman —"
+                " they can revise the collection directly (or resubmit to"
+                " auto-settle this request)")
+        raise ValueError(
+            f"correction {corr['id']}: the report is no longer awaiting"
+            " Collections approval — the request is stale")
+    old_payment = ((corr.get("old") or {}).get("payment") or "").strip()
+    if (v.get("payment") or "").strip() != old_payment:
+        raise CorrectionConflict(
+            f"correction {corr['id']}: the staged collection no longer matches"
+            " the requested snapshot — it changed since the request was raised")
+
+    new_payment = ((corr.get("new") or {}).get("payment") or "").strip()
+    if new_payment:
+        master = load_vouchers_by_bill_nos([bill_no]).get(bill_no)
+        if master is None:
+            raise ValueError(f"voucher {bill_no} not found in master")
+        normalized, reason = validate_payment(new_payment, master["balance"])
+        if reason:
+            raise ValueError(
+                f"correction {corr['id']}: corrected collection {reason}")
+        new_payment = "" if Decimal(normalized) == 0 else normalized
+
+    v["payment"] = new_payment
+    prior, bookmark = _load_installments(path)
+    compute_payment_dates([v], prior)
+    save_report_json(path, data)
+    vouchers = data.get("vouchers", [])
+    sel = data.get("selection", [])
+    try:
+        write_collection_text(path.with_suffix(".txt"),
+                              [sel[0]] if len(sel) > 0 and sel[0] else [],
+                              [sel[1]] if len(sel) > 1 and sel[1] else [],
+                              vouchers, stage="submit", status="submitted")
+    except Exception:
+        pass
+    _save_installments(path, vouchers, bookmark_bill_no=bookmark)
+    return mark_correction_applied(corr["id"], resolved_by, resolution_note or "")
+
+
+def settle_collection_corrections(report_data):
+    """Auto-settle open collection_amount requests satisfied by a salesman's
+    (re)submission: any request for one of the report's bills whose staged
+    payment now equals the requested value is marked applied, resolved by
+    the report's salesman. Called from record_submit_payments on submit —
+    this closes the Return-to-salesman loop without manual bookkeeping.
+    A resubmitted value that matches neither old nor new leaves the request
+    open (the approver rejects it with a note, or the cycle repeats)."""
+    by_bill = {v.get("bill_no"): v for v in report_data.get("vouchers", [])
+               if isinstance(v, dict) and v.get("bill_no")}
+    sel = report_data.get("selection", [])
+    salesman = sel[1] if len(sel) > 1 and sel[1] else "salesman"
+    for bill_no, requests in open_corrections_for_bills(list(by_bill)).items():
+        for corr in requests:
+            if corr["kind"] != "collection_amount":
+                continue
+            wanted = ((corr.get("new") or {}).get("payment") or "").strip()
+            actual = (by_bill[bill_no].get("payment") or "").strip()
+            if actual == wanted:
+                try:
+                    mark_correction_applied(corr["id"], salesman,
+                                            "matched after salesman revision")
+                except ValueError:
+                    pass  # raced with a manual resolution — nothing to do
+    return report_data
+
+
+def apply_correction_request(corr_id, action, resolved_by, resolution_note=None):
+    """Resolve one open correction request.
+
+    'apply', master-data kinds -> coll_store.apply_installment_correction
+                  (master change + status flip in ONE transaction), then
+                  refresh staged display balances. Deliberately no
+                  stage-based block: the approve-submit and post gates
+                  re-validate every payment against CURRENT master balance,
+                  so a payment invalidated by a correction is caught there
+                  and remedied by the existing Return flow.
+    'apply', collection_amount -> _apply_collection_correction (edits the
+                  staged report, not master — see its docstring).
+    'reject' / 'withdraw' -> one UPDATE stamping the resolution fields.
+
+    Returns the updated correction dict. Raises ValueError (request missing /
+    not open, voucher missing, negative balance, stage guard) or
+    coll_store.CorrectionConflict (raise-time snapshot went stale).
+    """
+    if action == "apply":
+        corr = load_correction(corr_id)
+        if corr is None or corr["status"] != "open":
+            raise ValueError(f"correction {corr_id} is not open")
+        if corr["kind"] == "collection_amount":
+            return _apply_collection_correction(corr, resolved_by, resolution_note)
+        corr = apply_installment_correction(corr_id, resolved_by, resolution_note or "")
+        _refresh_staged_balances(corr["bill_no"])
+        return corr
+    if action in ("reject", "withdraw"):
+        return resolve_correction(corr_id, "rejected" if action == "reject" else "withdrawn",
+                                  resolved_by, resolution_note or "")
+    raise ValueError(f"unknown correction action {action!r}")

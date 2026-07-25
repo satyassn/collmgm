@@ -9,13 +9,15 @@ Run via:  run_server.bat
 import re
 import secrets
 import sys
+import threading
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, Form, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -23,11 +25,16 @@ from coll_orchestrate import (
     StageError, ValidationError,
     prepare_submit_review, apply_submit_approval,
     ActiveReportState, check_active_beat_report, generate_collection_list, apply_start_approval,
+    set_start_verification, is_start_verification_complete,
+    set_submit_verification, is_submit_verification_complete,
+    apply_correction_request, _find_active_report_for_bill,
     compute_payment_dates, record_submit_payments, validate_payment,
+    validate_staged_report, format_submit_validation_errors,
     post_confirmed_report, return_post_stage,
 )
 from coll_store import (
     STAGING_DIR,
+    CorrectionConflict,
     _load_installments,
     _load_pending_start_reports,
     _load_pending_submit_reports,
@@ -35,8 +42,13 @@ from coll_store import (
     build_print_collection_html,
     cancel_staging_report,
     ensure_db,
+    insert_correction,
+    list_staging_reports,
+    load_correction,
+    load_corrections,
     load_permissions,
     load_report_json,
+    open_corrections_for_bills,
     parse_decimal,
     read_finalize_checkpoint,
     verify_user,
@@ -68,6 +80,13 @@ templates = Jinja2Templates(directory=str(ROOT_DIR / "templates"))
 # In-memory sessions: token -> User namedtuple
 _sessions: dict = {}
 _SESSION_COOKIE = "collmgm_session"
+
+# Serializes read-modify-write of a staging report between the verify endpoint
+# and the approve-start action handler. Process-local only (like _sessions, a
+# single-process deployment is assumed); a concurrent CLI process racing these
+# writes is narrowed — not eliminated — by re-loading the report after the
+# lock is taken.
+_verify_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +412,40 @@ def coll_approve_start(request: Request):
     return _tmpl("coll/approve_start.html", request, user=user, reports=reports)
 
 
+def _render_start_review(request, user, stem, data, error=None):
+    """Render the Approve Collection List review screen.
+
+    Shared by the GET route and the approve action's gate-failure path so a
+    blocked approve keeps the supervisor on the review with an error banner
+    instead of dead-ending on error.html. The per-voucher `verified` and
+    correction flags are render-time only, like _enrich_vouchers' fields —
+    never persisted.
+    """
+    sel = data.get("selection", [])
+    vouchers = sorted(data.get("vouchers", []), key=lambda v: bill_no_sort_key(v["bill_no"]))
+    total = sum(parse_decimal(v.get("balance")) for v in vouchers)
+    marked = set(data.get("verification", {}).get("bill_nos", []))
+    bill_nos = [v["bill_no"] for v in vouchers]
+    open_map = open_corrections_for_bills(bill_nos)
+    applied_bills = {c["bill_no"] for c in load_corrections(statuses=["applied"])
+                     if c["bill_no"] in set(bill_nos)}
+    for v in vouchers:
+        v["verified"] = v["bill_no"] in marked
+        v["correction_open"] = v["bill_no"] in open_map
+        v["correction_applied"] = v["bill_no"] in applied_bills
+    open_count = sum(len(reqs) for reqs in open_map.values())
+    return _tmpl("coll/approve_start_review.html", request, user=user,
+                 stem=stem, data=data, vouchers=_enrich_vouchers(vouchers),
+                 beat=sel[0] if sel else "",
+                 salesman=sel[1] if len(sel) > 1 else "",
+                 total_balance=total,
+                 verified_count=sum(1 for v in vouchers if v["verified"]),
+                 count_verified=bool(data.get("verification", {}).get("count")),
+                 all_verified=is_start_verification_complete(data) and not open_count,
+                 open_corrections=open_count,
+                 error=error)
+
+
 @app.get("/coll/approve-start/{stem}", response_class=HTMLResponse)
 def coll_approve_start_review(request: Request, stem: str):
     user, err = _require(request, "coll_approve_start")
@@ -401,14 +454,52 @@ def coll_approve_start_review(request: Request, stem: str):
     json_path, data = _load_staging_report(stem)
     if json_path is None:
         return _tmpl("error.html", request, user=user, message="Report not found.")
-    sel = data.get("selection", [])
-    vouchers = sorted(data.get("vouchers", []), key=lambda v: bill_no_sort_key(v["bill_no"]))
-    total = sum(parse_decimal(v.get("balance")) for v in vouchers)
-    return _tmpl("coll/approve_start_review.html", request, user=user,
-                 stem=stem, data=data, vouchers=_enrich_vouchers(vouchers),
-                 beat=sel[0] if sel else "",
-                 salesman=sel[1] if len(sel) > 1 else "",
-                 total_balance=total)
+    return _render_start_review(request, user, stem, data)
+
+
+@app.post("/coll/approve-start/{stem}/verify")
+def coll_approve_start_verify(request: Request, stem: str,
+                              bill_no: str = Form(default=""),
+                              verified: str = Form(default=""),
+                              count: str = Form(default="")):
+    """Persist one verification toggle (a voucher checkbox or the count box).
+
+    Called by page-script fetch, so responses are JSON with real status codes
+    (_require's HTML error pages would come back 200 and be indistinguishable
+    from success to the client script).
+    """
+    user = _get_user(request)
+    if not user:
+        return JSONResponse({"ok": False, "error": "auth"}, status_code=401)
+    try:
+        perms = load_permissions()
+    except FileNotFoundError:
+        return JSONResponse({"ok": False, "error": "perms"}, status_code=403)
+    if "coll_approve_start" not in perms.get(user.role, frozenset()):
+        return JSONResponse({"ok": False, "error": "perms"}, status_code=403)
+    bill_no = bill_no.strip()
+    if bool(bill_no) == bool(count):  # exactly one of the two per request
+        return JSONResponse({"ok": False, "error": "params"}, status_code=400)
+    # A voucher with an open correction cannot be verified — its numbers are
+    # disputed until the distributor applies or rejects the request.
+    if bill_no and open_corrections_for_bills([bill_no]):
+        return JSONResponse({"ok": False, "error": "correction"}, status_code=409)
+    with _verify_lock:
+        json_path, data = _load_staging_report(stem)  # fresh copy under the lock
+        if json_path is None:
+            return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+        try:
+            if bill_no:
+                set_start_verification(json_path, data, bill_no=bill_no,
+                                       verified=(verified == "1"))
+            else:
+                set_start_verification(json_path, data,
+                                       count_verified=(count == "1"))
+        except StageError:
+            return JSONResponse({"ok": False, "error": "stage"}, status_code=409)
+        except ValueError:
+            return JSONResponse({"ok": False, "error": "unknown_bill"}, status_code=404)
+    return JSONResponse({"ok": True})
 
 
 @app.post("/coll/approve-start/{stem}", response_class=HTMLResponse)
@@ -418,13 +509,33 @@ def coll_approve_start_action(request: Request, stem: str, action: str = Form(de
         return err
     if action not in ("approve", "return", "cancel"):
         return _r("/coll/approve-start")
-    json_path, data = _load_staging_report(stem)
-    if json_path is None:
-        return _tmpl("error.html", request, user=user, message="Report not found.")
-    try:
-        apply_start_approval(json_path, data, action)
-    except StageError as e:
-        return _tmpl("error.html", request, user=user, message=str(e))
+    with _verify_lock:
+        json_path, data = _load_staging_report(stem)
+        if json_path is None:
+            return _tmpl("error.html", request, user=user, message="Report not found.")
+        # Web-only hard gate: physical-voucher verification must be complete
+        # and no correction request may be pending before approval. The CLI
+        # approve flow (apply_start_approval) is deliberately not gated —
+        # checkboxes are a screen interaction.
+        if action == "approve":
+            open_map = open_corrections_for_bills(
+                [v.get("bill_no") for v in data.get("vouchers", [])
+                 if isinstance(v, dict)])
+            if open_map:
+                n = sum(len(reqs) for reqs in open_map.values())
+                return _render_start_review(
+                    request, user, stem, data,
+                    error=f"Cannot approve — {n} correction request"
+                          f"{'s are' if n != 1 else ' is'} awaiting the distributor.")
+            if not is_start_verification_complete(data):
+                return _render_start_review(
+                    request, user, stem, data,
+                    error="Cannot approve — verify every voucher and the voucher "
+                          "count against the physical bundle first.")
+        try:
+            apply_start_approval(json_path, data, action)
+        except StageError as e:
+            return _tmpl("error.html", request, user=user, message=str(e))
 
     if action in ("return", "cancel"):
         msg = ("Collection list returned — salesman must regenerate." if action == "return"
@@ -598,6 +709,43 @@ def coll_approve_submit(request: Request):
     return _tmpl("coll/approve_submit.html", request, user=user, reports=reports)
 
 
+def _render_submit_review(request, user, stem, json_path, data, error=None):
+    """Render the Approve Collections review screen.
+
+    Shared by the GET route and the approve action's gate-failure path
+    (blocked approve keeps the supervisor on the review with an error
+    banner). Correction and verification flags are render-time only —
+    verification itself IS persisted (via the /verify endpoint) but the
+    per-voucher `verified` flag attached here is just a read of that state,
+    same pattern as _render_start_review.
+    """
+    data = prepare_submit_review(json_path, data)
+    vouchers = data["vouchers"]
+    sel = data.get("selection", [])
+    total_collected = sum(parse_decimal(v.get("payment")) for v in vouchers)
+    paid_count = sum(1 for v in vouchers if parse_decimal(v.get("payment")) > 0)
+    bill_nos = [v["bill_no"] for v in vouchers]
+    open_map = open_corrections_for_bills(bill_nos)
+    applied_bills = {c["bill_no"] for c in load_corrections(statuses=["applied"])
+                     if c["bill_no"] in set(bill_nos)}
+    marked = set(data.get("verification", {}).get("bill_nos", []))
+    for v in vouchers:
+        v["correction_open"] = v["bill_no"] in open_map
+        v["correction_applied"] = v["bill_no"] in applied_bills
+        v["verified"] = v["bill_no"] in marked
+    open_count = sum(len(reqs) for reqs in open_map.values())
+    return _tmpl("coll/approve_submit_review.html", request, user=user,
+                 stem=stem, data=data, vouchers=_enrich_vouchers(vouchers),
+                 beat=sel[0] if sel else "",
+                 salesman=sel[1] if len(sel) > 1 else "",
+                 total_collected=total_collected, paid_count=paid_count,
+                 open_corrections=open_count,
+                 verified_count=sum(1 for v in vouchers if v["verified"]),
+                 count_verified=bool(data.get("verification", {}).get("count")),
+                 all_verified=is_submit_verification_complete(data) and not open_count,
+                 error=error)
+
+
 @app.get("/coll/approve-submit/{stem}", response_class=HTMLResponse)
 def coll_approve_submit_review(request: Request, stem: str):
     user, err = _require(request, "coll_approve_submit")
@@ -606,16 +754,51 @@ def coll_approve_submit_review(request: Request, stem: str):
     json_path, data = _load_staging_report(stem)
     if json_path is None:
         return _tmpl("error.html", request, user=user, message="Report not found.")
-    data = prepare_submit_review(json_path, data)
-    vouchers = data["vouchers"]
-    sel = data.get("selection", [])
-    total_collected = sum(parse_decimal(v.get("payment")) for v in vouchers)
-    paid_count = sum(1 for v in vouchers if parse_decimal(v.get("payment")) > 0)
-    return _tmpl("coll/approve_submit_review.html", request, user=user,
-                 stem=stem, data=data, vouchers=_enrich_vouchers(vouchers),
-                 beat=sel[0] if sel else "",
-                 salesman=sel[1] if len(sel) > 1 else "",
-                 total_collected=total_collected, paid_count=paid_count)
+    return _render_submit_review(request, user, stem, json_path, data)
+
+
+@app.post("/coll/approve-submit/{stem}/verify")
+def coll_approve_submit_verify(request: Request, stem: str,
+                               bill_no: str = Form(default=""),
+                               verified: str = Form(default=""),
+                               count: str = Form(default="")):
+    """Persist one verification toggle (a voucher checkbox or the count box).
+
+    Mirror of coll_approve_start_verify for the evening cross-check. JSON
+    responses for the page-script fetch caller; shares _verify_lock with the
+    start-stage endpoint (single-process deployment, same serialization
+    concern for either report's read-modify-write).
+    """
+    user = _get_user(request)
+    if not user:
+        return JSONResponse({"ok": False, "error": "auth"}, status_code=401)
+    try:
+        perms = load_permissions()
+    except FileNotFoundError:
+        return JSONResponse({"ok": False, "error": "perms"}, status_code=403)
+    if "coll_approve_submit" not in perms.get(user.role, frozenset()):
+        return JSONResponse({"ok": False, "error": "perms"}, status_code=403)
+    bill_no = bill_no.strip()
+    if bool(bill_no) == bool(count):
+        return JSONResponse({"ok": False, "error": "params"}, status_code=400)
+    if bill_no and open_corrections_for_bills([bill_no]):
+        return JSONResponse({"ok": False, "error": "correction"}, status_code=409)
+    with _verify_lock:
+        json_path, data = _load_staging_report(stem)
+        if json_path is None:
+            return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+        try:
+            if bill_no:
+                set_submit_verification(json_path, data, bill_no=bill_no,
+                                        verified=(verified == "1"))
+            else:
+                set_submit_verification(json_path, data,
+                                        count_verified=(count == "1"))
+        except StageError:
+            return JSONResponse({"ok": False, "error": "stage"}, status_code=409)
+        except ValueError:
+            return JSONResponse({"ok": False, "error": "unknown_bill"}, status_code=404)
+    return JSONResponse({"ok": True})
 
 
 @app.post("/coll/approve-submit/{stem}", response_class=HTMLResponse)
@@ -625,13 +808,47 @@ def coll_approve_submit_action(request: Request, stem: str, action: str = Form(d
         return err
     if action not in ("approve", "return"):
         return _r("/coll/approve-submit")
-    json_path, data = _load_staging_report(stem)
-    if json_path is None:
-        return _tmpl("error.html", request, user=user, message="Report not found.")
-    try:
-        apply_submit_approval(json_path, data, action)
-    except (StageError, ValidationError) as e:
-        return _tmpl("error.html", request, user=user, message=str(e))
+    with _verify_lock:
+        json_path, data = _load_staging_report(stem)
+        if json_path is None:
+            return _tmpl("error.html", request, user=user, message="Report not found.")
+        # Gate order on approve — but ONLY when the report is actually in the
+        # 'submitted' stage apply_submit_approval requires: validate_payment
+        # and the two web-only gates below are meaningless (and, worse,
+        # misleading) for a report already confirmed/returned/in-progress —
+        # that case must fall straight through to apply_submit_approval's own
+        # StageError so the existing wrong-stage message still surfaces.
+        # Within 'submitted': data validity first (a genuinely bad payment
+        # must never be masked by a "please verify" message — same defense
+        # apply_submit_approval performs, checked here early so it renders
+        # via error.html exactly as before this feature existed), then the
+        # two web-only gates — open correction requests, then verification
+        # completeness. Return stays available either way — it is the
+        # documented remedy for both (a correction auto-settles on a
+        # matching resubmission; verification simply restarts on the
+        # resubmitted report, which the stage guard already clears).
+        if action == "approve" and data.get("stages", {}).get("submit") == "submitted":
+            errors = validate_staged_report(data)
+            if errors:
+                return _tmpl("error.html", request, user=user,
+                             message=format_submit_validation_errors(errors))
+            open_map = open_corrections_for_bills(
+                [v.get("bill_no") for v in data.get("vouchers", []) if isinstance(v, dict)])
+            if open_map:
+                n = sum(len(reqs) for reqs in open_map.values())
+                return _render_submit_review(
+                    request, user, stem, json_path, data,
+                    error=f"Cannot approve — {n} correction request"
+                          f"{'s are' if n != 1 else ' is'} awaiting resolution.")
+            if not is_submit_verification_complete(data):
+                return _render_submit_review(
+                    request, user, stem, json_path, data,
+                    error="Cannot approve — verify every voucher and confirm the "
+                          "returned-voucher count against your notes first.")
+        try:
+            apply_submit_approval(json_path, data, action)
+        except (StageError, ValidationError) as e:
+            return _tmpl("error.html", request, user=user, message=str(e))
 
     if action == "return":
         return _tmpl("message.html", request, user=user,
@@ -712,7 +929,8 @@ def coll_post_action(request: Request, stem: str, action: str = Form(default="")
 # ---------------------------------------------------------------------------
 
 @app.get("/voucher/{bill_no}", response_class=HTMLResponse)
-def voucher_detail(request: Request, bill_no: str, fragment: int = 0):
+def voucher_detail(request: Request, bill_no: str, fragment: int = 0,
+                   correct: str = ""):
     # No permission key: any logged-in user may look up a voucher, same as
     # the Voucher Search report this view reuses.
     user, err = _require(request)
@@ -726,11 +944,348 @@ def voucher_detail(request: Request, bill_no: str, fragment: int = 0):
         return _tmpl("error.html", request, user=user,
                      message=f"No voucher found for: {bill_no.strip()}")
     voucher, installments, is_completed = result
+    # `correct` (a validated return path) opts the inline fragment into a
+    # Raise Correction button — only set by the approval review screens, and
+    # only rendered for roles holding raise_correction on active vouchers.
+    correct_from = _safe_from(correct) if correct else ""
+    can_raise = False
+    if correct_from and not is_completed:
+        try:
+            can_raise = "raise_correction" in load_permissions().get(user.role, frozenset())
+        except FileNotFoundError:
+            can_raise = False
     # Inline expand gets the slim installments-only partial; the standalone
     # page (and Voucher Search's include) keep the full card.
     template = "_voucher_inline.html" if fragment else "voucher.html"
     return _tmpl(template, request, user=user,
-                 voucher=voucher, installments=installments, is_completed=is_completed)
+                 voucher=voucher, installments=installments, is_completed=is_completed,
+                 correct_from=correct_from, can_raise=can_raise)
+
+
+# ---------------------------------------------------------------------------
+# Correction Requests
+# ---------------------------------------------------------------------------
+
+# Return-path whitelist for the raise form's from= param: relative /coll/...
+# paths only, so a crafted link can't bounce the user off-site.
+_FROM_RE = re.compile(r"^/coll/[A-Za-z0-9_/.\-]*$")
+
+_MASTER_KIND_LABELS = {
+    "installment_amount": "Change an installment amount",
+    "installment_delete": "Delete an installment",
+    "installment_add": "Add a missing installment",
+    "voucher_amount": "Change the voucher amount",
+}
+
+# Display map for ALL kinds (list/detail pages show any stored request).
+_KIND_LABELS = dict(_MASTER_KIND_LABELS)
+_KIND_LABELS["collection_amount"] = "Change the collection amount"
+
+
+def _kinds_for_stage(origin_stage):
+    """Kinds raiseable from a given approval screen (user decision):
+    Approve Collections may correct ONLY this cycle's collection amount —
+    never the voucher amount or past installments; those master-data kinds
+    belong to the Approve Collection List review alone."""
+    if origin_stage == "submit":
+        return {"collection_amount": _KIND_LABELS["collection_amount"]}
+    return _MASTER_KIND_LABELS
+
+
+def _safe_from(from_path):
+    return from_path if from_path and _FROM_RE.match(from_path) else "/menu"
+
+
+def _correction_context(from_path):
+    """Derive the audit-only (report_stem, origin_stage) from the from= path."""
+    m = re.match(r"^/coll/approve-(start|submit)/([A-Za-z0-9_.\-]+)$", from_path or "")
+    if not m:
+        return "", ""
+    return m.group(2), m.group(1)
+
+
+def _valid_amount(raw):
+    """Strict positive money amount in the DB's written format, or None."""
+    s = (raw or "").strip()
+    if not s or re.search(r"[^0-9.]", s):
+        return None
+    try:
+        d = Decimal(s)
+    except InvalidOperation:
+        return None
+    if not d.is_finite() or d <= 0:
+        return None
+    return str(d.quantize(Decimal("0.01")))
+
+
+def _valid_past_date(raw):
+    """ISO YYYY-MM-DD, not in the future (mirrors the payment_date rule), or None."""
+    s = (raw or "").strip()
+    try:
+        if datetime.strptime(s, "%Y-%m-%d").date() > datetime.now().date():
+            return None
+    except ValueError:
+        return None
+    return s
+
+
+def _can_act_on(corr, user):
+    """Per-kind resolution authority (user decision): collection_amount is
+    staged approval data, so anyone who can approve collections may resolve
+    it (coll_approve_submit: supervisor + distributor); the master-data
+    kinds stay distributor-only (apply_correction)."""
+    key = ("coll_approve_submit" if corr["kind"] == "collection_amount"
+           else "apply_correction")
+    try:
+        return key in load_permissions().get(user.role, frozenset())
+    except FileNotFoundError:
+        return False
+
+
+def _render_correction_form(request, user, voucher, installments, back, error=None):
+    _, origin_stage = _correction_context(back)
+    kinds = _kinds_for_stage(origin_stage)
+    staged_payment = None
+    if "collection_amount" in kinds:
+        _, _, sv = _find_active_report_for_bill(voucher["bill_no"])
+        if sv is not None:
+            staged_payment = (sv.get("payment") or "").strip()
+    existing = [c for c in load_corrections()
+                if c["bill_no"] == voucher["bill_no"]][:10]
+    return _tmpl("coll/correction_form.html", request, user=user,
+                 voucher=voucher, installments=installments, back=back,
+                 kinds=kinds, kind_labels=_KIND_LABELS,
+                 staged_payment=staged_payment,
+                 existing=existing, error=error)
+
+
+def _load_correction_target(request, user, bill_no):
+    """Resolve an active (non-completed) voucher for correction, or an error page."""
+    result = search_voucher(bill_no)
+    if result is None:
+        return None, _tmpl("error.html", request, user=user,
+                           message=f"No voucher found for: {bill_no.strip()}")
+    voucher, installments, is_completed = result
+    if is_completed:
+        return None, _tmpl("error.html", request, user=user,
+                           message="Completed vouchers cannot be corrected here.")
+    return (voucher, installments), None
+
+
+@app.get("/coll/correct/{bill_no}", response_class=HTMLResponse)
+def coll_correction_form(request: Request, bill_no: str,
+                         from_path: str = Query(default="/menu", alias="from")):
+    user, err = _require(request, "raise_correction")
+    if err:
+        return err
+    target, err = _load_correction_target(request, user, bill_no)
+    if err:
+        return err
+    voucher, installments = target
+    return _render_correction_form(request, user, voucher, installments,
+                                   back=_safe_from(from_path))
+
+
+@app.post("/coll/correct/{bill_no}", response_class=HTMLResponse)
+def coll_correction_submit(request: Request, bill_no: str,
+                           action: str = Form(default="raise"),
+                           kind: str = Form(default=""),
+                           installment_id: str = Form(default=""),
+                           new_amount: str = Form(default=""),
+                           new_date: str = Form(default=""),
+                           note: str = Form(default=""),
+                           corr_id: str = Form(default=""),
+                           from_path: str = Form(default="/menu", alias="from")):
+    user, err = _require(request, "raise_correction")
+    if err:
+        return err
+    back = _safe_from(from_path)
+    target, err = _load_correction_target(request, user, bill_no)
+    if err:
+        return err
+    voucher, installments = target
+
+    def form_error(msg):
+        return _render_correction_form(request, user, voucher, installments,
+                                       back=back, error=msg)
+
+    if action == "withdraw":
+        corr = load_correction(int(corr_id)) if corr_id.isdigit() else None
+        if (corr is None or corr["bill_no"] != voucher["bill_no"]
+                or corr["requested_by"] != user.name):
+            return form_error("Only your own requests for this voucher can be withdrawn.")
+        try:
+            apply_correction_request(corr["id"], "withdraw", user.name)
+        except ValueError as e:
+            return form_error(str(e))
+        return _r(f"/coll/correct/{voucher['bill_no']}?from={back}")
+
+    # Kinds are context-restricted: only what this approval screen may raise.
+    if kind not in _kinds_for_stage(_correction_context(back)[1]):
+        return form_error("Choose what kind of correction to request.")
+
+    record = {"kind": kind, "bill_no": voucher["bill_no"], "note": note.strip(),
+              "requested_by": user.name,
+              "requested_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S")}
+    record["report_stem"], record["origin_stage"] = _correction_context(back)
+
+    if kind == "collection_amount":
+        _, rdata, sv = _find_active_report_for_bill(voucher["bill_no"])
+        if sv is None or (rdata.get("stages", {}).get("submit") or "") != "submitted":
+            return form_error("This voucher is not in a collection report awaiting approval.")
+        staged_payment = (sv.get("payment") or "").strip()
+        corrected = (new_amount or "").strip()
+        if corrected:
+            # voucher comes from master (search_voucher) -> current master balance.
+            corrected, reason = validate_payment(corrected, voucher["balance"])
+            if reason:
+                return form_error(f"Corrected collection {reason}.")
+            if Decimal(corrected) == 0:
+                corrected = ""  # zero and empty both mean: no collection
+        if corrected == staged_payment:
+            return form_error("The corrected collection is the same as the entered one.")
+        record["old"] = {"payment": staged_payment,
+                         "date": (sv.get("payment_date") or "").strip()}
+        record["new"] = {"payment": corrected}
+    elif kind in ("installment_amount", "installment_delete"):
+        inst = next((i for i in installments
+                     if str(i.get("id")) == installment_id.strip()), None)
+        if inst is None:
+            return form_error("Pick the installment this correction applies to.")
+        record["installment_id"] = inst["id"]
+        record["old"] = {"date": inst["date"], "amount": inst["amount"]}
+        if kind == "installment_amount":
+            amount = _valid_amount(new_amount)
+            if amount is None:
+                return form_error("Enter a valid corrected amount (positive, max 2 decimals).")
+            if amount == str(parse_decimal(inst["amount"]).quantize(Decimal("0.01"))):
+                return form_error("The corrected amount is the same as the recorded one.")
+            record["new"] = {"amount": amount}
+    elif kind == "installment_add":
+        amount = _valid_amount(new_amount)
+        if amount is None:
+            return form_error("Enter a valid installment amount (positive, max 2 decimals).")
+        date = _valid_past_date(new_date)
+        if date is None:
+            return form_error("Enter a valid installment date (YYYY-MM-DD, not in the future).")
+        record["new"] = {"date": date, "amount": amount}
+    else:  # voucher_amount
+        amount = _valid_amount(new_amount)
+        if amount is None:
+            return form_error("Enter a valid voucher amount (positive, max 2 decimals).")
+        if amount == str(parse_decimal(voucher["amount"]).quantize(Decimal("0.01"))):
+            return form_error("The corrected amount is the same as the recorded one.")
+        record["old"] = {"amount": voucher["amount"]}
+        record["new"] = {"amount": amount}
+
+    insert_correction(record)
+    return _r(back)
+
+
+def _workflow_link(data, stem):
+    """Resolve the gated-workflow link/label for a report a correction blocks."""
+    stages = data.get("stages", {})
+    if stages.get("start") == "new":
+        return f"/coll/approve-start/{stem}", "Awaiting Collection List approval"
+    submit = stages.get("submit", "")
+    if submit == "submitted":
+        return f"/coll/approve-submit/{stem}", "Awaiting Collections approval"
+    if submit == "confirmed":
+        return f"/coll/post/{stem}", "Awaiting posting"
+    if submit in ("inprogress", "returned"):
+        return None, "With salesman (submission in progress)"
+    return None, "Approved list awaiting submission"
+
+
+@app.get("/coll/corrections", response_class=HTMLResponse)
+def coll_corrections(request: Request):
+    user, err = _require(request, "raise_correction")
+    if err:
+        return err
+    # Load active staging reports ONCE; both the active/history split and the
+    # gated-workflow links derive from this lookup by bill_no. Nothing is
+    # stored: an applied record drops to history the moment its report posts
+    # or is cancelled, and resurfaces if the bill re-enters a new list.
+    bill_map = {}
+    for path in list_staging_reports():
+        try:
+            data = load_report_json(path)
+        except Exception:
+            continue
+        for v in data.get("vouchers", []):
+            if isinstance(v, dict) and v.get("bill_no"):
+                bill_map.setdefault(v["bill_no"], (path.stem, data))
+
+    def entry(corr):
+        hit = bill_map.get(corr["bill_no"])
+        link = label = None
+        if hit:
+            link, label = _workflow_link(hit[1], hit[0])
+        return {"corr": corr, "link": link, "label": label,
+                "can_act": _can_act_on(corr, user)}
+
+    active, history = [], []
+    for corr in load_corrections():
+        if corr["status"] == "open" or (corr["status"] == "applied"
+                                        and corr["bill_no"] in bill_map):
+            active.append(entry(corr))
+        else:
+            history.append(corr)
+    return _tmpl("coll/corrections.html", request, user=user,
+                 active=active, history=history[:20], kinds=_KIND_LABELS)
+
+
+@app.get("/coll/corrections/{cid}", response_class=HTMLResponse)
+def coll_correction_review(request: Request, cid: int):
+    user, err = _require(request, "raise_correction")
+    if err:
+        return err
+    corr = load_correction(cid)
+    if corr is None:
+        return _tmpl("error.html", request, user=user, message="Correction request not found.")
+    result = search_voucher(corr["bill_no"])
+    voucher = installments = None
+    if result is not None:
+        voucher, installments, _completed = result
+    staged_payment = None
+    if corr["kind"] == "collection_amount":
+        _, _, sv = _find_active_report_for_bill(corr["bill_no"])
+        if sv is not None:
+            staged_payment = (sv.get("payment") or "").strip()
+    return _tmpl("coll/correction_review.html", request, user=user,
+                 corr=corr, voucher=voucher, installments=installments,
+                 staged_payment=staged_payment,
+                 kinds=_KIND_LABELS, can_apply=_can_act_on(corr, user))
+
+
+@app.post("/coll/corrections/{cid}", response_class=HTMLResponse)
+def coll_correction_action(request: Request, cid: int,
+                           action: str = Form(default=""),
+                           resolution_note: str = Form(default="")):
+    # Resolution authority is per kind (_can_act_on), not one permission key:
+    # supervisors may resolve collection_amount requests but not master kinds.
+    user, err = _require(request)
+    if err:
+        return err
+    corr = load_correction(cid)
+    if corr is None:
+        return _tmpl("error.html", request, user=user, message="Correction request not found.")
+    if not _can_act_on(corr, user):
+        return _tmpl("error.html", request, user=user,
+                     message="You don't have permission for this action.")
+    if action not in ("apply", "reject"):
+        return _r("/coll/corrections")
+    try:
+        apply_correction_request(cid, action, user.name, resolution_note.strip())
+    except CorrectionConflict as e:
+        return _tmpl("error.html", request, user=user, message=str(e))
+    except ValueError as e:
+        return _tmpl("error.html", request, user=user, message=str(e))
+    msg = (("Correction applied — the staged collection was updated."
+            if corr["kind"] == "collection_amount"
+            else "Correction applied — master data updated and staged balances refreshed.")
+           if action == "apply" else "Correction rejected.")
+    return _tmpl("message.html", request, user=user, message=msg, back="/coll/corrections")
 
 
 # ---------------------------------------------------------------------------

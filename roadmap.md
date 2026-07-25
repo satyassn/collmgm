@@ -2,6 +2,41 @@
 
 ## Released
 
+### iteration3 — Approval Verification + Correction Requests (web)
+
+Adds a physical-voucher verification workflow and a correction-request system to the two supervisor approval screens, closing the gap between what's on paper and what's staged in the system. Web-only throughout — the CLI approve flows are unaffected.
+
+- **Phase 1 — Approve Collection List verification:** per-voucher + bundle-count checkboxes cross-check the staged list against the physical vouchers pulled from the locker; installment history auto-expands per active voucher (accordion, check-to-advance); Approve is hard-gated until every checkbox is ticked.
+- **Phase 2 — Correction requests (master data):** a supervisor raises a structured correction (`installment_amount` / `installment_delete` / `installment_add` / `voucher_amount`) with a note; the distributor applies it (atomic master-data change + balance recompute) or rejects it from a dedicated Correction Requests screen. An open request blocks that voucher's verification and the list's approval; resolved requests are kept as an audit trail.
+- **Phase 3 — Correction requests (collection amount):** at Approve Collections, a narrower correction kind lets the supervisor or distributor fix only the collection amount entered this cycle — never master data. Alternatively, returning the report to the salesman auto-settles the request once the resubmitted amount matches what was asked for.
+- **Phase 4 — Approve Collections verification:** the same verification checkboxes, mirrored on the evening cross-check of returned vouchers and collected amounts; the bundle-count check reads "returned vouchers reconciled against my notes" since a voucher paid off in full is legitimately not returned.
+
+321 tests passing (up from 69 at the last README snapshot). Schema addition (`corrections` table): `schema.md`. State-machine documentation: `pipeline.md`.
+
+---
+
+### LAN Web App
+
+Browser-based access over the local network — no client install, works on desktop and mobile. Delivered incrementally as part of the ongoing alpha build line (see the `build/alpha-*` tags) rather than as a separately named release.
+
+**Stack as built** (two points differ from the original plan, noted below):
+
+| Layer | Technology | Notes |
+|---|---|---|
+| Backend | FastAPI + Uvicorn | Cookie-session auth, role-based routes mirroring the CLI workflow |
+| Frontend | Jinja2 templates + vanilla JS | No JS framework; a small amount of hand-written JS handles inline expand/accordion, live payment validation, and the verification screens above — **not HTMX**, as originally planned |
+| PWA | `manifest.json` + service worker | Home-screen icon on Android/iOS |
+| Database | SQLite (`sqlite3`, stdlib) | `data/collmgm.db`; CSVs remain the schema source of truth and first-run seed; versioned via `PRAGMA user_version` with additive/rebuild migrations in `coll_store.init_db()` |
+| Windows Service | NSSM wraps Uvicorn | Installer-driven (`packaging/service_setup.bat`); firewall rule opens port 8100 on LAN profiles |
+| Client | Chrome (Android) / Safari (iOS) | "Add to Home Screen" once, tap icon forever |
+
+- **Sub-milestone 1 (SQLite migration):** done — `coll_store.py` reads/writes `data/collmgm.db`; CSVs migrate in on first run.
+- **Sub-milestone 2 (FastAPI + web UI):** done — `scripts/coll_api.py`, `templates/`, `static/`; mobile-responsive (stacked-card tables, sticky action bars) added in a later pass.
+- **Sub-milestone 3 (Windows Service packaging):** done — `packaging/service_setup.bat` + `packaging/service_remove.bat`, wired into the Inno Setup installer (`packaging/setup.iss`).
+- **Not implemented from the original plan:** `zeroconf`/`collmgm.local` mDNS hostname broadcasting — devices currently reach the server by hostname/IP and port 8100 directly.
+
+---
+
 ### alpha — CLI with Login and RBAC
 **Release tag:** `CollMgm-alpha-20260701230618`
 
@@ -29,66 +64,6 @@ Builds on beta0.1 and adds authenticated access with role-based workflow gates.
 
 ## Planned
 
-### LAN Web App
+### iteration4 — Voucher Amendment (parked)
 
-**Goal:** Browser-based access over the local network — no internet, no client install, works on desktop and mobile. Users get a home-screen icon (PWA) and a friendly hostname; the server runs as a Windows Service on the distributor's PC.
-
-**Decided stack:**
-
-| Layer | Technology | Reason |
-|---|---|---|
-| Backend | FastAPI + Uvicorn | Minimal Python, auto OpenAPI docs, async-ready |
-| Frontend | Jinja2 templates + HTMX | Server-rendered HTML, no JS framework, mobile-responsive |
-| PWA | `manifest.json` + service worker | Home-screen icon on Android/iOS — no app store |
-| LAN hostname | `zeroconf` → `collmgm.local` | Friendly mDNS name avoids raw IP; iOS/Android browsers support it natively |
-| Database | SQLite (`sqlite3`, stdlib) | Concurrent multi-user writes; CSV cannot handle LAN concurrency |
-| Windows Service | NSSM wraps Uvicorn | Auto-starts on boot, no user login required |
-| Client | Chrome (Android) / Safari (iOS) | Zero install; "Add to Home Screen" once, tap icon forever |
-
-**First-time device setup (one-off per phone):**
-1. Open browser → `http://collmgm.local:8100`
-2. Browser menu → Add to Home Screen
-3. Tap the icon from now on
-
----
-
-#### Sub-milestone 1 — SQLite migration
-
-Replaces CSV files with SQLite. `coll_store.py` is the only layer that changes; all code above it is unaffected.
-
-- New `coll_store_sqlite.py` implementing the same interface as `coll_store.py`
-- One-time migration script: CSV → SQLite on first run, preserving the existing schema exactly
-- Staging reports remain as JSON files (no change to staging layer)
-- All existing tests still pass — store abstraction shields them
-- Schema enhancements (new fields on users, beats, vouchers, installments) are deferred to a later milestone
-
-**Files:** `scripts/coll_store_sqlite.py` (new), `scripts/migrate_csv_to_sqlite.py` (new), `schema.md` (updated), `generate_test_data.py` (updated)
-
----
-
-#### Sub-milestone 2 — FastAPI backend + HTMX web UI
-
-Splits `coll_workflow.py` into pure logic and adds the web layer. CLI continues to work unchanged.
-
-- Refactor `coll_workflow.py`: strip all `input()`/`print()` into pure functions; `coll_cli.py` and the API both call the same functions
-- New `scripts/coll_api.py`: FastAPI app, cookie-based session auth, endpoints mirror the CLI workflow steps
-- New `templates/` directory: Jinja2 + HTMX screens for login, menu, all workflow steps, reports
-- Role-based UI: each role sees only their actions (salesman → submit, supervisor → approve, distributor → post)
-- PWA assets: `static/manifest.json`, `static/sw.js`, app icons
-- `zeroconf` broadcasts `collmgm.local` on LAN startup
-
-**Files:** `scripts/coll_api.py` (new), `templates/` (new), `static/` (new), `scripts/coll_workflow.py` (refactored)
-
----
-
-#### Sub-milestone 3 — Windows Service packaging
-
-Extends the existing installer to register and manage the web server as a Windows Service.
-
-- Bundle NSSM in the installer
-- Installer registers `collmgm-server` service: `nssm install collmgm-server uvicorn scripts.coll_api:app --host 0.0.0.0 --port 8100`
-- Adds Windows Firewall inbound rule for port 8100 (LAN only)
-- Installer upgrade-safe: service is stopped before upgrade, restarted after
-- Updated Inno Setup script
-
-**Files:** `installer/collmgm.iss` (updated), `installer/nssm.exe` (bundled)
+A raw, single-voucher editor for the distributor: all voucher fields plus full control of that voucher's installments, submitted as one atomic transaction with an audit trail (new `amendments` table). Complements iteration3's one-field-at-a-time correction requests for cases needing a multi-field fix. **Status: planned and designed, implementation not started** — needs explicit approval for the `amendments` schema change before coding begins. Full design: `iteration4.md`.

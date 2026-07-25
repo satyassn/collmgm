@@ -22,6 +22,37 @@ TL;DR: Define a proof-of-concept data schema, validation rules, and operational 
 > `permissions.csv`'s `role,action_key` columns) was added since permissions
 > are also now DB-backed like the other master data.
 
+- `corrections` (SQLite only, no CSV counterpart — added iteration3 with explicit approval)
+  - columns: `id` (INTEGER PK AUTOINCREMENT), `kind`
+    (`installment_amount | installment_delete | installment_add | voucher_amount | collection_amount`),
+    `bill_no`, `report_stem`, `origin_stage` (audit-only context captured at
+    raise time), `installment_id` (references the target installment's
+    surrogate id for the edit/delete kinds), `old_json` / `new_json`
+    (raise-time snapshot and requested change), `note`, `status`
+    (`open | applied | rejected | withdrawn`), `requested_by`, `requested_at`,
+    `resolved_by`, `resolved_at`, `resolution_note`.
+  - Purpose: supervisor-raised correction requests. The four master-data
+    kinds (raiseable only from Approve Collection List) are applied or
+    rejected by the distributor: applying re-checks `old_json` against the
+    current row (stale requests refuse), performs the change, and recomputes
+    the voucher balance (`amount − SUM(installments)`, negative refused) in
+    one transaction with the status flip. `collection_amount` (raiseable only
+    from Approve Collections) instead edits the STAGED report's payment for
+    this cycle — report JSON + TXT + installments sidecar, then the status
+    flip; staging files and the DB cannot share a transaction, so a crash
+    between surfaces as an explicit snapshot conflict on retry. Resolved rows
+    are never deleted — they are the audit trail. An open request blocks web
+    approval of any staging report containing its `bill_no`.
+  - Widening the `kind` CHECK for installed DBs is handled by
+    `_migrate_corrections_kinds` (self-detecting table rebuild via
+    `sqlite_master`; no `user_version` bump).
+  - Permission keys: `raise_correction` (supervisor, distributor; also the
+    view permission for the corrections screens); `apply_correction`
+    (distributor only) resolves the master-data kinds; `collection_amount`
+    is resolved by anyone holding `coll_approve_submit` (supervisor,
+    distributor) — or by Return-to-salesman, which auto-settles the request
+    when the resubmitted payment matches the requested value.
+
 - CSV conventions (applies to all files):
   - Delimiter: comma `,`.
   - Header row required; UTF-8 encoded.

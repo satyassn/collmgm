@@ -11,4 +11,10 @@
   {% else %}
     <p class="muted">No installments collected yet.</p>
   {% endif %}
+  {% if correct_from and can_raise %}
+  <div class="inline-actions">
+    <a class="btn btn-sm btn-secondary"
+       href="/coll/correct/{{ voucher.bill_no | urlencode }}?from={{ correct_from | urlencode }}">Raise Correction</a>
+  </div>
+  {% endif %}
 </div>

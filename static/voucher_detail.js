@@ -4,8 +4,23 @@
  * beneath it, filled from GET <href>?fragment=1. Links outside a table,
  * modified clicks (new tab), and no-JS browsers fall back to normal
  * navigation to the full /voucher/{bill_no} page.
+ *
+ * A table carrying data-accordion keeps at most one detail row open:
+ * opening one closes any other open detail in the same table.
  */
 (function () {
+  function closeOthers(table, keepRow) {
+    if (!table || !table.hasAttribute("data-accordion")) return;
+    var open = table.querySelectorAll("tr.voucher-detail-row:not([hidden])");
+    for (var i = 0; i < open.length; i++) {
+      if (open[i] === keepRow) continue;
+      open[i].hidden = true;
+      var prevRow = open[i].previousElementSibling;
+      var prevLink = prevRow && prevRow.querySelector("a.voucher-link");
+      if (prevLink) prevLink.setAttribute("aria-expanded", "false");
+    }
+  }
+
   document.addEventListener("click", function (e) {
     var link = e.target.closest ? e.target.closest("a.voucher-link") : null;
     if (!link) return;
@@ -17,9 +32,11 @@
     var detail = row.nextElementSibling;
     if (detail && detail.classList.contains("voucher-detail-row")) {
       detail.hidden = !detail.hidden;
+      if (!detail.hidden) closeOthers(link.closest("table"), detail);
       link.setAttribute("aria-expanded", String(!detail.hidden));
       return;
     }
+    closeOthers(link.closest("table"), null);
 
     detail = document.createElement("tr");
     detail.className = "voucher-detail-row";
