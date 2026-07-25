@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Correction Requests — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Correction Requests</h2>
+
+{% if not active %}
+  <p class="empty-state">No open or active correction requests.</p>
+{% else %}
+  <ul class="report-list">
+    {% for e in active %}
+    <li class="report-item">
+      <span class="report-label">
+        <span class="mono">{{ e.corr.bill_no }}</span> — {{ kinds.get(e.corr.kind, e.corr.kind) }}
+        <span class="badge badge-{{ 'warn' if e.corr.status == 'open' else 'ok' }}">{{ 'Pending' if e.corr.status == 'open' else 'Applied' }}</span>
+      </span>
+      <span class="report-meta">
+        {{ e.corr.requested_by }} · {{ e.corr.requested_at[:10] }}
+        {% if e.label %} · {% if e.link %}<a href="{{ e.link }}">{{ e.label }}</a>{% else %}{{ e.label }}{% endif %}{% endif %}
+      </span>
+      <a class="btn btn-sm btn-primary" href="/coll/corrections/{{ e.corr.id }}">{{ 'Review' if e.can_act and e.corr.status == 'open' else 'View' }}</a>
+    </li>
+    {% endfor %}
+  </ul>
+{% endif %}
+
+{% if history %}
+<h3 class="group-heading">Recent History</h3>
+<ul class="report-list">
+  {% for c in history %}
+  <li class="report-item">
+    <span class="report-label">
+      <span class="mono">{{ c.bill_no }}</span> — {{ kinds.get(c.kind, c.kind) }}
+      <span class="badge badge-muted">{{ c.status }}</span>
+    </span>
+    <span class="report-meta">{{ c.resolved_by or c.requested_by }} · {{ (c.resolved_at or c.requested_at)[:10] }}{% if c.resolution_note %} · {{ c.resolution_note }}{% endif %}</span>
+    <a class="btn btn-sm btn-secondary" href="/coll/corrections/{{ c.id }}">View</a>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+<a class="btn btn-secondary" href="/menu">Back to Menu</a>
+{% endblock %}

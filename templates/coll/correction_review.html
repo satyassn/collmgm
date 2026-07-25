@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}Correction Request — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Correction Request #{{ corr.id }}</h2>
+<p class="meta-line">
+  <strong>Voucher:</strong> <span class="mono">{{ corr.bill_no }}</span>
+  &nbsp;|&nbsp; <strong>Type:</strong> {{ kinds.get(corr.kind, corr.kind) }}
+  &nbsp;|&nbsp; <span class="badge badge-{{ 'warn' if corr.status == 'open' else 'ok' if corr.status == 'applied' else 'muted' }}">{{ corr.status }}</span>
+</p>
+
+<div class="card">
+  <p><strong>Requested by:</strong> {{ corr.requested_by }} on {{ corr.requested_at[:10] }}</p>
+  {% if corr.kind == 'installment_amount' %}
+    <p><strong>Change:</strong> installment dated {{ corr.old.date }} —
+      <span class="mono">{{ corr.old.amount }}</span> &rarr; <span class="mono">{{ corr.new.amount }}</span></p>
+  {% elif corr.kind == 'installment_delete' %}
+    <p><strong>Change:</strong> delete installment dated {{ corr.old.date }} of
+      <span class="mono">{{ corr.old.amount }}</span></p>
+  {% elif corr.kind == 'installment_add' %}
+    <p><strong>Change:</strong> add installment dated {{ corr.new.date }} of
+      <span class="mono">{{ corr.new.amount }}</span></p>
+  {% elif corr.kind == 'collection_amount' %}
+    <p><strong>Change:</strong> collection entered this cycle —
+      <span class="mono">{{ corr.old.payment or "none" }}</span> &rarr;
+      <span class="mono">{{ corr.new.payment or "none (cleared)" }}</span></p>
+    {% if staged_payment is not none %}
+    <p><strong>Currently staged:</strong> <span class="mono">{{ staged_payment or "none" }}</span></p>
+    {% else %}
+    <p class="muted">The voucher is not in any active collection report right now.</p>
+    {% endif %}
+  {% else %}
+    <p><strong>Change:</strong> voucher amount
+      <span class="mono">{{ corr.old.amount }}</span> &rarr; <span class="mono">{{ corr.new.amount }}</span></p>
+  {% endif %}
+  {% if corr.note %}<p><strong>Note:</strong> {{ corr.note }}</p>{% endif %}
+  {% if corr.status != 'open' %}
+    <p><strong>Resolution:</strong> {{ corr.status }} by {{ corr.resolved_by }} on {{ (corr.resolved_at or '')[:10] }}{% if corr.resolution_note %} — {{ corr.resolution_note }}{% endif %}</p>
+  {% endif %}
+</div>
+
+<h3 class="group-heading">Current Master Data</h3>
+{% if voucher %}
+<div class="card">
+  <p><strong>Date:</strong> {{ voucher.date }}
+    &nbsp;|&nbsp; <strong>Amount:</strong> <span class="mono">{{ voucher.amount }}</span>
+    &nbsp;|&nbsp; <strong>Balance:</strong> <span class="mono">{{ voucher.balance }}</span></p>
+  {% if installments %}
+  <table class="data-table">
+    <thead><tr><th>Date</th><th class="num">Amount</th><th>Salesman</th></tr></thead>
+    <tbody>
+      {% for inst in installments %}
+      <tr{% if corr.installment_id and inst.id == corr.installment_id %} class="row-active"{% endif %}>
+        <td>{{ inst.date }}</td>
+        <td class="num mono">{{ inst.amount }}</td>
+        <td>{{ inst.salesman }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No installments recorded.</p>
+  {% endif %}
+</div>
+{% else %}
+<p class="alert alert-warn">Voucher not found among active vouchers (settled or archived since the request was raised).</p>
+{% endif %}
+
+{% if corr.status == 'open' and can_apply %}
+<form method="post" action="/coll/corrections/{{ corr.id }}" class="card">
+  <label class="field-label">Resolution note (optional)
+    <textarea name="resolution_note" rows="2" maxlength="500"></textarea>
+  </label>
+  <div class="action-row">
+    <button type="submit" name="action" value="apply" class="btn btn-primary"
+            onclick="return confirm('Apply this correction to master data?')">Apply</button>
+    <button type="submit" name="action" value="reject" class="btn btn-danger"
+            onclick="return confirm('Reject this correction request?')">Reject</button>
+    <a class="btn btn-secondary" href="/coll/corrections">Back</a>
+  </div>
+</form>
+{% else %}
+<div class="action-row">
+  <a class="btn btn-secondary" href="/coll/corrections">Back</a>
+</div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% block title %}Raise Correction — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Raise Correction</h2>
+<p class="meta-line"><strong>Voucher:</strong> <span class="mono">{{ voucher.bill_no }}</span>
+  &nbsp;|&nbsp; <strong>Date:</strong> {{ voucher.date }}
+  &nbsp;|&nbsp; <strong>Amount:</strong> <span class="mono">{{ voucher.amount }}</span>
+  &nbsp;|&nbsp; <strong>Balance:</strong> <span class="mono">{{ voucher.balance }}</span></p>
+
+{% if error %}<p class="alert alert-error">{{ error }}</p>{% endif %}
+
+<form method="post" action="/coll/correct/{{ voucher.bill_no | urlencode }}" class="card correction-form">
+  <input type="hidden" name="from" value="{{ back }}">
+
+  <fieldset class="kind-choice">
+    <legend>What is wrong?</legend>
+    {% for k, label in kinds.items() %}
+    <label class="kind-option"><input type="radio" name="kind" value="{{ k }}" required> {{ label }}</label>
+    {% endfor %}
+  </fieldset>
+
+  {% if "installment_amount" in kinds or "installment_delete" in kinds %}
+  <div class="field-group" data-kinds="installment_amount installment_delete" hidden>
+    <p class="group-heading">Which installment?</p>
+    {% if installments %}
+    <table class="data-table">
+      <thead><tr><th></th><th>Date</th><th class="num">Amount</th><th>Salesman</th></tr></thead>
+      <tbody>
+        {% for inst in installments %}
+        <tr>
+          <td><input type="radio" name="installment_id" value="{{ inst.id }}"
+                     aria-label="Installment {{ inst.date }} {{ inst.amount }}"></td>
+          <td>{{ inst.date }}</td>
+          <td class="num mono">{{ inst.amount }}</td>
+          <td>{{ inst.salesman }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">This voucher has no installments recorded.</p>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {% if "collection_amount" in kinds %}
+  <div class="field-group" data-kinds="collection_amount" hidden>
+    <p><strong>Current collection:</strong>
+      <span class="mono">{{ staged_payment or "none entered" }}</span></p>
+    <p class="muted">Leave the corrected amount empty to clear the collection.</p>
+  </div>
+  {% endif %}
+
+  <div class="field-group" data-kinds="installment_amount installment_add voucher_amount collection_amount" hidden>
+    <label class="field-label">Corrected / new amount
+      <input type="text" name="new_amount" inputmode="decimal" class="mono" autocomplete="off">
+    </label>
+  </div>
+
+  <div class="field-group" data-kinds="installment_add" hidden>
+    <label class="field-label">Installment date
+      <input type="date" name="new_date">
+    </label>
+  </div>
+
+  <label class="field-label">Note (what does the physical voucher show?)
+    <textarea name="note" rows="2" maxlength="500"></textarea>
+  </label>
+
+  <div class="action-row">
+    <button type="submit" name="action" value="raise" class="btn btn-primary">Raise Correction Request</button>
+    <a class="btn btn-secondary" href="{{ back }}">Back</a>
+  </div>
+</form>
+
+{% if existing %}
+<h3 class="group-heading">Requests for this voucher</h3>
+<ul class="report-list">
+  {% for c in existing %}
+  <li class="report-item">
+    <span class="report-label">
+      {{ kind_labels.get(c.kind, c.kind) }}
+      <span class="badge badge-{{ 'warn' if c.status == 'open' else 'ok' if c.status == 'applied' else 'muted' }}">{{ c.status }}</span>
+    </span>
+    <span class="report-meta">{{ c.requested_by }} · {{ c.requested_at[:10] }}{% if c.resolution_note %} · {{ c.resolution_note }}{% endif %}</span>
+    {% if c.status == 'open' and c.requested_by == user.name %}
+    <form method="post" action="/coll/correct/{{ voucher.bill_no | urlencode }}">
+      <input type="hidden" name="from" value="{{ back }}">
+      <input type="hidden" name="corr_id" value="{{ c.id }}">
+      <button type="submit" name="action" value="withdraw" class="btn btn-sm btn-secondary"
+              onclick="return confirm('Withdraw this correction request?')">Withdraw</button>
+    </form>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+<script>
+(function () {
+  var radios = document.querySelectorAll('input[name="kind"]');
+  var groups = document.querySelectorAll(".field-group");
+  function refresh() {
+    var picked = document.querySelector('input[name="kind"]:checked');
+    var kind = picked ? picked.value : "";
+    Array.prototype.forEach.call(groups, function (g) {
+      g.hidden = g.dataset.kinds.split(" ").indexOf(kind) === -1;
+    });
+  }
+  Array.prototype.forEach.call(radios, function (r) {
+    r.addEventListener("change", refresh);
+  });
+  refresh();
+})();
+</script>
+{% endblock %}

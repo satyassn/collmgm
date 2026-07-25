@@ -1008,5 +1008,669 @@ class PwaAssetTests(unittest.TestCase):
                             f"sw.js references missing file: /static/{name}")
 
 
+# ---------------------------------------------------------------------------
+# Physical-voucher verification on Approve Collection List: the verify
+# endpoint persists per-voucher/count toggles, and the approve action is
+# hard-gated (web only) until verification is complete.
+# ---------------------------------------------------------------------------
+
+class TestStartVerification(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self._add_user("smA", "salesman", "pwA")
+        self._add_user("sup", "supervisor", "pwS")
+        self._add_beat("beatA", "smA")
+        self._add_voucher("900", "beatA", "smA", balance="50.00")
+        self._add_voucher("901", "beatA", "smA", balance="30.00")
+        self.stem = "coll20260101-beat_salesman-beatA_smA"
+        self.path = self._write_staging_report(
+            self.stem, "beatA", "smA", start="new", submit="",
+            vouchers=[
+                {"bill_no": "900", "date": "2026-01-01", "balance": "50.00",
+                 "payment": "", "payment_date": "", "beat": "beatA", "salesman": "smA"},
+                {"bill_no": "901", "date": "2026-01-01", "balance": "30.00",
+                 "payment": "", "payment_date": "", "beat": "beatA", "salesman": "smA"},
+            ])
+        self.verify_url = f"/coll/approve-start/{self.stem}/verify"
+
+    def _saved(self):
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def _complete_verification(self, opener):
+        for bill in ("900", "901"):
+            self._post(opener, self.verify_url, {"bill_no": bill, "verified": "1"})
+        self._post(opener, self.verify_url, {"count": "1"})
+
+    def test_toggle_persists_and_untoggle_removes(self):
+        opener = self._login("sup", "pwS")
+        status, body = self._post(opener, self.verify_url,
+                                  {"bill_no": "900", "verified": "1"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        self.assertEqual(self._saved()["verification"]["bill_nos"], ["900"])
+        self._post(opener, self.verify_url, {"bill_no": "900", "verified": "0"})
+        self.assertEqual(self._saved()["verification"]["bill_nos"], [])
+
+    def test_count_flag_roundtrip(self):
+        opener = self._login("sup", "pwS")
+        self._post(opener, self.verify_url, {"count": "1"})
+        self.assertTrue(self._saved()["verification"]["count"])
+        self._post(opener, self.verify_url, {"count": "0"})
+        self.assertFalse(self._saved()["verification"]["count"])
+
+    def test_review_renders_persisted_state(self):
+        opener = self._login("sup", "pwS")
+        self._post(opener, self.verify_url, {"bill_no": "900", "verified": "1"})
+        status, body = self._get(opener, f"/coll/approve-start/{self.stem}")
+        self.assertEqual(status, 200)
+        self.assertIn("Verified 1 / 2", body)
+        self.assertIn("checked", body)
+
+    def test_wrong_stage_returns_409(self):
+        self._write_staging_report(self.stem, "beatA", "smA",
+                                   start="confirmed", submit="")
+        opener = self._login("sup", "pwS")
+        status, _ = self._post(opener, self.verify_url,
+                               {"bill_no": "900", "verified": "1"})
+        self.assertEqual(status, 409)
+
+    def test_unknown_bill_returns_404(self):
+        opener = self._login("sup", "pwS")
+        status, _ = self._post(opener, self.verify_url,
+                               {"bill_no": "999", "verified": "1"})
+        self.assertEqual(status, 404)
+
+    def test_param_misuse_returns_400(self):
+        opener = self._login("sup", "pwS")
+        status, _ = self._post(opener, self.verify_url, {})
+        self.assertEqual(status, 400)
+        status, _ = self._post(opener, self.verify_url,
+                               {"bill_no": "900", "verified": "1", "count": "1"})
+        self.assertEqual(status, 400)
+
+    def test_salesman_gets_403(self):
+        opener = self._login("smA", "pwA")
+        status, _ = self._post(opener, self.verify_url,
+                               {"bill_no": "900", "verified": "1"})
+        self.assertEqual(status, 403)
+        self.assertNotIn("verification", self._saved())
+
+    def test_logged_out_gets_401(self):
+        opener = self._client()
+        status, _ = self._post(opener, self.verify_url,
+                               {"bill_no": "900", "verified": "1"})
+        self.assertEqual(status, 401)
+
+    def test_approve_blocked_until_verification_complete(self):
+        opener = self._login("sup", "pwS")
+        status, body = self._post(opener, f"/coll/approve-start/{self.stem}",
+                                  {"action": "approve"})
+        self.assertEqual(status, 200)
+        self.assertIn("Cannot approve", body)
+        self.assertEqual(self._saved()["stages"]["start"], "new")
+
+        # All vouchers ticked but not the count box -> still blocked.
+        for bill in ("900", "901"):
+            self._post(opener, self.verify_url, {"bill_no": bill, "verified": "1"})
+        status, body = self._post(opener, f"/coll/approve-start/{self.stem}",
+                                  {"action": "approve"})
+        self.assertIn("Cannot approve", body)
+        self.assertEqual(self._saved()["stages"]["start"], "new")
+
+    def test_complete_verification_approves_and_pops_key(self):
+        opener = self._login("sup", "pwS")
+        self._complete_verification(opener)
+        status, body = self._post(opener, f"/coll/approve-start/{self.stem}",
+                                  {"action": "approve"})
+        self.assertEqual(status, 200)
+        self.assertIn("Collection list approved.", body)
+        saved = self._saved()
+        self.assertEqual(saved["stages"]["start"], "confirmed")
+        self.assertNotIn("verification", saved)
+
+    def test_return_and_cancel_need_no_verification(self):
+        opener = self._login("sup", "pwS")
+        status, body = self._post(opener, f"/coll/approve-start/{self.stem}",
+                                  {"action": "return"})
+        self.assertEqual(status, 200)
+        self.assertIn("returned", body)
+        self.assertFalse(self.path.exists())
+
+
+# ---------------------------------------------------------------------------
+# Correction requests — raise, queue visibility, apply/reject RBAC, and the
+# approval gates they hold.
+# ---------------------------------------------------------------------------
+
+class TestCorrections(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self._add_user("smA", "salesman", "pwA")
+        self._add_user("sup", "supervisor", "pwS")
+        self._add_user("dist", "distributor", "pwD")
+        self._add_beat("beatA", "smA")
+        self._add_voucher("900", "beatA", "smA", balance="50.00")  # amount == 50.00
+        self.stem = "coll20260101-beat_salesman-beatA_smA"
+        self.report_path = self._write_staging_report(
+            self.stem, "beatA", "smA", start="new", submit="",
+            vouchers=[{"bill_no": "900", "date": "2026-01-01", "balance": "50.00",
+                       "payment": "", "payment_date": "", "beat": "beatA",
+                       "salesman": "smA"}])
+        self.from_path = f"/coll/approve-start/{self.stem}"
+
+    def _add_installment(self, bill_no, date="2026-01-01", amount="10.00"):
+        conn = coll_store.get_db()
+        try:
+            cur = conn.execute(
+                "INSERT INTO installments (bill_no, date, amount, salesman, created_by, created_at)"
+                " VALUES (?, ?, ?, 'smA', 'test', 't')", (bill_no, date, amount))
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+
+    def _raise_voucher_amount(self, opener, new_amount="60.00"):
+        return self._post(opener, "/coll/correct/900",
+                          {"action": "raise", "kind": "voucher_amount",
+                           "new_amount": new_amount, "note": "physical shows more",
+                           "from": self.from_path})
+
+    def _corrections(self):
+        return coll_store.load_corrections()
+
+    def test_raise_voucher_amount_records_context(self):
+        opener = self._login("sup", "pwS")
+        status, body = self._get(opener, f"/coll/correct/900?from={self.from_path}")
+        self.assertEqual(status, 200)
+        self.assertIn("Raise Correction", body)
+        status, _ = self._raise_voucher_amount(opener)
+        self.assertEqual(status, 200)  # 303 followed back to the review page
+        corr = self._corrections()[0]
+        self.assertEqual(corr["kind"], "voucher_amount")
+        self.assertEqual(corr["old"], {"amount": "50.00"})
+        self.assertEqual(corr["new"], {"amount": "60.00"})
+        self.assertEqual(corr["report_stem"], self.stem)
+        self.assertEqual(corr["origin_stage"], "start")
+        self.assertEqual(corr["requested_by"], "sup")
+
+    def test_raise_validation(self):
+        opener = self._login("sup", "pwS")
+        status, body = self._post(opener, "/coll/correct/900",
+                                  {"action": "raise", "from": self.from_path})
+        self.assertIn("Choose what kind", body)
+        status, body = self._raise_voucher_amount(opener, new_amount="50.00")
+        self.assertIn("same as the recorded", body)
+        status, body = self._post(opener, "/coll/correct/900",
+                                  {"action": "raise", "kind": "installment_amount",
+                                   "new_amount": "5.00", "from": self.from_path})
+        self.assertIn("Pick the installment", body)
+        self.assertEqual(self._corrections(), [])
+
+    def test_installment_amount_kind_snapshots_row(self):
+        inst_id = self._add_installment("900", amount="10.00")
+        opener = self._login("sup", "pwS")
+        self._post(opener, "/coll/correct/900",
+                   {"action": "raise", "kind": "installment_amount",
+                    "installment_id": str(inst_id), "new_amount": "25.00",
+                    "from": self.from_path})
+        corr = self._corrections()[0]
+        self.assertEqual(corr["installment_id"], inst_id)
+        self.assertEqual(corr["old"], {"date": "2026-01-01", "amount": "10.00"})
+        self.assertEqual(corr["new"], {"amount": "25.00"})
+
+    def test_salesman_has_no_access(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._get(opener, "/coll/corrections")
+        self.assertIn("permission", body)
+        status, body = self._post(opener, "/coll/correct/900",
+                                  {"action": "raise", "kind": "voucher_amount",
+                                   "new_amount": "60.00", "from": self.from_path})
+        self.assertIn("permission", body)
+        self.assertEqual(self._corrections(), [])
+
+    def test_supervisor_views_distributor_acts(self):
+        sup = self._login("sup", "pwS")
+        self._raise_voucher_amount(sup)
+        cid = self._corrections()[0]["id"]
+
+        status, body = self._get(sup, "/coll/corrections")
+        self.assertIn("900", body)
+        self.assertIn("Pending", body)
+        status, body = self._get(sup, f"/coll/corrections/{cid}")
+        self.assertNotIn('value="apply"', body)  # read-only for supervisor
+
+        status, body = self._post(sup, f"/coll/corrections/{cid}", {"action": "apply"})
+        self.assertIn("permission", body)
+        self.assertEqual(coll_store.load_correction(cid)["status"], "open")
+
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, f"/coll/corrections/{cid}")
+        self.assertIn('value="apply"', body)
+        status, body = self._post(dist, f"/coll/corrections/{cid}", {"action": "apply"})
+        self.assertIn("Correction applied", body)
+        conn = coll_store.get_db()
+        try:
+            row = conn.execute("SELECT amount, balance FROM vouchers WHERE bill_no='900'").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual((row["amount"], row["balance"]), ("60.00", "60.00"))
+        # Staged display balance refreshed too.
+        staged = json.loads(self.report_path.read_text(encoding="utf-8"))
+        self.assertEqual(staged["vouchers"][0]["balance"], "60.00")
+
+    def test_open_correction_gates_verification_and_approval(self):
+        sup = self._login("sup", "pwS")
+        self._raise_voucher_amount(sup)
+        cid = self._corrections()[0]["id"]
+
+        # Verify endpoint refuses the disputed voucher.
+        status, _ = self._post(sup, f"/coll/approve-start/{self.stem}/verify",
+                               {"bill_no": "900", "verified": "1"})
+        self.assertEqual(status, 409)
+        # Count still saves, but approve is blocked with the corrections error.
+        self._post(sup, f"/coll/approve-start/{self.stem}/verify", {"count": "1"})
+        status, body = self._post(sup, f"/coll/approve-start/{self.stem}",
+                                  {"action": "approve"})
+        self.assertIn("correction request", body)
+        saved = json.loads(self.report_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["stages"]["start"], "new")
+        # Review shows the blocked state.
+        status, body = self._get(sup, f"/coll/approve-start/{self.stem}")
+        self.assertIn("Correction pending", body)
+        self.assertIn("disabled", body)
+
+        # Distributor applies -> voucher verifiable, approval unblocked.
+        dist = self._login("dist", "pwD")
+        self._post(dist, f"/coll/corrections/{cid}", {"action": "apply"})
+        status, body = self._get(sup, f"/coll/approve-start/{self.stem}")
+        self.assertIn("Correction applied", body)
+        status, _ = self._post(sup, f"/coll/approve-start/{self.stem}/verify",
+                               {"bill_no": "900", "verified": "1"})
+        self.assertEqual(status, 200)
+        status, body = self._post(sup, f"/coll/approve-start/{self.stem}",
+                                  {"action": "approve"})
+        self.assertIn("Collection list approved.", body)
+
+    def test_reject_unblocks_without_master_change(self):
+        sup = self._login("sup", "pwS")
+        self._raise_voucher_amount(sup)
+        cid = self._corrections()[0]["id"]
+        dist = self._login("dist", "pwD")
+        status, body = self._post(dist, f"/coll/corrections/{cid}",
+                                  {"action": "reject",
+                                   "resolution_note": "system agrees with locker copy"})
+        self.assertIn("Correction rejected", body)
+        conn = coll_store.get_db()
+        try:
+            row = conn.execute("SELECT amount FROM vouchers WHERE bill_no='900'").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["amount"], "50.00")
+        status, _ = self._post(sup, f"/coll/approve-start/{self.stem}/verify",
+                               {"bill_no": "900", "verified": "1"})
+        self.assertEqual(status, 200)
+
+    def test_applied_entry_active_then_history_after_cancel(self):
+        sup = self._login("sup", "pwS")
+        self._raise_voucher_amount(sup)
+        cid = self._corrections()[0]["id"]
+        dist = self._login("dist", "pwD")
+        self._post(dist, f"/coll/corrections/{cid}", {"action": "apply"})
+
+        # Active while the gated report is active, linking to its review.
+        status, body = self._get(dist, "/coll/corrections")
+        self.assertIn("Applied", body)
+        self.assertIn(f"/coll/approve-start/{self.stem}", body)
+
+        # Cancel the report -> the applied record drops to history (derived).
+        self._post(sup, f"/coll/approve-start/{self.stem}", {"action": "cancel"})
+        status, body = self._get(dist, "/coll/corrections")
+        self.assertIn("Recent History", body)
+        self.assertNotIn("Awaiting Collection List approval", body)
+
+    def test_withdraw_own_requests_only(self):
+        sup = self._login("sup", "pwS")
+        self._raise_voucher_amount(sup)
+        cid = self._corrections()[0]["id"]
+        dist = self._login("dist", "pwD")
+        status, body = self._post(dist, "/coll/correct/900",
+                                  {"action": "withdraw", "corr_id": str(cid),
+                                   "from": self.from_path})
+        self.assertIn("Only your own", body)
+        self.assertEqual(coll_store.load_correction(cid)["status"], "open")
+        status, body = self._post(sup, "/coll/correct/900",
+                                  {"action": "withdraw", "corr_id": str(cid),
+                                   "from": self.from_path})
+        self.assertEqual(coll_store.load_correction(cid)["status"], "withdrawn")
+
+
+# ---------------------------------------------------------------------------
+# Collection-amount corrections at Approve Collections: the only kind
+# raiseable from the submit review; resolvable by supervisor OR distributor
+# (or by Return + salesman revision, which auto-settles on match).
+# ---------------------------------------------------------------------------
+
+class TestCollectionCorrections(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self._add_user("smA", "salesman", "pwA")
+        self._add_user("sup", "supervisor", "pwS")
+        self._add_user("dist", "distributor", "pwD")
+        self._add_beat("beatA", "smA")
+        self._add_voucher("900", "beatA", "smA", balance="50.00")
+        self.stem = "coll20260101-beat_salesman-beatA_smA"
+        self.report_path = self._write_staging_report(
+            self.stem, "beatA", "smA", start="confirmed", submit="submitted",
+            vouchers=[{"bill_no": "900", "date": "2026-01-01", "balance": "50.00",
+                       "payment": "30.00", "payment_date": "2026-01-01",
+                       "beat": "beatA", "salesman": "smA"}])
+        self.from_path = f"/coll/approve-submit/{self.stem}"
+
+    def _staged_voucher(self):
+        return json.loads(self.report_path.read_text(encoding="utf-8"))["vouchers"][0]
+
+    def _raise_collection(self, opener, new_amount="45.00"):
+        return self._post(opener, "/coll/correct/900",
+                          {"action": "raise", "kind": "collection_amount",
+                           "new_amount": new_amount, "note": "physical shows different",
+                           "from": self.from_path})
+
+    def _complete_verification(self, opener):
+        # Phase 4 hard-gates approve on physical-voucher verification too —
+        # tests exercising a successful approve must satisfy it first.
+        self._post(opener, self.from_path + "/verify", {"bill_no": "900", "verified": "1"})
+        self._post(opener, self.from_path + "/verify", {"count": "1"})
+
+    def test_submit_context_offers_only_collection_kind(self):
+        opener = self._login("sup", "pwS")
+        status, body = self._get(opener, f"/coll/correct/900?from={self.from_path}")
+        self.assertEqual(status, 200)
+        self.assertIn("Change the collection amount", body)
+        self.assertNotIn("Change the voucher amount", body)
+        self.assertNotIn("Change an installment amount", body)
+        self.assertIn("Current collection", body)
+        self.assertIn("30.00", body)
+
+    def test_start_context_excludes_collection_kind(self):
+        opener = self._login("sup", "pwS")
+        status, body = self._get(opener, "/coll/correct/900?from=/coll/approve-start/x")
+        self.assertIn("Change the voucher amount", body)
+        self.assertNotIn("Change the collection amount", body)
+
+    def test_master_kind_rejected_in_submit_context(self):
+        opener = self._login("sup", "pwS")
+        status, body = self._post(opener, "/coll/correct/900",
+                                  {"action": "raise", "kind": "voucher_amount",
+                                   "new_amount": "60.00", "from": self.from_path})
+        self.assertIn("Choose what kind", body)
+        self.assertEqual(coll_store.load_corrections(), [])
+
+    def test_raise_snapshots_staged_payment(self):
+        opener = self._login("sup", "pwS")
+        status, _ = self._raise_collection(opener)
+        self.assertEqual(status, 200)  # 303 followed back to the review
+        corr = coll_store.load_corrections()[0]
+        self.assertEqual(corr["kind"], "collection_amount")
+        self.assertEqual(corr["old"], {"payment": "30.00", "date": "2026-01-01"})
+        self.assertEqual(corr["new"], {"payment": "45.00"})
+        self.assertEqual(corr["origin_stage"], "submit")
+
+    def test_raise_validation(self):
+        opener = self._login("sup", "pwS")
+        status, body = self._raise_collection(opener, new_amount="30.00")
+        self.assertIn("same as the entered", body)
+        status, body = self._raise_collection(opener, new_amount="60.00")  # > 50 balance
+        self.assertIn("exceeds balance", body)
+        self.assertEqual(coll_store.load_corrections(), [])
+
+    def test_open_correction_gates_approve_submit(self):
+        sup = self._login("sup", "pwS")
+        self._raise_collection(sup)
+        status, body = self._post(sup, self.from_path, {"action": "approve"})
+        self.assertIn("Cannot approve", body)
+        self.assertIn("1 correction request is awaiting resolution", body)
+        saved = json.loads(self.report_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["stages"]["submit"], "submitted")
+        status, body = self._get(sup, self.from_path)
+        self.assertIn("Correction pending", body)
+
+    def test_supervisor_can_apply_collection_correction(self):
+        sup = self._login("sup", "pwS")
+        self._raise_collection(sup)
+        cid = coll_store.load_corrections()[0]["id"]
+        status, body = self._get(sup, f"/coll/corrections/{cid}")
+        self.assertIn('value="apply"', body)  # supervisor CAN act on this kind
+        status, body = self._post(sup, f"/coll/corrections/{cid}", {"action": "apply"})
+        self.assertIn("staged collection was updated", body)
+        self.assertEqual(self._staged_voucher()["payment"], "45.00")
+        # Approval unblocked (once verification is also satisfied).
+        self._complete_verification(sup)
+        status, body = self._post(sup, self.from_path, {"action": "approve"})
+        self.assertIn("Collections approved", body)
+
+    def test_supervisor_cannot_apply_master_kind(self):
+        self._add_voucher("901", "beatA", "smA", balance="40.00")
+        sup = self._login("sup", "pwS")
+        self._post(sup, "/coll/correct/901",
+                   {"action": "raise", "kind": "voucher_amount",
+                    "new_amount": "55.00", "from": "/coll/approve-start/x"})
+        cid = coll_store.load_corrections()[0]["id"]
+        status, body = self._get(sup, f"/coll/corrections/{cid}")
+        self.assertNotIn('value="apply"', body)
+        status, body = self._post(sup, f"/coll/corrections/{cid}", {"action": "apply"})
+        self.assertIn("permission", body)
+        self.assertEqual(coll_store.load_correction(cid)["status"], "open")
+        dist = self._login("dist", "pwD")
+        status, body = self._post(dist, f"/coll/corrections/{cid}", {"action": "apply"})
+        self.assertIn("master data updated", body)
+
+    def test_distributor_can_apply_collection_correction(self):
+        sup = self._login("sup", "pwS")
+        self._raise_collection(sup)
+        cid = coll_store.load_corrections()[0]["id"]
+        dist = self._login("dist", "pwD")
+        status, body = self._post(dist, f"/coll/corrections/{cid}", {"action": "apply"})
+        self.assertIn("staged collection was updated", body)
+        self.assertEqual(self._staged_voucher()["payment"], "45.00")
+
+    def test_return_then_matching_resubmit_auto_settles(self):
+        sup = self._login("sup", "pwS")
+        self._raise_collection(sup)
+        cid = coll_store.load_corrections()[0]["id"]
+        # Return works despite the open request.
+        status, body = self._post(sup, self.from_path, {"action": "return"})
+        self.assertIn("returned", body)
+        # Salesman revises to the requested amount and resubmits.
+        sm = self._login("smA", "pwA")
+        status, body = self._post(sm, f"/coll/submit/{self.stem}",
+                                  {"action": "submit", "pay_900": "45.00"})
+        self.assertIn("submitted for supervisor review", body)
+        corr = coll_store.load_correction(cid)
+        self.assertEqual(corr["status"], "applied")
+        self.assertEqual(corr["resolution_note"], "matched after salesman revision")
+        # Approval now goes through (once verification is also satisfied).
+        self._complete_verification(sup)
+        status, body = self._post(sup, self.from_path, {"action": "approve"})
+        self.assertIn("Collections approved", body)
+
+    def test_resubmit_with_other_value_keeps_request_open(self):
+        sup = self._login("sup", "pwS")
+        self._raise_collection(sup)
+        cid = coll_store.load_corrections()[0]["id"]
+        self._post(sup, self.from_path, {"action": "return"})
+        sm = self._login("smA", "pwA")
+        self._post(sm, f"/coll/submit/{self.stem}",
+                   {"action": "submit", "pay_900": "40.00"})
+        self.assertEqual(coll_store.load_correction(cid)["status"], "open")
+        status, body = self._post(sup, self.from_path, {"action": "approve"})
+        self.assertIn("Cannot approve", body)
+
+    def test_correction_to_empty_clears_collection(self):
+        sup = self._login("sup", "pwS")
+        self._raise_collection(sup, new_amount="")
+        cid = coll_store.load_corrections()[0]["id"]
+        self.assertEqual(coll_store.load_correction(cid)["new"], {"payment": ""})
+        self._post(sup, f"/coll/corrections/{cid}", {"action": "apply"})
+        v = self._staged_voucher()
+        self.assertEqual((v["payment"], v["payment_date"]), ("", ""))
+
+    def test_salesman_cannot_act(self):
+        sup = self._login("sup", "pwS")
+        self._raise_collection(sup)
+        cid = coll_store.load_corrections()[0]["id"]
+        sm = self._login("smA", "pwA")
+        status, body = self._post(sm, f"/coll/corrections/{cid}", {"action": "apply"})
+        self.assertIn("permission", body)
+        self.assertEqual(coll_store.load_correction(cid)["status"], "open")
+
+
+# ---------------------------------------------------------------------------
+# Physical-voucher verification on Approve Collections (Phase 4): mirror of
+# TestStartVerification for the evening cross-check — same "verification"
+# key, guarded on stages.submit == "submitted", independent hard gate that
+# combines with (but doesn't replace) the open-corrections gate.
+# ---------------------------------------------------------------------------
+
+class TestSubmitVerification(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self._add_user("smA", "salesman", "pwA")
+        self._add_user("sup", "supervisor", "pwS")
+        self._add_voucher("900", "beatA", "smA", balance="50.00")
+        self._add_voucher("901", "beatA", "smA", balance="30.00")
+        self._add_beat("beatA", "smA")
+        self.stem = "coll20260101-beat_salesman-beatA_smA"
+        self.path = self._write_staging_report(
+            self.stem, "beatA", "smA", start="confirmed", submit="submitted",
+            vouchers=[
+                {"bill_no": "900", "date": "2026-01-01", "balance": "50.00",
+                 "payment": "20.00", "payment_date": "2026-01-01",
+                 "beat": "beatA", "salesman": "smA"},
+                {"bill_no": "901", "date": "2026-01-01", "balance": "30.00",
+                 "payment": "", "payment_date": "", "beat": "beatA", "salesman": "smA"},
+            ])
+        self.verify_url = f"/coll/approve-submit/{self.stem}/verify"
+
+    def _saved(self):
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def _complete_verification(self, opener):
+        for bill in ("900", "901"):
+            self._post(opener, self.verify_url, {"bill_no": bill, "verified": "1"})
+        self._post(opener, self.verify_url, {"count": "1"})
+
+    def test_toggle_persists_and_untoggle_removes(self):
+        opener = self._login("sup", "pwS")
+        status, body = self._post(opener, self.verify_url,
+                                  {"bill_no": "900", "verified": "1"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        self.assertEqual(self._saved()["verification"]["bill_nos"], ["900"])
+        self._post(opener, self.verify_url, {"bill_no": "900", "verified": "0"})
+        self.assertEqual(self._saved()["verification"]["bill_nos"], [])
+
+    def test_count_flag_roundtrip(self):
+        opener = self._login("sup", "pwS")
+        self._post(opener, self.verify_url, {"count": "1"})
+        self.assertTrue(self._saved()["verification"]["count"])
+        self._post(opener, self.verify_url, {"count": "0"})
+        self.assertFalse(self._saved()["verification"]["count"])
+
+    def test_review_renders_persisted_state(self):
+        opener = self._login("sup", "pwS")
+        self._post(opener, self.verify_url, {"bill_no": "900", "verified": "1"})
+        status, body = self._get(opener, f"/coll/approve-submit/{self.stem}")
+        self.assertEqual(status, 200)
+        self.assertIn("Verified 1 / 2", body)
+        self.assertIn("checked", body)
+
+    def test_wrong_stage_returns_409(self):
+        self._write_staging_report(self.stem, "beatA", "smA",
+                                   start="confirmed", submit="confirmed")
+        opener = self._login("sup", "pwS")
+        status, _ = self._post(opener, self.verify_url,
+                               {"bill_no": "900", "verified": "1"})
+        self.assertEqual(status, 409)
+
+    def test_unknown_bill_returns_404(self):
+        opener = self._login("sup", "pwS")
+        status, _ = self._post(opener, self.verify_url,
+                               {"bill_no": "999", "verified": "1"})
+        self.assertEqual(status, 404)
+
+    def test_param_misuse_returns_400(self):
+        opener = self._login("sup", "pwS")
+        status, _ = self._post(opener, self.verify_url, {})
+        self.assertEqual(status, 400)
+        status, _ = self._post(opener, self.verify_url,
+                               {"bill_no": "900", "verified": "1", "count": "1"})
+        self.assertEqual(status, 400)
+
+    def test_salesman_gets_403(self):
+        opener = self._login("smA", "pwA")
+        status, _ = self._post(opener, self.verify_url,
+                               {"bill_no": "900", "verified": "1"})
+        self.assertEqual(status, 403)
+        self.assertNotIn("verification", self._saved())
+
+    def test_logged_out_gets_401(self):
+        opener = self._client()
+        status, _ = self._post(opener, self.verify_url,
+                               {"bill_no": "900", "verified": "1"})
+        self.assertEqual(status, 401)
+
+    def test_approve_blocked_until_verification_complete(self):
+        opener = self._login("sup", "pwS")
+        status, body = self._post(opener, f"/coll/approve-submit/{self.stem}",
+                                  {"action": "approve"})
+        self.assertEqual(status, 200)
+        self.assertIn("Cannot approve", body)
+        self.assertEqual(self._saved()["stages"]["submit"], "submitted")
+
+        for bill in ("900", "901"):
+            self._post(opener, self.verify_url, {"bill_no": bill, "verified": "1"})
+        status, body = self._post(opener, f"/coll/approve-submit/{self.stem}",
+                                  {"action": "approve"})
+        self.assertIn("Cannot approve", body)
+        self.assertEqual(self._saved()["stages"]["submit"], "submitted")
+
+    def test_complete_verification_approves_and_pops_key(self):
+        opener = self._login("sup", "pwS")
+        self._complete_verification(opener)
+        status, body = self._post(opener, f"/coll/approve-submit/{self.stem}",
+                                  {"action": "approve"})
+        self.assertEqual(status, 200)
+        self.assertIn("Collections approved", body)
+        saved = self._saved()
+        self.assertEqual(saved["stages"]["submit"], "confirmed")
+        self.assertNotIn("verification", saved)
+
+    def test_return_needs_no_verification(self):
+        opener = self._login("sup", "pwS")
+        status, body = self._post(opener, f"/coll/approve-submit/{self.stem}",
+                                  {"action": "return"})
+        self.assertEqual(status, 200)
+        self.assertIn("returned", body)
+        saved = self._saved()
+        self.assertEqual(saved["stages"]["submit"], "returned")
+        self.assertNotIn("verification", saved)
+
+    def test_open_correction_blocks_even_with_full_verification(self):
+        opener = self._login("sup", "pwS")
+        self._complete_verification(opener)
+        self._post(opener, "/coll/correct/900",
+                  {"action": "raise", "kind": "collection_amount",
+                   "new_amount": "25.00", "from": f"/coll/approve-submit/{self.stem}"})
+        status, body = self._post(opener, f"/coll/approve-submit/{self.stem}",
+                                  {"action": "approve"})
+        self.assertIn("correction request", body)
+        self.assertEqual(self._saved()["stages"]["submit"], "submitted")
+        cid = coll_store.load_corrections()[0]["id"]
+        self._post(opener, f"/coll/corrections/{cid}", {"action": "reject"})
+        status, body = self._post(opener, f"/coll/approve-submit/{self.stem}",
+                                  {"action": "approve"})
+        self.assertIn("Collections approved", body)
+
+
 if __name__ == "__main__":
     unittest.main()

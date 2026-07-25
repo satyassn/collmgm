@@ -1,8 +1,10 @@
 ## Project overview
 
-`collmgm` is a Windows CLI collection-management tool backed by CSV files. It handles the full field-collection workflow — generating voucher lists, salesman submission, supervisor approval, and distributor posting — with role-based access control.
+`collmgm` is a Windows collection-management tool — CLI and a LAN-hosted mobile-responsive web app, both backed by the same SQLite-backed store. It handles the full field-collection workflow — generating voucher lists, salesman submission, supervisor approval, and distributor posting — with role-based access control.
 
-**Current release:** `CollMgm-alpha-20260701230618`
+The web app additionally supports a physical-voucher verification workflow and a correction-request system on both supervisor approval screens (see `roadmap.md`).
+
+**Current release:** `CollMgm-alpha-20260701230618` (see `roadmap.md` for everything shipped since, on the ongoing alpha build line)
 
 ---
 
@@ -26,26 +28,39 @@ python -m unittest discover -s tests -v
 
 Run from the **project root** (not from `scripts/` or `tests/`).
 
-**Expected output:** `Ran 69 tests in ~1.4s — OK`
+**Expected output:** `Ran 321 tests in ~80s — OK`
 
 ### What is tested
+
+Three files, each targeting one architectural layer:
+
+| File | Layer | Coverage |
+|---|---|---|
+| `tests/test_coll_store.py` | Persistence (`coll_store.py`) | CSV/SQLite reads-writes, schema migrations, permission backfills, the `corrections` table and its atomic apply, locks and checkpoints |
+| `tests/test_coll_orchestrate.py` | Shared workflow logic (`coll_orchestrate.py`) | Stage transitions for all 5 collection-workflow steps, payment/balance validation, the correction-request lifecycle (apply/reject/withdraw, auto-settle on resubmission), physical-voucher verification gates |
+| `tests/test_coll_api.py` | Web app (`coll_api.py`) | Full route + session + permission stack against a live server (RBAC/IDOR checks, stage guards, tamper defenses, the verification and correction-request screens end to end) |
+
+A few notable test classes from `test_coll_store.py` (the original CLI-era coverage):
 
 | Test class | Coverage |
 |---|---|
 | `TestSanitize` | filename-safe encoding edge cases |
 | `TestPasswordHashing` | PBKDF2 round-trip, wrong password, salt uniqueness |
 | `TestVerifyUser` | valid login, wrong password, unknown user, system role blocked |
-| `TestLoadPendingStartReports` | `stages.start == "new"` predicate; addv files ignored |
-| `TestLoadPendingSubmitReports` | `stages.submit == "submitted"` predicate; all other states excluded |
 | `TestInstallmentsSidecar` | round-trip, bookmark, no legacy `__status__` field |
-| `TestAppendInstallmentsCSV` | dedup on `(bill_no, date)`, header creation, zero/empty skipped |
 | `TestUpdateVouchersBalance` | balance arithmetic, zero detection, atomic write, lock lifecycle |
 | `TestBeatLock` | exclusive acquire, double-acquire blocked, release re-enables |
-| `TestFinalizeCheckpoint` | write, read, overwrite, clear |
-| `TestLoadVouchersRaw` | reads rows, missing file raises |
 | `TestArchiveCompleted` | vouchers and installments moved to completed files |
 
-Each test class uses an isolated temp directory; `coll_store`'s path constants are patched per-test so no real data files are touched.
+...and from the web/orchestrate suites added for iteration3:
+
+| Test class | Coverage |
+|---|---|
+| `TestStartVerification` / `TestSubmitVerification` (API) | Verification checkbox persistence, all guard status codes, the approve hard-gate, key popped on approve |
+| `TestCorrections` (API) | Raise/withdraw/queue/apply/reject for the four master-data kinds, role guards, derived active/history visibility |
+| `TestCollectionCorrections` (API) | Collection-amount-only raise, supervisor-or-distributor resolution, Return + auto-settle on matching resubmission |
+
+Each test class uses an isolated temp directory (or a live server on a random port, for the API suite); path constants are patched per-test so no real data files are touched.
 
 ---
 
@@ -105,8 +120,8 @@ Releases are tagged on `alpha/release` (hotfixes) or `alpha/dev` (new alpha drop
 | File | Purpose |
 |---|---|
 | `roadmap.md` | Release history and planned milestones |
-| `schema.md` | Canonical CSV schemas and validation rules |
-| `pipeline.md` | Collection workflow state reference |
+| `schema.md` | Canonical CSV/SQLite schemas and validation rules |
+| `pipeline.md` | Collection workflow state reference, incl. the verification/correction gates |
 | `CLAUDE.md` | Architecture, module contracts, and development principles |
 | `scripts/coll_store.py` | All path constants and I/O primitives |
 | `scripts/coll_data.py` | Data loading and query functions |

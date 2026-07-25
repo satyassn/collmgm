@@ -30,11 +30,16 @@ class OrchestrateTestCase(unittest.TestCase):
         # is only used inside coll_store's own archive_files(), so one patch
         # suffices there, but it's still essential: without it, archive_files()
         # would try to move files into the real project's archive/ directory.
+        # DATA_DIR is patched to a dir with no DB file so DB-touching helpers
+        # (e.g. settle_collection_corrections inside record_submit_payments)
+        # no-op instead of reaching the real data/collmgm.db; DbTestCase
+        # layers a real temp DB on top for tests that need one.
         self._patches = [
             patch.object(coll_store, "STAGING_DIR", self.tmp / "staging"),
             patch.object(coll_data, "STAGING_DIR", self.tmp / "staging"),
             patch.object(coll_orchestrate, "STAGING_DIR", self.tmp / "staging"),
             patch.object(coll_store, "ARCHIVE_DIR", self.tmp / "archive"),
+            patch.object(coll_store, "DATA_DIR", self.tmp / "nodb-data"),
         ]
         for p in self._patches:
             p.start()
@@ -318,6 +323,149 @@ class TestApplyStartApproval(OrchestrateTestCase):
         coll_orchestrate.apply_start_approval(report_path, data, "cancel")
         self.assertFalse(report_path.exists())
         self.assertTrue(coll_store.acquire_beat_lock("beat1"))
+
+
+class TestStartVerification(OrchestrateTestCase):
+    def _generated_report(self):
+        outcome = coll_orchestrate.generate_collection_list(
+            "beat1", "sm1",
+            [{"bill_no": "10", "balance": "10.00"}, {"bill_no": "2", "balance": "5.00"}])
+        data = json.loads(outcome.json_path.read_text(encoding="utf-8"))
+        return outcome.json_path, data
+
+    def _reload(self, path):
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_verify_toggle_persists_and_removes(self):
+        path, data = self._generated_report()
+        coll_orchestrate.set_start_verification(path, data, bill_no="10", verified=True)
+        self.assertEqual(self._reload(path)["verification"]["bill_nos"], ["10"])
+        coll_orchestrate.set_start_verification(path, data, bill_no="10", verified=False)
+        self.assertEqual(self._reload(path)["verification"]["bill_nos"], [])
+
+    def test_bill_nos_kept_in_bill_no_sort_order(self):
+        path, data = self._generated_report()
+        coll_orchestrate.set_start_verification(path, data, bill_no="10", verified=True)
+        coll_orchestrate.set_start_verification(path, data, bill_no="2", verified=True)
+        self.assertEqual(self._reload(path)["verification"]["bill_nos"], ["2", "10"])
+
+    def test_count_flag_roundtrip(self):
+        path, data = self._generated_report()
+        coll_orchestrate.set_start_verification(path, data, count_verified=True)
+        self.assertTrue(self._reload(path)["verification"]["count"])
+        coll_orchestrate.set_start_verification(path, data, count_verified=False)
+        self.assertFalse(self._reload(path)["verification"]["count"])
+
+    def test_unknown_bill_raises_value_error(self):
+        path, data = self._generated_report()
+        with self.assertRaises(ValueError):
+            coll_orchestrate.set_start_verification(path, data, bill_no="99", verified=True)
+
+    def test_requires_start_stage_new(self):
+        path, data = self._generated_report()
+        data["stages"]["start"] = "confirmed"
+        with self.assertRaises(coll_orchestrate.StageError):
+            coll_orchestrate.set_start_verification(path, data, bill_no="10", verified=True)
+
+    def test_complete_requires_every_bill_and_count(self):
+        path, data = self._generated_report()
+        self.assertFalse(coll_orchestrate.is_start_verification_complete(data))
+        coll_orchestrate.set_start_verification(path, data, bill_no="10", verified=True)
+        coll_orchestrate.set_start_verification(path, data, count_verified=True)
+        self.assertFalse(coll_orchestrate.is_start_verification_complete(data))
+        coll_orchestrate.set_start_verification(path, data, bill_no="2", verified=True)
+        self.assertTrue(coll_orchestrate.is_start_verification_complete(data))
+
+    def test_approve_pops_verification_key(self):
+        # CLI regression guard: a report carrying the web-only key still
+        # approves, and the key never survives into the confirmed JSON.
+        path, data = self._generated_report()
+        coll_orchestrate.set_start_verification(path, data, bill_no="10", verified=True)
+        coll_orchestrate.apply_start_approval(path, data, "approve")
+        saved = self._reload(path)
+        self.assertEqual(saved["stages"]["start"], "confirmed")
+        self.assertNotIn("verification", saved)
+
+
+class TestSubmitVerification(DbTestCase):
+    """Mirror of TestStartVerification for the evening cross-check on
+    Approve Collections — same "verification" key shape, guarded on
+    stages.submit == 'submitted' instead of stages.start == 'new'."""
+
+    def setUp(self):
+        super().setUp()
+        # Master rows matching _report()'s fixture (bill_no "20"/"10"), needed
+        # by apply_submit_approval's approve-path validation.
+        self._insert_voucher(bill_no="20", balance="50.00")
+        self._insert_voucher(bill_no="10", balance="100.00")
+
+    def _seeded(self):
+        data = self._report()  # stage_submit="submitted" by default
+        path = self._write_json("coll-sv.json", data)
+        return path, data
+
+    def _reload(self, path):
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_verify_toggle_persists_and_removes(self):
+        path, data = self._seeded()
+        coll_orchestrate.set_submit_verification(path, data, bill_no="20", verified=True)
+        self.assertEqual(self._reload(path)["verification"]["bill_nos"], ["20"])
+        coll_orchestrate.set_submit_verification(path, data, bill_no="20", verified=False)
+        self.assertEqual(self._reload(path)["verification"]["bill_nos"], [])
+
+    def test_bill_nos_kept_in_sort_order(self):
+        path, data = self._seeded()
+        coll_orchestrate.set_submit_verification(path, data, bill_no="20", verified=True)
+        coll_orchestrate.set_submit_verification(path, data, bill_no="10", verified=True)
+        self.assertEqual(self._reload(path)["verification"]["bill_nos"], ["10", "20"])
+
+    def test_count_flag_roundtrip(self):
+        path, data = self._seeded()
+        coll_orchestrate.set_submit_verification(path, data, count_verified=True)
+        self.assertTrue(self._reload(path)["verification"]["count"])
+        coll_orchestrate.set_submit_verification(path, data, count_verified=False)
+        self.assertFalse(self._reload(path)["verification"]["count"])
+
+    def test_unknown_bill_raises_value_error(self):
+        path, data = self._seeded()
+        with self.assertRaises(ValueError):
+            coll_orchestrate.set_submit_verification(path, data, bill_no="99", verified=True)
+
+    def test_requires_submit_stage_submitted(self):
+        for stage in ("", "inprogress", "returned", "confirmed"):
+            path, data = self._seeded()
+            data["stages"]["submit"] = stage
+            with self.assertRaises(coll_orchestrate.StageError):
+                coll_orchestrate.set_submit_verification(path, data, bill_no="20", verified=True)
+
+    def test_complete_requires_every_bill_and_count(self):
+        path, data = self._seeded()
+        self.assertFalse(coll_orchestrate.is_submit_verification_complete(data))
+        coll_orchestrate.set_submit_verification(path, data, bill_no="20", verified=True)
+        coll_orchestrate.set_submit_verification(path, data, count_verified=True)
+        self.assertFalse(coll_orchestrate.is_submit_verification_complete(data))
+        coll_orchestrate.set_submit_verification(path, data, bill_no="10", verified=True)
+        self.assertTrue(coll_orchestrate.is_submit_verification_complete(data))
+
+    def test_approve_pops_verification_key(self):
+        path, data = self._seeded()
+        coll_orchestrate.set_submit_verification(path, data, bill_no="20", verified=True)
+        coll_orchestrate.apply_submit_approval(path, data, "approve")
+        saved = self._reload(path)
+        self.assertEqual(saved["stages"]["submit"], "confirmed")
+        self.assertNotIn("verification", saved)
+
+    def test_return_pops_verification_key_too(self):
+        # Unlike a start-stage return, a submit-stage return does NOT delete
+        # the file — stale verification state must not resurface on re-review.
+        path, data = self._seeded()
+        coll_orchestrate.set_submit_verification(path, data, bill_no="20", verified=True)
+        coll_orchestrate.apply_submit_approval(path, data, "return")
+        saved = self._reload(path)
+        self.assertEqual(saved["stages"]["submit"], "returned")
+        self.assertNotIn("verification", saved)
+        self.assertTrue(path.exists())
 
 
 class TestComputePaymentDates(OrchestrateTestCase):
@@ -779,6 +927,176 @@ class TestValidateStagedReport(DbTestCase):
             conn.close()
         errors = coll_orchestrate.validate_staged_report(self._staged())
         self.assertEqual(sum("not found in master" in e for e in errors), 2)
+
+
+class TestApplyCorrectionRequest(DbTestCase):
+    """Orchestration around the store's atomic apply: staged-balance refresh
+    and the reject/withdraw resolutions."""
+
+    def _seed(self):
+        self._insert_voucher("1", balance="80.00")  # amount 100.00
+        conn = coll_store.get_db()
+        try:
+            conn.execute(
+                "INSERT INTO installments (bill_no, date, amount, salesman, created_by, created_at)"
+                " VALUES ('1', '2026-01-01', '20.00', 'sm1', 'app', 't')")
+            conn.commit()
+            inst_id = conn.execute("SELECT id FROM installments").fetchone()["id"]
+        finally:
+            conn.close()
+        cid = coll_store.insert_correction({
+            "kind": "installment_amount", "bill_no": "1", "installment_id": inst_id,
+            "old": {"date": "2026-01-01", "amount": "20.00"},
+            "new": {"amount": "50.00"},
+            "requested_by": "sup", "requested_at": "2026-07-18T10:00:00"})
+        report = {
+            "stages": {"start": "new", "submit": "", "post": ""},
+            "selection_type": "beat_salesman", "selection": ["beat1", "sm1"],
+            "vouchers": [{"bill_no": "1", "date": "2026-01-01", "balance": "80.00",
+                          "payment": "", "beat": "beat1", "salesman": "sm1"}],
+        }
+        path = self._write_staging_json("coll-corrtest.json", report)
+        return cid, path
+
+    def test_apply_updates_master_and_refreshes_staged_balance(self):
+        cid, path = self._seed()
+        corr = coll_orchestrate.apply_correction_request(cid, "apply", "dist")
+        self.assertEqual(corr["status"], "applied")
+        rows = self._query("SELECT balance FROM vouchers WHERE bill_no = '1'")
+        self.assertEqual(rows[0]["balance"], "50.00")
+        staged = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(staged["vouchers"][0]["balance"], "50.00")
+        self.assertTrue(path.with_suffix(".txt").exists())
+
+    def test_reject_stamps_resolution_and_touches_nothing(self):
+        cid, path = self._seed()
+        corr = coll_orchestrate.apply_correction_request(
+            cid, "reject", "dist", "physical voucher agrees with the system")
+        self.assertEqual((corr["status"], corr["resolved_by"]), ("rejected", "dist"))
+        self.assertEqual(corr["resolution_note"], "physical voucher agrees with the system")
+        self.assertEqual(self._query("SELECT balance FROM vouchers")[0]["balance"], "80.00")
+        staged = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(staged["vouchers"][0]["balance"], "80.00")
+
+    def test_withdraw_resolution(self):
+        cid, _ = self._seed()
+        corr = coll_orchestrate.apply_correction_request(cid, "withdraw", "sup")
+        self.assertEqual(corr["status"], "withdrawn")
+
+    def test_unknown_action_rejected(self):
+        cid, _ = self._seed()
+        with self.assertRaises(ValueError):
+            coll_orchestrate.apply_correction_request(cid, "archive", "dist")
+
+
+class TestCollectionCorrectionApply(DbTestCase):
+    """collection_amount corrections edit the STAGED report (payment), not
+    master data — with sidecar + TXT kept in sync and stage/snapshot guards."""
+
+    def _seed(self, payment="30.00", corr_new="50.00", submit="submitted", bill="1"):
+        self._insert_voucher(bill, balance="80.00")  # master amount 100.00
+        report = {
+            "stages": {"start": "confirmed", "submit": submit, "post": ""},
+            "selection_type": "beat_salesman", "selection": ["beat1", "sm1"],
+            "vouchers": [{"bill_no": bill, "date": "2026-01-01", "balance": "80.00",
+                          "payment": payment,
+                          "payment_date": "2026-07-01" if payment else "",
+                          "beat": "beat1", "salesman": "sm1"}],
+        }
+        path = self._write_staging_json(f"coll-cc{bill}.json", report)
+        cid = coll_store.insert_correction({
+            "kind": "collection_amount", "bill_no": bill,
+            "old": {"payment": payment, "date": "2026-07-01" if payment else ""},
+            "new": {"payment": corr_new},
+            "requested_by": "sup", "requested_at": "2026-07-19T09:00:00"})
+        return cid, path
+
+    def _staged(self, path):
+        return json.loads(path.read_text(encoding="utf-8"))["vouchers"][0]
+
+    def test_apply_updates_staged_payment_sidecar_and_txt(self):
+        cid, path = self._seed()
+        corr = coll_orchestrate.apply_correction_request(cid, "apply", "sup")
+        self.assertEqual((corr["status"], corr["resolved_by"]), ("applied", "sup"))
+        v = self._staged(path)
+        self.assertEqual(v["payment"], "50.00")
+        from datetime import datetime
+        self.assertEqual(v["payment_date"], datetime.now().strftime("%Y-%m-%d"))
+        sidecar, _ = coll_store._load_installments(path)
+        self.assertEqual(sidecar["1"]["payment"], "50.00")
+        self.assertTrue(path.with_suffix(".txt").exists())
+        # Master data untouched.
+        self.assertEqual(self._query("SELECT balance FROM vouchers")[0]["balance"], "80.00")
+
+    def test_empty_correction_clears_payment_and_date(self):
+        cid, path = self._seed(corr_new="")
+        coll_orchestrate.apply_correction_request(cid, "apply", "dist")
+        v = self._staged(path)
+        self.assertEqual((v["payment"], v["payment_date"]), ("", ""))
+        sidecar, _ = coll_store._load_installments(path)
+        self.assertNotIn("1", sidecar)  # only truthy payments are kept
+
+    def test_snapshot_conflict_when_staged_payment_changed(self):
+        cid, path = self._seed()
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["vouchers"][0]["payment"] = "25.00"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        with self.assertRaises(coll_store.CorrectionConflict):
+            coll_orchestrate.apply_correction_request(cid, "apply", "sup")
+        self.assertEqual(coll_store.load_correction(cid)["status"], "open")
+
+    def test_stage_guards(self):
+        cases = (("returned", "with the salesman", "1"),
+                 ("inprogress", "with the salesman", "2"),
+                 ("confirmed", "no longer awaiting", "3"))
+        for submit, fragment, bill in cases:
+            with self.subTest(submit=submit):
+                cid, path = self._seed(submit=submit, bill=bill)
+                with self.assertRaises(ValueError) as ctx:
+                    coll_orchestrate.apply_correction_request(cid, "apply", "sup")
+                self.assertIn(fragment, str(ctx.exception))
+                self.assertEqual(coll_store.load_correction(cid)["status"], "open")
+                self.assertEqual(self._staged(path)["payment"], "30.00")
+
+    def test_no_active_report_is_stale(self):
+        self._insert_voucher("1", balance="80.00")
+        cid = coll_store.insert_correction({
+            "kind": "collection_amount", "bill_no": "1",
+            "old": {"payment": "30.00", "date": ""}, "new": {"payment": "50.00"},
+            "requested_by": "sup", "requested_at": "t"})
+        with self.assertRaises(ValueError) as ctx:
+            coll_orchestrate.apply_correction_request(cid, "apply", "sup")
+        self.assertIn("stale", str(ctx.exception))
+
+    def test_corrected_value_must_fit_master_balance(self):
+        cid, path = self._seed(corr_new="90.00")  # master balance is 80.00
+        with self.assertRaises(ValueError) as ctx:
+            coll_orchestrate.apply_correction_request(cid, "apply", "sup")
+        self.assertIn("exceeds balance", str(ctx.exception))
+        self.assertEqual(coll_store.load_correction(cid)["status"], "open")
+        self.assertEqual(self._staged(path)["payment"], "30.00")
+
+    def test_resubmit_with_requested_value_auto_settles(self):
+        cid, path = self._seed(submit="returned")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        vouchers = data["vouchers"]
+        vouchers[0]["payment"] = "50.00"
+        coll_orchestrate.record_submit_payments(path, data, vouchers,
+                                                submit_for_review=True,
+                                                beats=["beat1"], salesmen=["sm1"])
+        corr = coll_store.load_correction(cid)
+        self.assertEqual((corr["status"], corr["resolved_by"]), ("applied", "sm1"))
+        self.assertEqual(corr["resolution_note"], "matched after salesman revision")
+
+    def test_resubmit_with_other_value_stays_open(self):
+        cid, path = self._seed(submit="returned")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        vouchers = data["vouchers"]
+        vouchers[0]["payment"] = "40.00"
+        coll_orchestrate.record_submit_payments(path, data, vouchers,
+                                                submit_for_review=True,
+                                                beats=["beat1"], salesmen=["sm1"])
+        self.assertEqual(coll_store.load_correction(cid)["status"], "open")
 
 
 class TestValidatePayment(unittest.TestCase):

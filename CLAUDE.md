@@ -48,6 +48,8 @@ Five sequential steps per beat:
 
 **Beat-level workflow guard:** only one active staging report per beat is allowed. A second `coll-start` for the same beat is blocked until the existing report is posted or cancelled.
 
+**Correction requests (web-only, iteration3):** during an approval review a supervisor may raise a structured correction (plus a free-text note). Requests live in the SQLite `corrections` table (see `schema.md`). Which kinds are raiseable is stage-restricted: the **Approve Collection List** review offers the four master-data kinds (`installment_amount` / `installment_delete` / `installment_add` / `voucher_amount` — resolved only by the distributor; Apply = atomic master change + balance recompute); the **Approve Collections** review offers only `collection_amount` (this cycle's staged payment — resolved by supervisor OR distributor via `coll_approve_submit`, or by Return-to-salesman, which auto-settles the request when the resubmitted payment matches). An **open** request blocks web approval of any staging report containing that `bill_no` (and disables that voucher's verification checkbox); **applied** requests stay listed on the Correction Requests screen — linking to the workflow they gate — until that report posts or is cancelled (derived at render time, nothing stored). The CLI ignores corrections entirely.
+
 ### Report JSON schema (staging)
 
 ```json
@@ -62,9 +64,12 @@ Five sequential steps per beat:
   },
   "vouchers": [
     {"bill_no": "...", "date": "...", "balance": "100.00", "payment": "", "payment_date": "", "beat": "beat1", "salesman": "salesman1"}
-  ]
+  ],
+  "verification": {"bill_nos": ["..."], "count": true}
 }
 ```
+
+`verification` is optional, web-only bookkeeping for the physical-voucher checks on **both** the Approve Collection List and Approve Collections screens (per-voucher + count checkboxes) — same shape, reused because each stage's approval pops the key on exit. Present only while `stages.start == "new"` or `stages.submit == "submitted"`, respectively; `apply_start_approval` pops it on approve (every entry point) and `apply_submit_approval` pops it on **either** approve or return (a submit-stage return does not delete the file, so a stale state must not resurface on the resubmitted report's next review). The CLI ignores it. The Approve Collections count checkbox reads "Returned vouchers reconciled against my notes" — unlike the morning bundle count it does not assert the returned count equals the voucher count, since a missing voucher can legitimately mean the customer paid it off in full.
 
 ---
 
@@ -82,6 +87,8 @@ data/
 staging/              — active collection reports (JSON + TXT pairs)
 archive/              — finalized collection reports (JSON + TXT pairs)
 ```
+
+Master data actually lives in `data/collmgm.db` (SQLite; CSVs are the schema source of truth and first-run seed). The DB additionally holds `permissions` and the `corrections` table (correction requests + audit trail — no CSV counterpart; see `schema.md`).
 
 CSV conventions: comma delimiter, UTF-8, ISO 8601 dates, `Decimal` for amounts (never float).
 

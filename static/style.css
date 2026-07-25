@@ -147,6 +147,7 @@ input:focus, select:focus, textarea:focus {
 }
 .btn:hover { opacity: .88; }
 .btn:active { opacity: .75; }
+.btn[disabled] { opacity: .5; cursor: not-allowed; pointer-events: none; }
 .btn-primary   { background: var(--blue);  color: #fff; }
 .btn-secondary { background: var(--gray-200); color: var(--gray-800); }
 .btn-danger    { background: var(--red);   color: #fff; }
@@ -281,6 +282,79 @@ input:focus, select:focus, textarea:focus {
 .num  { text-align: right !important; }
 .mono { font-family: var(--font-mono); }
 .muted { color: var(--gray-400); }
+
+/* ---- Physical-voucher verification (Approve Collection List) ---- */
+.verify-col, .verify-cell { text-align: center; }
+.verify-box, .count-verify input {
+  width: 1.3rem;
+  height: 1.3rem;
+  accent-color: var(--green);
+  cursor: pointer;
+}
+/* Deeper green than .has-payment's #f0fdf4 so the two states read apart */
+.data-table tbody tr.row-verified,
+.data-table tbody tr.row-verified:hover { background: #dcfce7; }
+/* Declared after .row-verified so the active highlight wins on a verified row */
+.data-table tbody tr.row-active,
+.data-table tbody tr.row-active:hover {
+  background: #eff6ff;
+  box-shadow: inset 3px 0 0 var(--blue);
+}
+.verify-summary { gap: 1rem; flex-wrap: wrap; }
+/* Approve Collections merges the verify checkbox into the existing Payment
+   column (no 7th column / new mobile grid-area needed): the cell holds one
+   inline-flex wrapper so the mobile td[data-label]::before label still pairs
+   with exactly one sibling for its space-between layout. */
+.pay-verify-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.count-verify {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+/* ---- Correction requests ---- */
+/* Amber = disputed numbers: declared after .row-verified so a pending
+   correction visually overrides an earlier verified tint */
+.data-table tbody tr.row-correction,
+.data-table tbody tr.row-correction:hover { background: #fef3c7; }
+.badge {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .03em;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.badge-warn  { background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
+.badge-ok    { background: #d1fae5; color: var(--green); border: 1px solid #6ee7b7; }
+.badge-muted { background: var(--gray-100); color: var(--gray-600); border: 1px solid var(--gray-200); }
+.inline-actions { margin-top: 0.5rem; }
+.correction-form .kind-choice {
+  border: 1px solid var(--gray-200);
+  border-radius: var(--radius);
+  padding: 0.5rem 0.75rem;
+  margin-bottom: 0.75rem;
+}
+.correction-form .kind-choice legend { font-weight: 600; padding: 0 4px; }
+.kind-option { display: block; margin: 4px 0; cursor: pointer; }
+.field-label { display: block; margin: 0.75rem 0 0.25rem; font-weight: 600; }
+.field-label input, .field-label textarea {
+  display: block;
+  width: 100%;
+  max-width: 24rem;
+  margin-top: 4px;
+  font-weight: 400;
+}
+.field-group { margin-bottom: 0.75rem; }
 
 /* ---- Payment input ---- */
 .payment-table .pay-cell { padding: 4px 8px; }
@@ -469,6 +543,19 @@ input.pay-input {
   .stack-table tbody tr:hover { background: #fff; }
   .stack-table tbody tr.has-payment,
   .stack-table tbody tr.has-payment:hover { background: #f0fdf4; }
+  .stack-table tbody tr.row-verified,
+  .stack-table tbody tr.row-verified:hover { background: #dcfce7; }
+  .stack-table tbody tr.row-correction,
+  .stack-table tbody tr.row-correction:hover { background: #fef3c7; }
+  .stack-table tbody tr.row-active,
+  .stack-table tbody tr.row-active:hover {
+    border-color: var(--blue);
+    box-shadow: 0 0 0 2px rgba(26, 86, 219, .25);
+  }
+  /* Bigger touch target for the card's bottom-right verify checkbox */
+  .stack-table .verify-box { width: 1.5rem; height: 1.5rem; }
+  /* The tfoot's empty 6th cell must not become a full-width flex child */
+  .stack-table tfoot td:empty { display: none; }
   .stack-table td { border-bottom: none; padding: 3px 0; flex: 1 1 100%; }
   .stack-table td[data-label] {
     display: flex;
