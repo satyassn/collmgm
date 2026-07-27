@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Amendment Request — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Amendment Request #{{ req.id }}</h2>
+<p class="meta-line">
+  <strong>Voucher:</strong> <span class="mono">{{ req.bill_no }}</span>
+  &nbsp;|&nbsp; <span class="badge badge-{{ 'warn' if req.status == 'open' else 'ok' if req.status == 'applied' else 'muted' }}">{{ req.status }}</span>
+</p>
+
+<div class="card">
+  <p><strong>Requested by:</strong> {{ req.requested_by }} on {{ req.requested_at[:10] }}</p>
+  <p><strong>Note:</strong> {{ req.note }}</p>
+  {% if req.status != 'open' %}
+    <p><strong>Resolution:</strong> {{ req.status }} by {{ req.resolved_by }} on {{ (req.resolved_at or '')[:10] }}{% if req.resolution_note %} — {{ req.resolution_note }}{% endif %}</p>
+    {% if req.linked_amendment_id %}
+    <p><a href="/coll/amendments/{{ req.linked_amendment_id }}">View the amendment that resolved this request</a></p>
+    {% endif %}
+  {% endif %}
+</div>
+
+<h3 class="group-heading">Current Voucher</h3>
+{% if voucher %}
+<div class="card">
+  <p><strong>Date:</strong> {{ voucher.date }}
+    &nbsp;|&nbsp; <strong>Amount:</strong> <span class="mono">{{ voucher.amount }}</span>
+    &nbsp;|&nbsp; <strong>Balance:</strong> <span class="mono">{{ voucher.balance }}</span></p>
+  {% if installments %}
+  <table class="data-table">
+    <thead><tr><th>Date</th><th class="num">Amount</th><th>Salesman</th></tr></thead>
+    <tbody>
+      {% for inst in installments %}
+      <tr>
+        <td>{{ inst.date }}</td>
+        <td class="num mono">{{ inst.amount }}</td>
+        <td>{{ inst.salesman }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="muted">No installments recorded.</p>
+  {% endif %}
+</div>
+{% else %}
+<p class="alert alert-warn">Voucher not found among active vouchers (settled or archived since the request was raised).</p>
+{% endif %}
+
+{% if req.status == 'open' and can_resolve %}
+<div class="action-row">
+  <a class="btn btn-primary" href="/coll/amend/{{ req.bill_no | urlencode }}">Open Amend Voucher Editor</a>
+</div>
+<form method="post" action="/coll/amend-requests/{{ req.id }}" class="card">
+  <input type="hidden" name="next" value="{{ back }}">
+  <label class="field-label">Resolution note (optional)
+    <textarea name="resolution_note" rows="2" maxlength="500"></textarea>
+  </label>
+  <div class="action-row">
+    <button type="submit" name="action" value="reject" class="btn btn-danger"
+            onclick="return confirm('Reject this amendment request?')">Reject</button>
+    <a class="btn btn-secondary" href="{{ back }}">Back</a>
+  </div>
+</form>
+{% else %}
+<div class="action-row">
+  <a class="btn btn-secondary" href="{{ back }}">Back</a>
+</div>
+{% endif %}
+{% endblock %}

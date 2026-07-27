@@ -3,6 +3,9 @@ salesman,coll_start
 salesman,coll_submit
 salesman,add_vouchers
 salesman,reports
+salesman,raise_correction
+salesman,raise_amendment_request
+salesman,view_checks
 supervisor,coll_start
 supervisor,coll_approve_start
 supervisor,coll_submit
@@ -12,6 +15,8 @@ supervisor,import_vouchers
 supervisor,reports
 supervisor,coll_print
 supervisor,raise_correction
+supervisor,raise_amendment_request
+supervisor,view_checks
 distributor,coll_start
 distributor,coll_approve_start
 distributor,coll_submit
@@ -28,3 +33,5 @@ distributor,manage_beats
 distributor,raise_correction
 distributor,apply_correction
 distributor,amend_voucher
+distributor,view_checks
+distributor,resolve_check

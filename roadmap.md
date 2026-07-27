@@ -2,6 +2,17 @@
 
 ## Released
 
+### iteration4 — Voucher Amendment (web)
+
+A raw, single-voucher editor for the distributor ("Amend Voucher"): all voucher fields plus full control of that voucher's installments (edit/delete/add), submitted as one atomic transaction with a load-time snapshot check (`AmendmentConflict`) and balance recompute. Complements iteration3's one-field-at-a-time correction requests for cases needing a multi-field fix. No approval step — every applied edit is recorded permanently in the new `amendments` table.
+
+- **Gate:** the editor refuses to open while any open master-data correction exists on the bill — the distributor is redirected to that correction's review page to resolve it first, since an amendment could otherwise invalidate its snapshot; an open `collection_amount` request doesn't gate.
+- **Staged interplay:** amending a voucher mid-flight in an active staging report is allowed (no stage-based block) — approve-submit/post always re-validate against CURRENT master data, and Return is the existing remedy. Applied amendments refresh the staged `balance`/`voucher_date`/`salesman` display fields, deliberately never `beat`.
+
+361 tests passing (up from 321 at the last roadmap snapshot). Schema addition (`amendments` table): `schema.md`. State-machine documentation: `pipeline.md`.
+
+---
+
 ### iteration3 — Approval Verification + Correction Requests (web)
 
 Adds a physical-voucher verification workflow and a correction-request system to the two supervisor approval screens, closing the gap between what's on paper and what's staged in the system. Web-only throughout — the CLI approve flows are unaffected.
@@ -59,11 +70,3 @@ Builds on beta0.1 and adds authenticated access with role-based workflow gates.
 - Modular architecture: `coll_store` / `coll_data` / `coll_cli` / `coll_workflow`
 - Report generation (JSON + TXT) with staging and archive lifecycle
 - Batch balance update to `vouchers.csv` on post
-
----
-
-## Planned
-
-### iteration4 — Voucher Amendment (parked)
-
-A raw, single-voucher editor for the distributor: all voucher fields plus full control of that voucher's installments, submitted as one atomic transaction with an audit trail (new `amendments` table). Complements iteration3's one-field-at-a-time correction requests for cases needing a multi-field fix. **Status: planned and designed, implementation not started** — needs explicit approval for the `amendments` schema change before coding begins. Full design: `iteration4.md`.

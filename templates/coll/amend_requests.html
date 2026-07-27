@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Amendment Requests — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Amendment Requests</h2>
+
+{% if not active %}
+  <p class="empty-state">No open amendment requests.</p>
+{% else %}
+  <ul class="report-list">
+    {% for r in active %}
+    <li class="report-item">
+      <span class="report-label">
+        <span class="mono">{{ r.bill_no }}</span> — {{ r.note }}
+        <span class="badge badge-warn">Pending</span>
+      </span>
+      <span class="report-meta">{{ r.requested_by }} · {{ r.requested_at[:10] }}</span>
+      <a class="btn btn-sm btn-primary" href="/coll/amend-requests/{{ r.id }}">{{ 'Review' if can_resolve else 'View' }}</a>
+    </li>
+    {% endfor %}
+  </ul>
+{% endif %}
+
+{% if history %}
+<h3 class="group-heading">Recent History</h3>
+<ul class="report-list">
+  {% for r in history %}
+  <li class="report-item">
+    <span class="report-label">
+      <span class="mono">{{ r.bill_no }}</span> — {{ r.note }}
+      <span class="badge badge-{{ 'ok' if r.status == 'applied' else 'muted' }}">{{ r.status }}</span>
+    </span>
+    <span class="report-meta">{{ r.resolved_by or r.requested_by }} · {{ (r.resolved_at or r.requested_at)[:10] }}{% if r.resolution_note %} · {{ r.resolution_note }}{% endif %}</span>
+    <a class="btn btn-sm btn-secondary" href="/coll/amend-requests/{{ r.id }}">View</a>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+<div class="action-row">
+  {% if can_raise %}
+  <a class="btn btn-secondary" href="/coll/amend-request">Request Voucher Amendment</a>
+  {% endif %}
+  <a class="btn btn-secondary" href="/menu">Back to Menu</a>
+</div>
+{% endblock %}

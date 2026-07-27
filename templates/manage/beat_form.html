@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}{{ 'New Beat' if mode == 'create' else 'Edit Beat' }} — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">{{ 'New Beat' if mode == 'create' else 'Edit Beat' }}</h2>
+
+{% if error %}<p class="alert alert-error">{{ error }}</p>{% endif %}
+
+<form method="post"
+      action="{{ '/manage/beats/new' if mode == 'create' else '/manage/beats/' ~ (target.name | urlencode) ~ '/edit' }}"
+      class="card">
+
+  <label class="field-label">Beat Name
+    {% if mode == 'create' %}
+      <input type="text" name="name" value="{{ target.name if target else '' }}" required autofocus>
+    {% else %}
+      <input type="text" value="{{ target.name }}" disabled>
+    {% endif %}
+  </label>
+
+  <label class="field-label">Salesman
+    <select name="salesman" required>
+      <option value="" disabled {% if not target %}selected{% endif %}>Select a salesman</option>
+      {% for s in salesmen %}
+      <option value="{{ s }}" {% if target and target.salesman == s %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <div class="action-row">
+    <button type="submit" class="btn btn-primary">{{ 'Create Beat' if mode == 'create' else 'Save' }}</button>
+    <a class="btn btn-secondary" href="/manage/beats">Cancel</a>
+  </div>
+</form>
+{% endblock %}

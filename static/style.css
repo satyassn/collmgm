@@ -51,16 +51,40 @@ body {
   text-decoration: none;
   flex: 1;
 }
-.user-info { font-size: 0.875rem; }
-.logout-btn {
-  font-size: 0.8rem;
-  color: rgba(255,255,255,.85);
-  text-decoration: none;
+/* ---- Nav dropdown (Manage / Account) ---- */
+.nav-dropdown { position: relative; }
+.nav-dropdown-toggle {
+  background: none;
   border: 1px solid rgba(255,255,255,.4);
+  color: #fff;
+  font-size: 0.8rem;
   padding: 4px 10px;
   border-radius: var(--radius);
+  cursor: pointer;
 }
-.logout-btn:hover { background: rgba(255,255,255,.15); }
+.nav-dropdown-toggle:hover { background: rgba(255,255,255,.15); }
+.nav-dropdown-menu {
+  display: none;
+  position: absolute;
+  right: 0;
+  top: calc(100% + 4px);
+  background: #fff;
+  color: var(--gray-800);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  min-width: 160px;
+  z-index: 30;
+  overflow: hidden;
+}
+.nav-dropdown-menu.open { display: block; }
+.nav-dropdown-menu a {
+  display: block;
+  padding: 10px 14px;
+  color: var(--gray-800);
+  text-decoration: none;
+  font-size: 0.9rem;
+}
+.nav-dropdown-menu a:hover { background: var(--gray-100); }
 
 /* ---- Role badges ---- */
 .role-badge {
@@ -131,6 +155,16 @@ input:focus, select:focus, textarea:focus {
 }
 .form-group { margin-bottom: 1rem; }
 .form-group label { margin-top: 0; }
+
+.password-field-wrap { position: relative; display: block; }
+.password-field-wrap input { padding-right: 40px; }
+.password-toggle-btn {
+  position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  background: none; border: none; padding: 4px; cursor: pointer;
+  color: var(--gray-600); display: flex; align-items: center;
+}
+.password-toggle-btn:hover { color: var(--gray-800); }
+.password-toggle-btn svg { width: 20px; height: 20px; display: block; }
 
 /* ---- Buttons ---- */
 .btn {
@@ -337,6 +371,7 @@ input:focus, select:focus, textarea:focus {
 .badge-warn  { background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
 .badge-ok    { background: #d1fae5; color: var(--green); border: 1px solid #6ee7b7; }
 .badge-muted { background: var(--gray-100); color: var(--gray-600); border: 1px solid var(--gray-200); }
+.badge-error { background: #fee2e2; color: var(--red); border: 1px solid #fca5a5; }
 .inline-actions { margin-top: 0.5rem; }
 .correction-form .kind-choice {
   border: 1px solid var(--gray-200);
@@ -426,6 +461,7 @@ input.pay-input {
   font-size: 0.9rem;
 }
 .summary-total { font-size: 1rem; }
+.summary-box--types { justify-content: flex-start; gap: 1.5rem; flex-wrap: wrap; }
 
 .balance-preview.negative { color: var(--red); font-weight: 700; }
 
@@ -690,16 +726,18 @@ input.pay-input {
      Must stay after the grid rule (equal specificity, source order wins). */
   .stack-table tbody tr[hidden] { display: none; }
 
-  /* Voucher Amendment installment grid (Date/Amount/Salesman/Delete): its
-     own mapping, not .stack-table — that class's nth-child rules above are
-     tuned for the 6-col voucher/payment tables' bill/date/amt/total/bal/pay
-     shape and would misplace a differently-shaped 4-col editable grid. Same
-     data-label labeling technique, scoped to its own class instead. */
-  .amend-inst-table thead { display: none; }
-  .amend-inst-table, .amend-inst-table tbody,
-  .amend-inst-table tr, .amend-inst-table td { display: block; width: 100%; }
-  .amend-inst-table { border: none; box-shadow: none; background: transparent; }
-  .amend-inst-table tr {
+  /* Generic list-of-records card converter: opt-in via .card-table.
+     Unlike .stack-table (specialized grid-template-areas "stats row on top"
+     layout, hardcoded via nth-child to the 6-col voucher/payment shape),
+     .card-table makes no assumption about column count or order — each td
+     just becomes a labeled row via its data-label attribute, and the tr
+     becomes a card. Use this for any other list-of-records table (report
+     tables, installment pickers/diffs, the amendment editor's grid). */
+  .card-table thead { display: none; }
+  .card-table, .card-table tbody,
+  .card-table tr, .card-table td { display: block; width: 100%; }
+  .card-table { border: none; box-shadow: none; background: transparent; }
+  .card-table tr {
     background: #fff;
     border: 1px solid var(--gray-200);
     border-radius: var(--radius);
@@ -707,14 +745,14 @@ input.pay-input {
     padding: 0.4rem 0.65rem;
     margin-bottom: 0.4rem;
   }
-  .amend-inst-table td { border-bottom: none; padding: 3px 0; }
-  .amend-inst-table td[data-label] {
+  .card-table td { border-bottom: none; padding: 3px 0; }
+  .card-table td[data-label] {
     display: flex;
     justify-content: space-between;
     align-items: center;
     gap: 1rem;
   }
-  .amend-inst-table td[data-label]::before {
+  .card-table td[data-label]::before {
     content: attr(data-label);
     flex-shrink: 0;
     font-size: 0.72rem;
@@ -723,5 +761,5 @@ input.pay-input {
     letter-spacing: .04em;
     color: var(--gray-600);
   }
-  .amend-inst-table input, .amend-inst-table select { max-width: 60%; }
+  .card-table input, .card-table select { max-width: 60%; }
 }

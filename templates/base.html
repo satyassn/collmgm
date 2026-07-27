@@ -13,20 +13,37 @@
       navigator.serviceWorker.register('/static/sw.js');
   </script>
   <script src="/static/voucher_detail.js" defer></script>
+  <script src="/static/nav_dropdown.js" defer></script>
+  <script src="/static/password_toggle.js" defer></script>
 </head>
 <body>
   <header class="topbar">
     <a class="brand" href="/menu">CollMgm</a>
     {% if user is defined and user %}
-      <span class="user-info">
-        <span class="role-badge role-{{ user.role }}">{{ user.role }}</span>
-        {{ user.name }}
-      </span>
-      <a class="logout-btn" href="/logout">Logout</a>
+      {% if nav_perms is defined and ("manage_users" in nav_perms or "manage_beats" in nav_perms) %}
+      <div class="nav-dropdown">
+        <button type="button" class="nav-dropdown-toggle">Manage &#9662;</button>
+        <div class="nav-dropdown-menu">
+          {% if "manage_users" in nav_perms %}<a href="/manage/users">Users</a>{% endif %}
+          {% if "manage_beats" in nav_perms %}<a href="/manage/beats">Beats</a>{% endif %}
+        </div>
+      </div>
+      {% endif %}
+      <div class="nav-dropdown">
+        <button type="button" class="nav-dropdown-toggle">
+          <span class="role-badge role-{{ user.role }}">{{ user.role }}</span> {{ user.name }} &#9662;
+        </button>
+        <div class="nav-dropdown-menu">
+          <a href="/profile">Profile</a>
+          <a href="/logout">Logout</a>
+        </div>
+      </div>
     {% endif %}
   </header>
 
   <main>
+    {% set ok = request.query_params.get('ok') %}
+    {% if ok %}<p class="alert alert-success">{{ ok }}</p>{% endif %}
     {% block content %}{% endblock %}
   </main>
 </body>

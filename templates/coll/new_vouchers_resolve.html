@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Resolve New Vouchers — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Resolve Raised Issues</h2>
+
+{% if not flags %}
+  <p class="empty-state">No open issues in this batch.</p>
+{% else %}
+  <ul class="report-list">
+    {% for f in flags %}
+    <li class="report-item">
+      <span class="report-label">
+        <span class="mono">{{ f.bill_no }}</span> — {{ kinds.get(f.kind, f.kind) }}
+        <span class="badge badge-warn">open</span>
+      </span>
+      <span class="report-meta">{{ f.raised_by }} &middot; {{ f.raised_at[:10] }}{% if f.note %} &middot; {{ f.note }}{% endif %}</span>
+      <a class="btn btn-sm btn-primary" href="/coll/new-vouchers/{{ stem }}/resolve/{{ f.id }}">Resolve</a>
+    </li>
+    {% endfor %}
+  </ul>
+{% endif %}
+<a class="btn btn-secondary" href="/coll/new-vouchers">Back</a>
+{% endblock %}

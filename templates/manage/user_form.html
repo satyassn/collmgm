@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}{{ 'New User' if mode == 'create' else 'Edit User' }} — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">{{ 'New User' if mode == 'create' else 'Edit User' }}</h2>
+
+{% if error %}<p class="alert alert-error">{{ error }}</p>{% endif %}
+
+<form method="post"
+      action="{{ '/manage/users/new' if mode == 'create' else '/manage/users/' ~ (target.name | urlencode) ~ '/edit' }}"
+      class="card">
+
+  <label class="field-label">Username
+    {% if mode == 'create' %}
+      <input type="text" name="name" value="{{ target.name if target else '' }}" required autofocus>
+    {% else %}
+      <input type="text" value="{{ target.name }}" disabled>
+    {% endif %}
+  </label>
+
+  <label class="field-label">Role
+    <select name="role" required>
+      {% for r in roles %}
+      <option value="{{ r }}" {% if target and target.role == r %}selected{% endif %}>{{ r }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  {% if mode == 'create' %}
+  <label class="field-label">Initial Password
+    <input type="password" name="password" required minlength="6" autocomplete="new-password">
+  </label>
+  <label class="field-label">Confirm Password
+    <input type="password" name="confirm_password" required minlength="6" autocomplete="new-password">
+  </label>
+  <p class="hint">The user must change this password the first time they log in.</p>
+  {% endif %}
+
+  <div class="action-row">
+    <button type="submit" class="btn btn-primary">{{ 'Create User' if mode == 'create' else 'Save' }}</button>
+    <a class="btn btn-secondary" href="/manage/users">Cancel</a>
+  </div>
+</form>
+{% endblock %}

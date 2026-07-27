@@ -15,10 +15,10 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Literal, NamedTuple, Optional
 
-from coll_data import _find_any_active_beat_report
+from coll_data import _find_any_active_beat_report, search_voucher
 from coll_store import (
     STAGING_DIR,
-    parse_decimal, load_vouchers_by_bill_nos,
+    parse_decimal, load_vouchers_by_bill_nos, load_beats_raw,
     save_report_json, load_report_json, write_collection_text, bill_no_sort_key,
     ensure_staging_dir, sanitize_filename_component,
     acquire_beat_lock, release_beat_lock, cancel_staging_report,
@@ -32,6 +32,11 @@ from coll_store import (
     mark_correction_applied, open_corrections_for_bills,
     CorrectionConflict, load_correction,
     apply_voucher_amendment,
+    insert_amendment_request, load_amendment_request,
+    resolve_amendment_request as _store_resolve_amendment_request,
+    auto_resolve_amendment_requests,
+    mark_check_encashed, mark_check_bounced,
+    delete_staged_report,
 )
 
 
@@ -76,7 +81,7 @@ def prepare_submit_review(report_path, report_data):
     report_data["vouchers"] = sorted(report_data["vouchers"], key=lambda v: bill_no_sort_key(v["bill_no"]))
     sel = report_data.get("selection", [])
     beat = sel[0] if len(sel) > 0 else ""
-    salesman = sel[1] if len(sel) > 1 else ""
+    salesman = owning_salesman(report_data.get("selection_type", "beat_salesman"), sel)
     try:
         write_collection_text(report_path.with_suffix(".txt"), [beat], [salesman],
                               report_data["vouchers"], stage="submit", status="submitted")
@@ -181,6 +186,22 @@ def is_submit_verification_complete(report_data):
 # coll-start / coll-approve-start
 # ---------------------------------------------------------------------------
 
+def owning_salesman(selection_type, selection):
+    """Salesman responsible for this report, for RBAC/display purposes.
+
+    'beat_salesman' reports carry it directly in selection[1]. 'beat' reports
+    (beat-wide combined lists spanning several salesmen) derive it from the
+    beat's assigned salesman in master data, since submit-stage RBAC and
+    display still route to one responsible person even though vouchers can
+    span several salesmen.
+    """
+    if selection_type == "beat_salesman" and len(selection) > 1:
+        return selection[1]
+    if selection_type == "beat" and selection:
+        return next((b["salesman"] for b in load_beats_raw() if b["name"] == selection[0]), "")
+    return ""
+
+
 class ActiveReportState(str, Enum):
     NONE = "none"                          # no active report for this beat/salesman
     PENDING_START = "pending_start"         # stages.start == 'new' — offer approve/cancel inline
@@ -216,32 +237,44 @@ class GenerateOutcome(NamedTuple):
     vouchers: list
 
 
-def generate_collection_list(beat, salesman, vouchers):
+def generate_collection_list(selection_type, selection, vouchers):
     """Acquire the beat lock and write a new start-stage staging report.
 
+    `selection_type`/`selection` are stored verbatim in the staged JSON —
+    "beat_salesman"/[beat, salesman] for a single-salesman list (CLI, and
+    the web app's original flow), or "beat"/[beat] for a beat-wide combined
+    list spanning several salesmen (web). selection[0] is always the beat,
+    for every selection_type used so far, and is what the beat lock is keyed
+    on. The TXT sidecar's "Salesmen:" line is derived via owning_salesman()
+    rather than taken from `selection` directly, so a beat-only report still
+    shows the beat's assigned salesman for reference.
+
     Precondition (caller's responsibility): `vouchers` is non-empty and
-    check_active_beat_report() returned NONE for this beat/salesman.
+    check_active_beat_report() returned NONE for this selection.
     """
+    beat = selection[0]
     if not acquire_beat_lock(beat):
         return GenerateOutcome(False, "lock_conflict", None, None, None, vouchers)
 
     ensure_staging_dir()
     timestamp = datetime.now().strftime("%Y%m%d")
-    safe_selection = "_".join(sanitize_filename_component(v) for v in (beat, salesman))
-    base_name = f"coll{timestamp}-beat_salesman-{safe_selection}"
+    safe_selection = "_".join(sanitize_filename_component(v) for v in selection)
+    base_name = f"coll{timestamp}-{selection_type}-{safe_selection}"
     json_path = STAGING_DIR / f"{base_name}.json"
     txt_path = STAGING_DIR / f"{base_name}.txt"
 
     report_data = {
         "stages": {"start": "new", "submit": "", "post": ""},
-        "selection_type": "beat_salesman",
-        "selection": [beat, salesman],
+        "selection_type": selection_type,
+        "selection": list(selection),
         "date": datetime.now().strftime("%Y-%m-%d"),
         "vouchers": vouchers,
     }
+    owner = owning_salesman(selection_type, selection)
     try:
         save_report_json(json_path, report_data)
-        write_collection_text(txt_path, [beat], [salesman], vouchers, stage="start", status="new")
+        write_collection_text(txt_path, [beat], [owner] if owner else [],
+                              vouchers, stage="start", status="new")
     except Exception as error:
         release_beat_lock(beat)
         return GenerateOutcome(False, "write_error", str(error), None, None, vouchers)
@@ -260,7 +293,7 @@ def approve_start_stage(report_path, report_data):
     report_data.setdefault("stages", {})["start"] = "confirmed"
     sel = report_data.get("selection", [])
     beat = sel[0] if len(sel) > 0 else ""
-    salesman = sel[1] if len(sel) > 1 else ""
+    salesman = owning_salesman(report_data.get("selection_type", "beat_salesman"), sel)
     save_report_json(report_path, report_data)
     vouchers = report_data.get("vouchers", [])
     if vouchers:
@@ -436,7 +469,9 @@ def validate_staged_report(report_data):
         seen.add(v["bill_no"])
 
     sel = report_data.get("selection", [])
-    check_selection = report_data.get("selection_type") == "beat_salesman" and len(sel) >= 2
+    sel_type = report_data.get("selection_type")
+    check_beat_salesman = sel_type == "beat_salesman" and len(sel) >= 2
+    check_beat_only = sel_type == "beat" and len(sel) >= 1
     master = load_vouchers_by_bill_nos([v["bill_no"] for v in well_formed])
     today = datetime.now().date()
 
@@ -446,14 +481,24 @@ def validate_staged_report(report_data):
         if row is None:
             errors.append(f"{bill_no}: not found in master vouchers (deleted or already settled)")
             continue
-        if check_selection:
+        if check_beat_salesman:
             expected = (sel[0], sel[1])
             if ((v.get("beat"), v.get("salesman")) != expected
                     or (row["beat"], row["salesman"]) != expected):
                 errors.append(f"{bill_no}: beat/salesman mismatch with master")
+        elif check_beat_only:
+            # A beat-wide combined list intentionally spans several
+            # salesmen, so only the beat identity is cross-checked here —
+            # a salesman mismatch is surfaced as a review flag, not an error.
+            if v.get("beat") != sel[0] or row["beat"] != sel[0]:
+                errors.append(f"{bill_no}: beat mismatch with master")
         _, reason = validate_payment(v.get("payment"), row["balance"])
         if reason:
             errors.append(f"{bill_no}: {reason}")
+        elif (v.get("payment") or "").strip():
+            type_reason = validate_payment_type(v)
+            if type_reason:
+                errors.append(f"{bill_no}: {type_reason}")
         payment_date = (v.get("payment_date") or "").strip()
         if payment_date:
             try:
@@ -505,6 +550,58 @@ def validate_payment(raw, balance):
         return str(amount.quantize(Decimal("0.01"))), None
     except InvalidOperation:
         return None, "not a number"
+
+
+def validate_payment_type(voucher):
+    """Validate one voucher's payment-type fields (web-only; the CLI never
+    sets these, so payment_type defaults to 'cash' and this always passes
+    for CLI-originated data).
+
+    Returns None on success, or a reason string on rejection. 'cash'/unset
+    needs nothing further. 'upi' requires a non-empty upi_txn_id. 'check'
+    requires check_bank, check_no, and a well-formed ISO check_date (any
+    date, past or future — post-dated checks are normal, only the format is
+    checked here).
+    """
+    payment_type = (voucher.get("payment_type") or "cash").strip() or "cash"
+    if payment_type == "cash":
+        return None
+    if payment_type == "upi":
+        if not (voucher.get("upi_txn_id") or "").strip():
+            return "UPI transaction id is required"
+        return None
+    if payment_type == "check":
+        if not (voucher.get("check_bank") or "").strip():
+            return "check bank is required"
+        if not (voucher.get("check_no") or "").strip():
+            return "check number is required"
+        check_date = (voucher.get("check_date") or "").strip()
+        if not check_date:
+            return "check date is required"
+        try:
+            datetime.strptime(check_date, "%Y-%m-%d")
+        except ValueError:
+            return f"invalid check date '{check_date}'"
+        return None
+    return f"unknown payment type '{payment_type}'"
+
+
+def payment_type_totals(vouchers):
+    """Return {'cash': {'count', 'amount'}, 'upi': {...}, 'check': {...}} for
+    the vouchers with a non-empty staged payment > 0 — the cash/UPI/check
+    breakdown shown on the Submit/Approve Collections/Post Collections
+    summary boxes. An unrecognized/missing payment_type counts as cash."""
+    totals = {t: {"count": 0, "amount": Decimal("0")} for t in ("cash", "upi", "check")}
+    for v in vouchers:
+        amount = parse_decimal(v.get("payment"))
+        if amount <= 0:
+            continue
+        payment_type = (v.get("payment_type") or "cash").strip() or "cash"
+        if payment_type not in totals:
+            payment_type = "cash"
+        totals[payment_type]["count"] += 1
+        totals[payment_type]["amount"] += amount
+    return totals
 
 
 # ---------------------------------------------------------------------------
@@ -679,7 +776,7 @@ def _refresh_staged_voucher_fields(bill_no):
             save_report_json(path, data)
             sel = data.get("selection", [])
             beat = sel[0] if len(sel) > 0 else ""
-            salesman = sel[1] if len(sel) > 1 else ""
+            salesman = owning_salesman(data.get("selection_type", "beat_salesman"), sel)
             stages = data.get("stages", {})
             if stages.get("submit"):
                 stage, status = "submit", stages["submit"]
@@ -764,10 +861,11 @@ def _apply_collection_correction(corr, resolved_by, resolution_note=None):
     save_report_json(path, data)
     vouchers = data.get("vouchers", [])
     sel = data.get("selection", [])
+    owner = owning_salesman(data.get("selection_type", "beat_salesman"), sel)
     try:
         write_collection_text(path.with_suffix(".txt"),
                               [sel[0]] if len(sel) > 0 and sel[0] else [],
-                              [sel[1]] if len(sel) > 1 and sel[1] else [],
+                              [owner] if owner else [],
                               vouchers, stage="submit", status="submitted")
     except Exception:
         pass
@@ -786,7 +884,7 @@ def settle_collection_corrections(report_data):
     by_bill = {v.get("bill_no"): v for v in report_data.get("vouchers", [])
                if isinstance(v, dict) and v.get("bill_no")}
     sel = report_data.get("selection", [])
-    salesman = sel[1] if len(sel) > 1 and sel[1] else "salesman"
+    salesman = owning_salesman(report_data.get("selection_type", "beat_salesman"), sel) or "salesman"
     for bill_no, requests in open_corrections_for_bills(list(by_bill)).items():
         for corr in requests:
             if corr["kind"] != "collection_amount":
@@ -854,4 +952,236 @@ def amend_voucher(bill_no, snapshot, new_state, amended_by, note=""):
     """
     amendment = apply_voucher_amendment(bill_no, snapshot, new_state, amended_by, note or "")
     _refresh_staged_voucher_fields(bill_no)
+    auto_resolve_amendment_requests(bill_no, amended_by, amendment["id"])
     return amendment
+
+
+# ---------------------------------------------------------------------------
+# Amendment requests
+# ---------------------------------------------------------------------------
+
+def raise_amendment_request(bill_no, requested_by, note):
+    """Raise an open amendment request against an active (non-completed)
+    voucher. Free-text note only — unlike corrections there is no structured
+    kind/snapshot, since the fix is left to the distributor's raw editor.
+
+    Returns the new request id. Raises ValueError if the voucher doesn't
+    exist or is already completed/archived.
+    """
+    result = search_voucher(bill_no)
+    if result is None:
+        raise ValueError(f"voucher {bill_no} not found")
+    _voucher, _installments, is_completed = result
+    if is_completed:
+        raise ValueError(f"voucher {bill_no} is completed — cannot request an amendment")
+    now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    return insert_amendment_request(bill_no, note or "", requested_by, now)
+
+
+def resolve_amendment_request(req_id, action, resolved_by, resolution_note=None):
+    """Resolve one open amendment request via 'reject' or 'withdraw'.
+
+    There is no 'apply' action here — a request is auto-resolved as a side
+    effect of amend_voucher() landing an actual edit on its bill_no, not
+    through this function.
+
+    Returns the updated request dict. Raises ValueError if the request is
+    missing or no longer open, or if `action` isn't reject/withdraw.
+    """
+    if action not in ("reject", "withdraw"):
+        raise ValueError(f"unknown amendment request action {action!r}")
+    status = "rejected" if action == "reject" else "withdrawn"
+    return _store_resolve_amendment_request(req_id, status, resolved_by, resolution_note or "")
+
+
+# ---------------------------------------------------------------------------
+# Checks
+# ---------------------------------------------------------------------------
+
+def resolve_check(check_id, action, resolved_by, resolution_note=None):
+    """Resolve one pending check via 'encash' or 'bounce'.
+
+    'encash' -> coll_store.mark_check_encashed (status flip only — the
+                money was confirmed received).
+    'bounce' -> coll_store.mark_check_bounced (deletes the underlying
+                installment and recomputes the voucher balance in the same
+                transaction, unless the voucher's already archived — see
+                that function's docstring).
+
+    Returns the updated check dict. Raises ValueError if the check is
+    missing, not pending, or `action` isn't encash/bounce.
+    """
+    if action == "encash":
+        return mark_check_encashed(check_id, resolved_by, resolution_note or "")
+    if action == "bounce":
+        return mark_check_bounced(check_id, resolved_by, resolution_note or "")
+    raise ValueError(f"unknown check action {action!r}")
+
+
+# ---------------------------------------------------------------------------
+# Onboarding new vouchers — salesman review + distributor resolve (web-only)
+#
+# Operates entirely on the in-memory addv*.json batch dict (mutate + return);
+# callers (coll_api.py) are responsible for loading/saving it via
+# coll_store.load_report_json/save_report_json. No DB access here — staged
+# vouchers aren't in the vouchers table yet, so none of the live-data
+# amendment/correction machinery (optimistic-concurrency snapshots, surrogate
+# installment ids) applies; identity within a batch is just bill_no.
+# ---------------------------------------------------------------------------
+
+ADDV_FLAG_KINDS = {
+    "voucher_amount": "Change the voucher amount",
+    "installment_amount": "Change an installment amount",
+    "installment_delete": "Delete an installment",
+    "installment_add": "Add a missing installment",
+    "amendment": "Other issue (needs a raw edit)",
+}
+
+
+def addv_batch_status(batch_data):
+    """Derive a batch's overall onboarding status from its vouchers/flags —
+    never stored, always recomputed at render time (same "derive, don't
+    store" approach already used for correction-open/verification badges
+    elsewhere in the app).
+
+    A voucher missing `review_status` (e.g. staged by the pre-existing CLI
+    import, which knows nothing about this feature) counts as "pending", so
+    every addv batch — regardless of which path created it — is subject to
+    the same review gate.
+
+    Returns {"status": "pending_review"|"awaiting_resolution"|"ready_to_post"|"posted",
+             "total": n, "reviewed": n, "open_flags": n}.
+    """
+    vouchers = batch_data.get("vouchers", [])
+    flags = batch_data.get("flags", [])
+    total = len(vouchers)
+    reviewed = sum(1 for v in vouchers if v.get("review_status", "pending") != "pending")
+    open_flags = sum(1 for f in flags if f.get("status") == "open")
+
+    if batch_data.get("stages", {}).get("post") == "confirmed":
+        status = "posted"
+    elif reviewed < total:
+        status = "pending_review"
+    elif open_flags > 0:
+        status = "awaiting_resolution"
+    else:
+        status = "ready_to_post"
+
+    return {"status": status, "total": total, "reviewed": reviewed, "open_flags": open_flags}
+
+
+def addv_vouchers_for_salesman(batch_data, salesman):
+    """Vouchers in this batch assigned to one salesman, for their review queue."""
+    return [v for v in batch_data.get("vouchers", []) if v.get("salesman") == salesman]
+
+
+def clear_addv_review(batch_data, bill_no, reviewed_by):
+    """Salesman found nothing wrong with this voucher — mark it reviewed."""
+    voucher = next((v for v in batch_data.get("vouchers", []) if v.get("bill_no") == bill_no), None)
+    if voucher is None:
+        raise ValueError(f"voucher {bill_no} not found in batch")
+    voucher["review_status"] = "reviewed"
+    return batch_data
+
+
+def raise_addv_flag(batch_data, bill_no, kind, note, raised_by, now_str, target=None, new=None):
+    """Salesman raises a correction/amendment against one staged voucher.
+
+    target: the existing installment this flag refers to (for
+    installment_amount/installment_delete), as {"date","amount"} — matched
+    against batch_data["installments"] by value at resolve time, since staged
+    installments carry no surrogate id. new: the proposed value(s) — {"amount"}
+    for voucher_amount/installment_amount, {"date","amount"} for
+    installment_add, None for installment_delete/amendment.
+    """
+    if kind not in ADDV_FLAG_KINDS:
+        raise ValueError(f"unknown flag kind {kind!r}")
+    voucher = next((v for v in batch_data.get("vouchers", []) if v.get("bill_no") == bill_no), None)
+    if voucher is None:
+        raise ValueError(f"voucher {bill_no} not found in batch")
+
+    flags = batch_data.setdefault("flags", [])
+    next_id = max((f["id"] for f in flags), default=0) + 1
+    flags.append({
+        "id": next_id,
+        "bill_no": bill_no,
+        "kind": kind,
+        "target": target,
+        "new": new,
+        "note": (note or "").strip(),
+        "raised_by": raised_by,
+        "raised_at": now_str,
+        "status": "open",
+        "resolved_by": "",
+        "resolved_at": "",
+    })
+    voucher["review_status"] = "flagged"
+    return batch_data
+
+
+def resolve_addv_flag(batch_data, flag_id, voucher_updates, installments, resolved_by, now_str):
+    """Distributor's fix for one open flag, applied directly to the staged
+    voucher/installment dicts (no DB, no concurrency snapshot — the whole
+    batch is a single JSON file the caller holds for the duration of the
+    request).
+
+    voucher_updates: dict of voucher fields to overwrite (any of
+    date/amount/beat/salesman) — only keys present are changed.
+    installments: full replacement list of {"date","amount"} rows for this
+    bill_no, or None to leave this bill's installments untouched. Balance is
+    always recomputed from amount - sum(installments), never taken from
+    voucher_updates.
+
+    Raises ValueError if the flag/voucher isn't found, the flag isn't open,
+    or the edit would leave a negative balance.
+    """
+    flag = next((f for f in batch_data.get("flags", []) if f.get("id") == flag_id), None)
+    if flag is None:
+        raise ValueError(f"flag {flag_id} not found")
+    if flag.get("status") != "open":
+        raise ValueError(f"flag {flag_id} is not open")
+
+    bill_no = flag["bill_no"]
+    voucher = next((v for v in batch_data.get("vouchers", []) if v.get("bill_no") == bill_no), None)
+    if voucher is None:
+        raise ValueError(f"voucher {bill_no} not found in batch")
+
+    for key in ("date", "amount", "beat", "salesman"):
+        if voucher_updates and key in voucher_updates:
+            voucher[key] = voucher_updates[key]
+
+    if installments is not None:
+        others = [i for i in batch_data.get("installments", []) if i.get("bill_no") != bill_no]
+        new_rows = []
+        for row in installments:
+            new_rows.append({
+                "bill_no": bill_no,
+                "date": row["date"],
+                "amount": str(Decimal(str(row["amount"])).quantize(Decimal("0.01"))),
+                "salesman": voucher["salesman"],
+                "created_by": row.get("created_by", resolved_by),
+                "created_at": row.get("created_at", now_str),
+            })
+        batch_data["installments"] = others + new_rows
+
+    inst_sum = sum(
+        (Decimal(str(i["amount"])) for i in batch_data.get("installments", []) if i.get("bill_no") == bill_no),
+        Decimal("0"),
+    )
+    amount = Decimal(str(voucher["amount"]))
+    if inst_sum > amount:
+        raise ValueError(f"voucher {bill_no}: total installments ({inst_sum}) exceed amount ({amount})")
+    voucher["balance"] = str((amount - inst_sum).quantize(Decimal("0.01")))
+
+    flag["status"] = "resolved"
+    flag["resolved_by"] = resolved_by
+    flag["resolved_at"] = now_str
+    return batch_data
+
+
+def reject_addv_batch(path):
+    """Discard a staged addv batch outright — no CLI equivalent exists today
+    (the CLI can only leave a batch un-approved, never delete it). The
+    creator still has the source CSV to re-import, so a plain delete (no
+    rejected-archive trail) is enough."""
+    delete_staged_report(path)

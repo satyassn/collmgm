@@ -20,11 +20,12 @@
   <tbody>
     {% for v in vouchers %}
     <tr data-bill="{{ v.bill_no }}"
-        class="{% if v.correction_open %}row-correction{% elif v.verified %}row-verified{% endif %}">
+        class="{% if v.correction_open %}row-correction{% elif v.verified %}row-verified{% elif v.salesman_mismatch %}row-correction{% endif %}">
       <td class="mono">
         <a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}?correct=/coll/approve-start/{{ stem }}">{{ v.bill_no }}</a>
         {% if v.correction_open %}<span class="badge badge-warn">Correction pending</span>
         {% elif v.correction_applied %}<span class="badge badge-ok">Correction applied</span>{% endif %}
+        {% if v.salesman_mismatch %}<span class="badge badge-warn">Different salesman</span>{% endif %}
       </td>
       <td>{{ v.get("voucher_date","") }}</td>
       <td class="num mono" data-label="Amt">{{ v.get("amount","") }}</td>

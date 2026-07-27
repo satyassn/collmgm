@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Request Voucher Amendment — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Request Voucher Amendment</h2>
+<p class="meta-line"><strong>Voucher:</strong> <span class="mono">{{ voucher.bill_no }}</span>
+  &nbsp;|&nbsp; <strong>Date:</strong> {{ voucher.date }}
+  &nbsp;|&nbsp; <strong>Amount:</strong> <span class="mono">{{ voucher.amount }}</span>
+  &nbsp;|&nbsp; <strong>Balance:</strong> <span class="mono">{{ voucher.balance }}</span></p>
+
+{% if error %}<p class="alert alert-error">{{ error }}</p>{% endif %}
+
+<form method="post" action="/coll/amend-request/{{ voucher.bill_no | urlencode }}" class="card">
+  <input type="hidden" name="from" value="{{ back }}">
+
+  <label class="field-label">What needs to be amended?
+    <textarea name="note" rows="3" maxlength="500" required
+              placeholder="Describe what's wrong and what the physical voucher shows."></textarea>
+  </label>
+
+  <div class="action-row">
+    <button type="submit" name="action" value="raise" class="btn btn-primary">Raise Amendment Request</button>
+    <a class="btn btn-secondary" href="{{ back }}">Back</a>
+  </div>
+</form>
+
+{% if existing %}
+<h3 class="group-heading">Requests for this voucher</h3>
+<ul class="report-list">
+  {% for r in existing %}
+  <li class="report-item">
+    <span class="report-label">
+      {{ r.note }}
+      <span class="badge badge-{{ 'warn' if r.status == 'open' else 'ok' if r.status == 'applied' else 'muted' }}">{{ r.status }}</span>
+    </span>
+    <span class="report-meta">{{ r.requested_by }} · {{ r.requested_at[:10] }}{% if r.resolution_note %} · {{ r.resolution_note }}{% endif %}</span>
+    {% if r.status == 'open' and r.requested_by == user.name %}
+    <form method="post" action="/coll/amend-request/{{ voucher.bill_no | urlencode }}">
+      <input type="hidden" name="from" value="{{ back }}">
+      <input type="hidden" name="req_id" value="{{ r.id }}">
+      <button type="submit" name="action" value="withdraw" class="btn btn-sm btn-secondary"
+              onclick="return confirm('Withdraw this amendment request?')">Withdraw</button>
+    </form>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

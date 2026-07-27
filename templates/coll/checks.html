@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Checks — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Checks</h2>
+
+{% macro check_list(items, empty_msg) %}
+  {% if not items %}
+    <p class="empty-state">{{ empty_msg }}</p>
+  {% else %}
+    <ul class="report-list">
+      {% for c in items %}
+      <li class="report-item">
+        <span class="report-label">
+          <span class="mono">{{ c.bill_no }}</span> — {{ c.bank }}{% if c.branch %} ({{ c.branch }}){% endif %} #{{ c.check_no }}
+          <span class="badge badge-{{ 'warn' if c.status == 'pending' else 'error' if c.status == 'bounced' else 'ok' }}">{{ c.status }}</span>
+        </span>
+        <span class="report-meta">
+          {{ c.salesman }} &middot; Check date {{ c.check_date }} &middot; <span class="mono">{{ c.amount }}</span>
+          {% if c.resolution_note %} &middot; {{ c.resolution_note }}{% endif %}
+        </span>
+        {% if can_resolve and c.status == 'pending' %}
+        <form method="post" action="/coll/checks/{{ c.id }}" class="action-row">
+          <input type="text" name="resolution_note" placeholder="Note (optional)" class="check-note-input">
+          <button type="submit" name="action" value="encash" class="btn btn-sm btn-primary"
+                  onclick="return confirm('Mark this check encashed?')">Mark Encashed</button>
+          <button type="submit" name="action" value="bounce" class="btn btn-sm btn-warning"
+                  onclick="return confirm('Mark this check bounced? The voucher balance will be restored.')">Mark Bounced</button>
+        </form>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+{% endmacro %}
+
+<h3 class="group-heading">Overdue for Encashment</h3>
+{{ check_list(overdue, "No overdue checks.") }}
+
+<h3 class="group-heading">Due Soon (next 2 days)</h3>
+{{ check_list(due_soon, "No checks due soon.") }}
+
+<h3 class="group-heading">Bounced</h3>
+{{ check_list(bounced, "No bounced checks.") }}
+
+<h3 class="group-heading">Pending (not yet due)</h3>
+{{ check_list(pending_later, "No other pending checks.") }}
+
+<h3 class="group-heading">Recently Encashed</h3>
+{{ check_list(encashed[:20], "No encashed checks yet.") }}
+
+<div class="action-row">
+  <a class="btn btn-secondary" href="/menu">Back to Menu</a>
+</div>
+{% endblock %}

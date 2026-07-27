@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+{% block title %}Review Voucher — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Review Voucher</h2>
+<p class="meta-line"><strong>Bill No:</strong> <span class="mono">{{ voucher.bill_no }}</span>
+  &nbsp;|&nbsp; <strong>Date:</strong> {{ voucher.date }}
+  &nbsp;|&nbsp; <strong>Amount:</strong> <span class="mono">{{ voucher.amount }}</span>
+  &nbsp;|&nbsp; <strong>Balance:</strong> <span class="mono">{{ voucher.balance }}</span></p>
+
+{% if error %}<p class="alert alert-error">{{ error }}</p>{% endif %}
+
+{% if installments %}
+<div class="table-wrapper">
+<table class="data-table card-table">
+  <thead><tr><th>Date</th><th class="num">Amount</th></tr></thead>
+  <tbody>
+    {% for inst in installments %}
+    <tr><td>{{ inst.date }}</td><td class="num mono">{{ inst.amount }}</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="muted">No installments recorded for this voucher yet.</p>
+{% endif %}
+
+<form method="post" action="/coll/new-vouchers/{{ stem }}/review/{{ voucher.bill_no | urlencode }}" class="card">
+  <input type="hidden" name="action" value="clear">
+  <button type="submit" class="btn btn-primary">Looks Good — Nothing Wrong</button>
+</form>
+
+<form method="post" action="/coll/new-vouchers/{{ stem }}/review/{{ voucher.bill_no | urlencode }}" class="card correction-form">
+  <input type="hidden" name="action" value="raise">
+
+  <fieldset class="kind-choice">
+    <legend>What is wrong?</legend>
+    {% for k, label in kinds.items() %}
+    <label class="kind-option"><input type="radio" name="kind" value="{{ k }}" required> {{ label }}</label>
+    {% endfor %}
+  </fieldset>
+
+  <div class="field-group" data-kinds="installment_amount installment_delete" hidden>
+    <p class="group-heading">Which installment?</p>
+    {% if installments %}
+    <div class="table-wrapper">
+    <table class="data-table card-table">
+      <thead><tr><th></th><th>Date</th><th class="num">Amount</th></tr></thead>
+      <tbody>
+        {% for inst in installments %}
+        <tr>
+          <td><input type="radio" name="installment_index" value="{{ loop.index0 }}"
+                     aria-label="Installment {{ inst.date }} {{ inst.amount }}"></td>
+          <td>{{ inst.date }}</td>
+          <td class="num mono">{{ inst.amount }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    {% else %}
+    <p class="muted">This voucher has no installments recorded.</p>
+    {% endif %}
+  </div>
+
+  <div class="field-group" data-kinds="installment_amount installment_add voucher_amount" hidden>
+    <label class="field-label">Corrected / new amount
+      <input type="text" name="new_amount" inputmode="decimal" class="mono" autocomplete="off">
+    </label>
+  </div>
+
+  <div class="field-group" data-kinds="installment_add" hidden>
+    <label class="field-label">Installment date
+      <input type="date" name="new_date">
+    </label>
+  </div>
+
+  <label class="field-label">Note (what does the physical voucher show?)
+    <textarea name="note" rows="2" maxlength="500"></textarea>
+  </label>
+
+  <div class="action-row">
+    <button type="submit" class="btn btn-primary">Raise Issue</button>
+    <a class="btn btn-secondary" href="/coll/new-vouchers/{{ stem }}/review">Back</a>
+  </div>
+</form>
+
+{% if flags %}
+<h3 class="group-heading">Issues raised for this voucher</h3>
+<ul class="report-list">
+  {% for f in flags %}
+  <li class="report-item">
+    <span class="report-label">
+      {{ kinds.get(f.kind, f.kind) }}
+      <span class="badge badge-{{ 'ok' if f.status == 'resolved' else 'warn' }}">{{ f.status }}</span>
+    </span>
+    <span class="report-meta">{{ f.raised_by }} &middot; {{ f.raised_at[:10] }}{% if f.note %} &middot; {{ f.note }}{% endif %}</span>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+
+<script>
+(function () {
+  var radios = document.querySelectorAll('input[name="kind"]');
+  var groups = document.querySelectorAll(".field-group");
+  function refresh() {
+    var picked = document.querySelector('input[name="kind"]:checked');
+    var kind = picked ? picked.value : "";
+    Array.prototype.forEach.call(groups, function (g) {
+      g.hidden = g.dataset.kinds.split(" ").indexOf(kind) === -1;
+    });
+  }
+  Array.prototype.forEach.call(radios, function (r) {
+    r.addEventListener("change", refresh);
+  });
+  refresh();
+})();
+</script>
+{% endblock %}

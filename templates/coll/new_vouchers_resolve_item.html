@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}Resolve Issue — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Resolve Issue</h2>
+<p class="meta-line"><strong>Bill No:</strong> <span class="mono">{{ flag.bill_no }}</span>
+  &nbsp;|&nbsp; <strong>Issue:</strong> {{ kind_label }}</p>
+{% if flag.note %}<p class="muted">Salesman's note: {{ flag.note }}</p>{% endif %}
+
+{% if error %}<p class="alert alert-error">{{ error }}</p>{% endif %}
+
+<form method="post" action="/coll/new-vouchers/{{ stem }}/resolve/{{ flag.id }}" class="card">
+  <p class="group-heading">Voucher</p>
+  <label class="field-label">Date
+    <input type="date" name="voucher_date" value="{{ voucher.date }}" required>
+  </label>
+  <label class="field-label">Amount
+    <input type="text" name="voucher_amount" inputmode="decimal" class="mono"
+           value="{{ flag.new.amount if flag.kind == 'voucher_amount' and flag.new else voucher.amount }}" required>
+  </label>
+  <label class="field-label">Beat
+    <select name="voucher_beat" required>
+      {% for b in beats %}
+      <option value="{{ b.name }}" {{ 'selected' if b.name == voucher.beat }}>{{ b.name }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label class="field-label">Salesman
+    <select name="voucher_salesman" required>
+      {% for s in salesmen %}
+      <option value="{{ s }}" {{ 'selected' if s == voucher.salesman }}>{{ s }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <p class="group-heading">Installments</p>
+  <p class="muted">Check "Remove" to delete a row. Leave a blank row empty to skip it.</p>
+  <div class="table-wrapper">
+  <table class="data-table card-table">
+    <thead><tr><th>Date</th><th class="num">Amount</th><th>Remove</th></tr></thead>
+    <tbody>
+      {% for inst in installments %}
+      {% set is_target = flag.target and flag.target.date == inst.date and flag.target.amount == inst.amount %}
+      <tr>
+        <td><input type="date" name="inst_date" value="{{ inst.date }}"></td>
+        <td class="num"><input type="text" name="inst_amount" inputmode="decimal" class="mono"
+                   value="{{ flag.new.amount if flag.kind == 'installment_amount' and is_target and flag.new else inst.amount }}"></td>
+        <td><input type="checkbox" name="inst_remove" value="{{ loop.index0 }}"
+                    {{ 'checked' if flag.kind == 'installment_delete' and is_target }}></td>
+      </tr>
+      {% endfor %}
+      {% for extra in range(3) %}
+      {% set idx = installments|length + extra %}
+      <tr>
+        <td><input type="date" name="inst_date"
+                    value="{{ flag.new.date if flag.kind == 'installment_add' and extra == 0 and flag.new else '' }}"></td>
+        <td class="num"><input type="text" name="inst_amount" inputmode="decimal" class="mono"
+                   value="{{ flag.new.amount if flag.kind == 'installment_add' and extra == 0 and flag.new else '' }}"></td>
+        <td><input type="checkbox" name="inst_remove" value="{{ idx }}"></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+
+  <div class="action-row">
+    <button type="submit" class="btn btn-primary">Save &amp; Resolve</button>
+    <a class="btn btn-secondary" href="/coll/new-vouchers/{{ stem }}/resolve">Back</a>
+  </div>
+</form>
+{% endblock %}

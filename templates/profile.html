@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Profile — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Profile</h2>
+
+{% if forced %}
+<p class="alert alert-warn">You must change your password before continuing.</p>
+{% endif %}
+
+<p class="meta-line"><strong>Username:</strong> {{ user.name }}
+  &nbsp;|&nbsp; <strong>Role:</strong> <span class="role-badge role-{{ user.role }}">{{ user.role }}</span></p>
+
+{% if error %}<p class="alert alert-error">{{ error }}</p>{% endif %}
+
+<h3 class="group-heading">Change Password</h3>
+<form method="post" action="/profile/change-password" class="card">
+  <input type="hidden" name="forced" value="{{ '1' if forced else '' }}">
+  <label class="field-label">Current Password
+    <input type="password" name="current_password" required autocomplete="current-password" autofocus>
+  </label>
+  <label class="field-label">New Password
+    <input type="password" name="new_password" required minlength="6" autocomplete="new-password">
+  </label>
+  <label class="field-label">Confirm New Password
+    <input type="password" name="confirm_password" required minlength="6" autocomplete="new-password">
+  </label>
+
+  <div class="action-row">
+    <button type="submit" class="btn btn-primary">Change Password</button>
+    {% if not forced %}<a class="btn btn-secondary" href="/menu">Back to Menu</a>{% endif %}
+  </div>
+</form>
+{% endblock %}

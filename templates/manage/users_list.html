@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block title %}Manage Users — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Manage Users</h2>
+
+{% if not users %}
+  <p class="empty-state">No users found.</p>
+{% else %}
+  <ul class="report-list">
+    {% for u in users %}
+    <li class="report-item">
+      <span class="report-label">
+        {{ u.name }}
+        <span class="role-badge role-{{ u.role }}">{{ u.role }}</span>
+        {% if u.must_change_password %}<span class="badge badge-warn">Must change password</span>{% endif %}
+      </span>
+      {% if u.role != 'distributor' %}
+      <a class="btn btn-sm btn-secondary" href="/manage/users/{{ u.name | urlencode }}/edit">Edit</a>
+      {% endif %}
+      <a class="btn btn-sm btn-secondary" href="/manage/users/{{ u.name | urlencode }}/reset-password">Reset Password</a>
+      {% if u.role != 'distributor' %}
+      <form method="post" action="/manage/users/{{ u.name | urlencode }}/delete" style="display:inline">
+        <button type="submit" class="btn btn-sm btn-danger"
+                onclick="return confirm('Delete user {{ u.name }}? This cannot be undone.')">Delete</button>
+      </form>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+{% endif %}
+
+<div class="action-row">
+  <a class="btn btn-primary" href="/manage/users/new">+ New User</a>
+  <a class="btn btn-secondary" href="/menu">Back to Menu</a>
+</div>
+{% endblock %}

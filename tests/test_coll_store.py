@@ -893,6 +893,37 @@ class TestCollPrintPermissionBackfill(unittest.TestCase):
         self.assertIn(("supervisor", "coll_print"), rows)
         self.assertIn(("distributor", "coll_print"), rows)
 
+    def test_base_permissions_granted_with_no_csv_on_disk(self):
+        # A packaged install's data/ dir ships no CSVs at all (only
+        # collmgm.db) — the base RBAC set (manage_users/manage_beats
+        # included) must still land without data/permissions.csv existing.
+        self.assertFalse((self.tmp / "data" / "permissions.csv").exists())
+        coll_store.init_db()
+        rows = self._perm_rows()
+        self.assertIn(("distributor", "manage_users"), rows)
+        self.assertIn(("distributor", "manage_beats"), rows)
+        self.assertIn(("distributor", "coll_start"), rows)
+        self.assertIn(("supervisor", "coll_approve_start"), rows)
+        self.assertIn(("salesman", "coll_submit"), rows)
+
+    def test_partially_seeded_db_gains_manage_permissions(self):
+        # Simulate the user's actual broken install: later iteration
+        # backfills (coll_print, corrections, amendments, checks) already
+        # ran and inserted rows, but the base set never did because
+        # permissions.csv was never on disk — the old "table has any rows ->
+        # skip" guard would leave this stuck forever even after an upgrade.
+        coll_store.init_db()
+        self._exec("DELETE FROM permissions")
+        self._exec("INSERT INTO permissions (role, action_key) VALUES (?, ?)",
+                   ("distributor", "amend_voucher"))
+        rows_before = self._perm_rows()
+        self.assertNotIn(("distributor", "manage_users"), rows_before)
+        coll_store.init_db()
+        rows = self._perm_rows()
+        self.assertIn(("distributor", "manage_users"), rows)
+        self.assertIn(("distributor", "manage_beats"), rows)
+        self.assertIn(("distributor", "amend_voucher"), rows)
+
 
 # ---------------------------------------------------------------------------
 # Correction requests — table, CRUD, and the atomic apply
@@ -928,7 +959,10 @@ class TestCorrections(StoreTestCase):
         self.assertIn(("supervisor", "raise_correction"), rows)
         self.assertIn(("distributor", "raise_correction"), rows)
         self.assertIn(("distributor", "apply_correction"), rows)
-        self.assertNotIn(("salesman", "raise_correction"), rows)
+        # Widened alongside amendment requests: a salesman reaching the
+        # correction flow can also use its "raise an amendment request
+        # instead" cross-link.
+        self.assertIn(("salesman", "raise_correction"), rows)
 
     def test_insert_and_load_roundtrip(self):
         cid = self._corr(report_stem="collX", origin_stage="start")
@@ -1369,6 +1403,597 @@ class TestAmendments(StoreTestCase):
         self.assertEqual([a["bill_no"] for a in coll_store.load_amendments(bill_no="1")], ["1"])
         self.assertEqual(len(coll_store.load_amendments(limit=1)), 1)
         self.assertIsNone(coll_store.load_amendment(9999))
+
+
+# ---------------------------------------------------------------------------
+# Amendment requests — table, CRUD, and auto-resolve
+# ---------------------------------------------------------------------------
+
+class TestAmendmentRequests(StoreTestCase):
+    def _req(self, bill_no="1", note="looks wrong", requested_by="sup",
+              requested_at="2026-07-25T10:00:00"):
+        return coll_store.insert_amendment_request(bill_no, note, requested_by, requested_at)
+
+    def test_table_created_for_preexisting_db(self):
+        conn = coll_store.get_db()
+        try:
+            conn.execute("DROP TABLE amendment_requests")
+            conn.commit()
+        finally:
+            conn.close()
+        coll_store.init_db()
+        self.assertEqual(self._query("SELECT COUNT(*) AS n FROM amendment_requests")[0]["n"], 0)
+
+    def test_amendment_request_permission_backfill(self):
+        rows = {(r["role"], r["action_key"])
+                for r in self._query("SELECT role, action_key FROM permissions")}
+        self.assertIn(("supervisor", "raise_amendment_request"), rows)
+        self.assertIn(("salesman", "raise_amendment_request"), rows)
+
+    def test_insert_and_load_roundtrip(self):
+        rid = self._req(note="date looks wrong")
+        req = coll_store.load_amendment_request(rid)
+        self.assertEqual(req["status"], "open")
+        self.assertEqual(req["note"], "date looks wrong")
+        self.assertIsNone(req["resolved_by"])
+        self.assertIsNone(req["linked_amendment_id"])
+
+    def test_load_amendment_requests_filters_and_orders(self):
+        first = self._req(bill_no="1")
+        second = self._req(bill_no="2")
+        coll_store.resolve_amendment_request(first, "rejected", "dist", "not needed")
+        self.assertEqual([r["id"] for r in coll_store.load_amendment_requests()],
+                         [second, first])
+        self.assertEqual([r["id"] for r in coll_store.load_amendment_requests(statuses=["open"])],
+                         [second])
+        self.assertEqual(len(coll_store.load_amendment_requests(limit=1)), 1)
+
+    def test_open_amendment_requests_for_bills(self):
+        rid = self._req(bill_no="7")
+        self._req(bill_no="8")
+        coll_store.resolve_amendment_request(self._req(bill_no="7"), "withdrawn", "sup")
+        open_map = coll_store.open_amendment_requests_for_bills(["7", "9"])
+        self.assertEqual(list(open_map.keys()), ["7"])
+        self.assertEqual([r["id"] for r in open_map["7"]], [rid])
+
+    def test_resolve_amendment_request_guards(self):
+        rid = self._req()
+        with self.assertRaises(ValueError):
+            coll_store.resolve_amendment_request(rid, "applied", "dist")  # wrong path
+        coll_store.resolve_amendment_request(rid, "rejected", "dist", "no need")
+        req = coll_store.load_amendment_request(rid)
+        self.assertEqual((req["status"], req["resolved_by"], req["resolution_note"]),
+                         ("rejected", "dist", "no need"))
+        with self.assertRaises(ValueError):
+            coll_store.resolve_amendment_request(rid, "rejected", "dist")  # no longer open
+
+    def test_auto_resolve_closes_every_open_request_on_the_bill(self):
+        first = self._req(bill_no="1", note="date wrong")
+        second = self._req(bill_no="1", note="beat wrong")
+        other_bill = self._req(bill_no="2")
+        coll_store.auto_resolve_amendment_requests("1", "dist", amendment_id=42)
+        for rid in (first, second):
+            req = coll_store.load_amendment_request(rid)
+            self.assertEqual(req["status"], "applied")
+            self.assertEqual(req["resolved_by"], "dist")
+            self.assertEqual(req["linked_amendment_id"], 42)
+        self.assertEqual(coll_store.load_amendment_request(other_bill)["status"], "open")
+
+
+# ---------------------------------------------------------------------------
+# User lifecycle: create_user / load_user / load_users_admin / update_user_role /
+# delete_user / set_user_password / reset_user_password / change_own_password
+# ---------------------------------------------------------------------------
+
+class TestUserLifecycle(StoreTestCase):
+    def _add_user(self, name, role, password="pw123456", must_change=0):
+        self._insert_rows("users", [{
+            "name": name, "role": role,
+            "password_hash": coll_store.hash_password(password),
+            "must_change_password": must_change,
+        }])
+
+    # ---- create_user ----
+
+    def test_create_user_happy_path(self):
+        coll_store.create_user("newsales", "salesman", "abcdef", "abcdef")
+        row = self._query("SELECT * FROM users WHERE name='newsales'")[0]
+        self.assertEqual(row["role"], "salesman")
+        self.assertEqual(row["must_change_password"], 1)
+        self.assertTrue(coll_store._verify_password(row["password_hash"], "abcdef"))
+
+    def test_create_user_duplicate_name(self):
+        coll_store.create_user("dup", "salesman", "abcdef", "abcdef")
+        with self.assertRaises(ValueError):
+            coll_store.create_user("dup", "salesman", "abcdef", "abcdef")
+
+    def test_create_user_invalid_role(self):
+        with self.assertRaises(ValueError):
+            coll_store.create_user("x", "manager", "abcdef", "abcdef")
+
+    def test_create_user_system_role_rejected(self):
+        with self.assertRaises(ValueError):
+            coll_store.create_user("x", "system", "abcdef", "abcdef")
+
+    def test_create_user_distributor_role_rejected(self):
+        with self.assertRaises(ValueError):
+            coll_store.create_user("x", "distributor", "abcdef", "abcdef")
+
+    def test_create_user_password_too_short(self):
+        with self.assertRaises(ValueError):
+            coll_store.create_user("x", "salesman", "abc", "abc")
+
+    def test_create_user_password_mismatch(self):
+        with self.assertRaises(ValueError):
+            coll_store.create_user("x", "salesman", "abcdef", "abcxyz")
+
+    def test_create_user_empty_name(self):
+        with self.assertRaises(ValueError):
+            coll_store.create_user("", "salesman", "abcdef", "abcdef")
+
+    def test_create_user_bad_name_chars(self):
+        with self.assertRaises(ValueError):
+            coll_store.create_user("bad name!", "salesman", "abcdef", "abcdef")
+
+    # ---- load_user / load_users_admin ----
+
+    def test_load_user_returns_admin_view(self):
+        self._add_user("alice", "salesman")
+        row = coll_store.load_user("alice")
+        self.assertEqual(row["role"], "salesman")
+        self.assertNotIn("password_hash", row)
+
+    def test_load_user_missing_returns_none(self):
+        self.assertIsNone(coll_store.load_user("nobody"))
+
+    def test_load_users_admin_ordered(self):
+        self._add_user("zed", "salesman")
+        self._add_user("amy", "supervisor")
+        names = [u["name"] for u in coll_store.load_users_admin()]
+        self.assertEqual(names, sorted(names))
+        self.assertIn("zed", names)
+        self.assertIn("amy", names)
+
+    # ---- update_user_role ----
+
+    def test_update_user_role_happy_path(self):
+        self._add_user("bob", "salesman")
+        coll_store.update_user_role("bob", "supervisor")
+        self.assertEqual(coll_store.load_user("bob")["role"], "supervisor")
+
+    def test_update_user_role_unknown_user(self):
+        with self.assertRaises(ValueError):
+            coll_store.update_user_role("nobody", "supervisor")
+
+    def test_update_user_role_invalid_role(self):
+        self._add_user("bob", "salesman")
+        with self.assertRaises(ValueError):
+            coll_store.update_user_role("bob", "system")
+
+    def test_update_user_role_last_distributor_blocked(self):
+        self._add_user("dist1", "distributor")
+        with self.assertRaises(ValueError):
+            coll_store.update_user_role("dist1", "supervisor")
+
+    def test_update_user_role_promote_to_distributor_blocked(self):
+        self._add_user("bob", "supervisor")
+        with self.assertRaises(ValueError):
+            coll_store.update_user_role("bob", "distributor")
+
+    # ---- delete_user ----
+
+    def test_delete_user_happy_path(self):
+        self._add_user("alice", "salesman")
+        coll_store.delete_user("alice", current_user_name="dist")
+        self.assertIsNone(coll_store.load_user("alice"))
+
+    def test_delete_user_not_found(self):
+        with self.assertRaises(ValueError):
+            coll_store.delete_user("nobody", current_user_name="dist")
+
+    def test_delete_user_self_lockout(self):
+        self._add_user("dist1", "distributor")
+        self._add_user("dist2", "distributor")
+        with self.assertRaises(ValueError):
+            coll_store.delete_user("dist1", current_user_name="dist1")
+
+    def test_delete_user_last_distributor_blocked(self):
+        self._add_user("dist1", "distributor")
+        with self.assertRaises(ValueError):
+            coll_store.delete_user("dist1", current_user_name="other")
+
+    def test_delete_user_distributor_with_others_present_still_blocked(self):
+        self._add_user("dist1", "distributor")
+        self._add_user("dist2", "distributor")
+        with self.assertRaises(ValueError):
+            coll_store.delete_user("dist1", current_user_name="other")
+        with self.assertRaises(ValueError):
+            coll_store.delete_user("dist2", current_user_name="other")
+
+    def test_delete_user_blocked_by_beats_salesman(self):
+        self._add_user("sales1", "salesman")
+        self._insert_rows("beats", [{"name": "beatA", "salesman": "sales1"}])
+        with self.assertRaises(ValueError):
+            coll_store.delete_user("sales1", current_user_name="dist")
+
+    def test_delete_user_blocked_by_voucher_salesman(self):
+        self._add_user("sales1", "salesman")
+        self._insert_rows("vouchers", [self._v_row("1", salesman="sales1")])
+        with self.assertRaises(ValueError):
+            coll_store.delete_user("sales1", current_user_name="dist")
+
+    def test_delete_user_blocked_by_voucher_created_by(self):
+        self._add_user("sales1", "salesman")
+        row = self._v_row("1")
+        row["created_by"] = "sales1"
+        self._insert_rows("vouchers", [row])
+        with self.assertRaises(ValueError):
+            coll_store.delete_user("sales1", current_user_name="dist")
+
+    def test_delete_user_blocked_by_installment_salesman(self):
+        self._add_user("sales1", "salesman")
+        self._insert_rows("vouchers", [self._v_row("1")])
+        self._insert_rows("installments", [self._i_row("1", salesman="sales1")])
+        with self.assertRaises(ValueError):
+            coll_store.delete_user("sales1", current_user_name="dist")
+
+    def test_delete_user_blocked_by_installment_created_by(self):
+        self._add_user("sales1", "salesman")
+        self._insert_rows("vouchers", [self._v_row("1")])
+        row = self._i_row("1")
+        row["created_by"] = "sales1"
+        self._insert_rows("installments", [row])
+        with self.assertRaises(ValueError):
+            coll_store.delete_user("sales1", current_user_name="dist")
+
+    def test_delete_user_blocked_by_completed_vouchers_salesman(self):
+        self._add_user("sales1", "salesman")
+        self._insert_rows("completed_vouchers", [self._v_row("1", salesman="sales1")])
+        with self.assertRaises(ValueError):
+            coll_store.delete_user("sales1", current_user_name="dist")
+
+    def test_delete_user_blocked_by_completed_vouchers_created_by(self):
+        self._add_user("sales1", "salesman")
+        row = self._v_row("1")
+        row["created_by"] = "sales1"
+        self._insert_rows("completed_vouchers", [row])
+        with self.assertRaises(ValueError):
+            coll_store.delete_user("sales1", current_user_name="dist")
+
+    def test_delete_user_blocked_by_completed_installments_salesman(self):
+        self._add_user("sales1", "salesman")
+        self._insert_rows("completed_installments", [self._i_row("1", salesman="sales1")])
+        with self.assertRaises(ValueError):
+            coll_store.delete_user("sales1", current_user_name="dist")
+
+    def test_delete_user_blocked_by_completed_installments_created_by(self):
+        self._add_user("sales1", "salesman")
+        row = self._i_row("1")
+        row["created_by"] = "sales1"
+        self._insert_rows("completed_installments", [row])
+        with self.assertRaises(ValueError):
+            coll_store.delete_user("sales1", current_user_name="dist")
+
+    def test_delete_user_not_blocked_by_correction_audit_reference(self):
+        self._add_user("sales1", "salesman")
+        self._insert_rows("corrections", [{
+            "kind": "voucher_amount", "bill_no": "1", "requested_by": "sales1",
+            "requested_at": "t",
+        }])
+        coll_store.delete_user("sales1", current_user_name="dist")  # must not raise
+        self.assertIsNone(coll_store.load_user("sales1"))
+
+    def test_delete_user_not_blocked_by_amendment_audit_reference(self):
+        self._add_user("sales1", "salesman")
+        self._insert_rows("amendments", [{
+            "bill_no": "1", "old_json": "{}", "new_json": "{}",
+            "amended_by": "sales1", "amended_at": "t",
+        }])
+        coll_store.delete_user("sales1", current_user_name="dist")  # must not raise
+        self.assertIsNone(coll_store.load_user("sales1"))
+
+    # ---- set_user_password / reset_user_password / change_own_password ----
+
+    def test_reset_user_password_sets_flag_and_hash(self):
+        self._add_user("alice", "salesman", password="oldpass")
+        coll_store.reset_user_password("alice", "newpass1", "newpass1")
+        row = self._query("SELECT * FROM users WHERE name='alice'")[0]
+        self.assertEqual(row["must_change_password"], 1)
+        self.assertTrue(coll_store._verify_password(row["password_hash"], "newpass1"))
+
+    def test_reset_user_password_policy_failures(self):
+        self._add_user("alice", "salesman")
+        with self.assertRaises(ValueError):
+            coll_store.reset_user_password("alice", "short", "short")
+        with self.assertRaises(ValueError):
+            coll_store.reset_user_password("alice", "abcdef", "xyzxyz")
+
+    def test_change_own_password_happy_path_clears_flag(self):
+        self._add_user("alice", "salesman", password="oldpass", must_change=1)
+        coll_store.change_own_password("alice", "oldpass", "newpass1", "newpass1")
+        row = self._query("SELECT * FROM users WHERE name='alice'")[0]
+        self.assertEqual(row["must_change_password"], 0)
+        self.assertTrue(coll_store._verify_password(row["password_hash"], "newpass1"))
+
+    def test_change_own_password_wrong_current(self):
+        self._add_user("alice", "salesman", password="oldpass")
+        with self.assertRaises(ValueError):
+            coll_store.change_own_password("alice", "wrongpass", "newpass1", "newpass1")
+
+    def test_change_own_password_confirm_mismatch(self):
+        self._add_user("alice", "salesman", password="oldpass")
+        with self.assertRaises(ValueError):
+            coll_store.change_own_password("alice", "oldpass", "newpass1", "newpass2")
+
+    def test_change_own_password_same_as_current(self):
+        self._add_user("alice", "salesman", password="oldpass")
+        with self.assertRaises(ValueError):
+            coll_store.change_own_password("alice", "oldpass", "oldpass", "oldpass")
+
+    def test_change_own_password_too_short(self):
+        self._add_user("alice", "salesman", password="oldpass")
+        with self.assertRaises(ValueError):
+            coll_store.change_own_password("alice", "oldpass", "abc", "abc")
+
+
+# ---------------------------------------------------------------------------
+# Beat lifecycle: create_beat / update_beat_salesman / delete_beat
+# ---------------------------------------------------------------------------
+
+class TestBeatLifecycle(StoreTestCase):
+    def _add_salesman(self, name):
+        self._insert_rows("users", [{"name": name, "role": "salesman",
+                                      "password_hash": coll_store.hash_password("pw123456")}])
+
+    def test_create_beat_happy_path(self):
+        self._add_salesman("sales1")
+        coll_store.create_beat("beatA", "sales1")
+        row = self._query("SELECT * FROM beats WHERE name='beatA'")[0]
+        self.assertEqual(row["salesman"], "sales1")
+
+    def test_create_beat_duplicate_name(self):
+        self._add_salesman("sales1")
+        coll_store.create_beat("beatA", "sales1")
+        with self.assertRaises(ValueError):
+            coll_store.create_beat("beatA", "sales1")
+
+    def test_create_beat_unknown_salesman(self):
+        with self.assertRaises(ValueError):
+            coll_store.create_beat("beatA", "nobody")
+
+    def test_create_beat_non_salesman_role_rejected(self):
+        self._insert_rows("users", [{"name": "sup1", "role": "supervisor",
+                                      "password_hash": coll_store.hash_password("pw123456")}])
+        with self.assertRaises(ValueError):
+            coll_store.create_beat("beatA", "sup1")
+
+    def test_create_beat_invalid_name(self):
+        self._add_salesman("sales1")
+        with self.assertRaises(ValueError):
+            coll_store.create_beat("", "sales1")
+
+    def test_update_beat_salesman_happy_path(self):
+        self._add_salesman("sales1")
+        self._add_salesman("sales2")
+        coll_store.create_beat("beatA", "sales1")
+        coll_store.update_beat_salesman("beatA", "sales2")
+        row = self._query("SELECT * FROM beats WHERE name='beatA'")[0]
+        self.assertEqual(row["salesman"], "sales2")
+
+    def test_update_beat_salesman_unknown_beat(self):
+        self._add_salesman("sales1")
+        with self.assertRaises(ValueError):
+            coll_store.update_beat_salesman("nobeat", "sales1")
+
+    def test_update_beat_salesman_unknown_salesman(self):
+        self._add_salesman("sales1")
+        coll_store.create_beat("beatA", "sales1")
+        with self.assertRaises(ValueError):
+            coll_store.update_beat_salesman("beatA", "nobody")
+
+    def test_delete_beat_happy_path(self):
+        self._add_salesman("sales1")
+        coll_store.create_beat("beatA", "sales1")
+        coll_store.delete_beat("beatA")
+        self.assertEqual(self._query("SELECT * FROM beats WHERE name='beatA'"), [])
+
+    def test_delete_beat_not_found(self):
+        with self.assertRaises(ValueError):
+            coll_store.delete_beat("nobeat")
+
+    def test_delete_beat_blocked_by_vouchers(self):
+        self._add_salesman("sales1")
+        coll_store.create_beat("beatA", "sales1")
+        self._insert_rows("vouchers", [self._v_row("1", beat="beatA")])
+        with self.assertRaises(ValueError):
+            coll_store.delete_beat("beatA")
+
+    def test_delete_beat_blocked_by_completed_vouchers(self):
+        self._add_salesman("sales1")
+        coll_store.create_beat("beatA", "sales1")
+        self._insert_rows("completed_vouchers", [self._v_row("1", beat="beatA")])
+        with self.assertRaises(ValueError):
+            coll_store.delete_beat("beatA")
+
+
+class TestPaymentTypeAndChecks(StoreTestCase):
+    def _staged(self, bill_no, payment, **extra):
+        v = {"bill_no": bill_no, "payment": payment, "salesman": "s1", "beat": "b1"}
+        v.update(extra)
+        return v
+
+    def _check_voucher(self, bill_no, payment, **extra):
+        extra.setdefault("check_bank", "Bank A")
+        extra.setdefault("check_branch", "Main")
+        extra.setdefault("check_no", "CHK001")
+        extra.setdefault("check_date", "2026-07-30")
+        return self._staged(bill_no, payment, payment_type="check", **extra)
+
+    # ------------------------------------------------------------------
+    # Posting: payment_type/payment_ref columns + checks row creation
+    # ------------------------------------------------------------------
+
+    def test_cash_default_when_unset(self):
+        self._insert_rows("vouchers", [self._v_row("B001", balance="100.00")])
+        coll_store.apply_post_to_db([self._staged("B001", "10.00")])
+        rows = self._query("SELECT * FROM installments")
+        self.assertEqual(rows[0]["payment_type"], "cash")
+        self.assertEqual(rows[0]["payment_ref"], "")
+        self.assertEqual(self._query("SELECT * FROM checks"), [])
+
+    def test_upi_payment_stores_txn_id_in_payment_ref(self):
+        self._insert_rows("vouchers", [self._v_row("B001", balance="100.00")])
+        coll_store.apply_post_to_db([self._staged("B001", "10.00", payment_type="upi",
+                                                   upi_txn_id="TXN123")])
+        row = self._query("SELECT * FROM installments")[0]
+        self.assertEqual(row["payment_type"], "upi")
+        self.assertEqual(json.loads(row["payment_ref"]), {"txn_id": "TXN123"})
+        self.assertEqual(self._query("SELECT * FROM checks"), [])
+
+    def test_check_payment_creates_pending_check_row(self):
+        self._insert_rows("vouchers", [self._v_row("B001", balance="100.00")])
+        coll_store.apply_post_to_db([self._check_voucher("B001", "40.00")])
+        inst = self._query("SELECT * FROM installments")[0]
+        self.assertEqual(inst["payment_type"], "check")
+        checks = self._query("SELECT * FROM checks")
+        self.assertEqual(len(checks), 1)
+        c = checks[0]
+        self.assertEqual(c["bill_no"], "B001")
+        self.assertEqual(c["status"], "pending")
+        self.assertEqual(c["bank"], "Bank A")
+        self.assertEqual(c["check_no"], "CHK001")
+        self.assertEqual(c["amount"], "40.00")
+        self.assertEqual(c["installment_id"], inst["id"])
+
+    def test_zero_or_empty_check_payment_creates_no_check_row(self):
+        self._insert_rows("vouchers", [self._v_row("B001"), self._v_row("B002")])
+        coll_store.apply_post_to_db([
+            self._check_voucher("B001", "0"),
+            self._check_voucher("B002", ""),
+        ])
+        self.assertEqual(self._query("SELECT * FROM checks"), [])
+
+    # ------------------------------------------------------------------
+    # mark_check_encashed
+    # ------------------------------------------------------------------
+
+    def test_mark_check_encashed_happy_path(self):
+        self._insert_rows("vouchers", [self._v_row("B001", balance="100.00")])
+        coll_store.apply_post_to_db([self._check_voucher("B001", "40.00")])
+        check_id = self._query("SELECT id FROM checks")[0]["id"]
+        updated = coll_store.mark_check_encashed(check_id, "distributor1", "confirmed")
+        self.assertEqual(updated["status"], "encashed")
+        self.assertEqual(updated["resolved_by"], "distributor1")
+        self.assertEqual(updated["resolution_note"], "confirmed")
+        # Encashing never touches the balance — the money was already collected.
+        self.assertEqual(self._query("SELECT balance FROM vouchers")[0]["balance"], "60.00")
+
+    def test_mark_check_encashed_not_pending_raises(self):
+        self._insert_rows("vouchers", [self._v_row("B001", balance="100.00")])
+        coll_store.apply_post_to_db([self._check_voucher("B001", "40.00")])
+        check_id = self._query("SELECT id FROM checks")[0]["id"]
+        coll_store.mark_check_encashed(check_id, "distributor1")
+        with self.assertRaises(ValueError):
+            coll_store.mark_check_encashed(check_id, "distributor1")
+
+    def test_mark_check_encashed_missing_raises(self):
+        with self.assertRaises(ValueError):
+            coll_store.mark_check_encashed(999, "distributor1")
+
+    # ------------------------------------------------------------------
+    # mark_check_bounced
+    # ------------------------------------------------------------------
+
+    def test_mark_check_bounced_restores_balance_and_deletes_installment(self):
+        self._insert_rows("vouchers", [self._v_row("B001", balance="100.00")])
+        coll_store.apply_post_to_db([self._check_voucher("B001", "40.00")])
+        check_id = self._query("SELECT id FROM checks")[0]["id"]
+        updated = coll_store.mark_check_bounced(check_id, "distributor1", "insufficient funds")
+        self.assertEqual(updated["status"], "bounced")
+        self.assertEqual(updated["resolution_note"], "insufficient funds")
+        self.assertEqual(self._query("SELECT balance FROM vouchers")[0]["balance"], "100.00")
+        self.assertEqual(self._query("SELECT * FROM installments"), [])
+
+    def test_mark_check_bounced_archived_voucher_skips_balance(self):
+        # The check payment fully settles the voucher, which archives it
+        # (moves it + its installment to completed_*). Bouncing afterwards
+        # cannot reopen an archived voucher — status still flips, but the
+        # balance is left untouched with an explanatory note.
+        self._insert_rows("vouchers", [self._v_row("B001", balance="40.00")])
+        coll_store.apply_post_to_db([self._check_voucher("B001", "40.00")])
+        self.assertEqual(self._query("SELECT * FROM vouchers"), [])
+        check_id = self._query("SELECT id FROM checks")[0]["id"]
+        updated = coll_store.mark_check_bounced(check_id, "distributor1")
+        self.assertEqual(updated["status"], "bounced")
+        self.assertIn("already archived", updated["resolution_note"])
+        # Still archived — no balance to restore, nothing un-archived.
+        self.assertEqual(self._query("SELECT * FROM vouchers"), [])
+        self.assertEqual(len(self._query("SELECT * FROM completed_vouchers")), 1)
+
+    def test_mark_check_bounced_not_pending_raises(self):
+        self._insert_rows("vouchers", [self._v_row("B001", balance="100.00")])
+        coll_store.apply_post_to_db([self._check_voucher("B001", "40.00")])
+        check_id = self._query("SELECT id FROM checks")[0]["id"]
+        coll_store.mark_check_encashed(check_id, "distributor1")
+        with self.assertRaises(ValueError):
+            coll_store.mark_check_bounced(check_id, "distributor1")
+
+    def test_mark_check_bounced_missing_raises(self):
+        with self.assertRaises(ValueError):
+            coll_store.mark_check_bounced(999, "distributor1")
+
+    # ------------------------------------------------------------------
+    # load_checks / check_summary_counts
+    # ------------------------------------------------------------------
+
+    def test_load_checks_filters_by_status(self):
+        self._insert_rows("vouchers", [self._v_row("B001", balance="100.00"),
+                                       self._v_row("B002", balance="100.00")])
+        coll_store.apply_post_to_db([self._check_voucher("B001", "10.00"),
+                                    self._check_voucher("B002", "20.00")])
+        ids = [c["id"] for c in self._query("SELECT id FROM checks ORDER BY id")]
+        coll_store.mark_check_encashed(ids[0], "distributor1")
+        pending = coll_store.load_checks(statuses=["pending"])
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["bill_no"], "B002")
+        self.assertEqual(len(coll_store.load_checks()), 2)
+
+    def test_check_summary_counts_buckets(self):
+        self._insert_rows("vouchers", [self._v_row(f"B00{i}", balance="100.00")
+                                       for i in range(1, 5)])
+        coll_store.apply_post_to_db([
+            self._check_voucher("B001", "10.00", check_date="2026-07-25"),  # overdue
+            self._check_voucher("B002", "10.00", check_date="2026-07-28"),  # due soon
+            self._check_voucher("B003", "10.00", check_date="2026-08-15"),  # not due yet
+            self._check_voucher("B004", "10.00", check_date="2026-07-25"),  # will bounce
+        ])
+        ids = {c["bill_no"]: c["id"] for c in self._query("SELECT id, bill_no FROM checks")}
+        coll_store.mark_check_bounced(ids["B004"], "distributor1")
+        counts = coll_store.check_summary_counts(today="2026-07-26")
+        self.assertEqual(counts, {"due_soon": 1, "overdue": 1, "bounced": 1})
+
+    # ------------------------------------------------------------------
+    # Schema / permissions backfills
+    # ------------------------------------------------------------------
+
+    def test_installments_table_has_payment_type_columns(self):
+        cols = {r["name"] for r in self._query("PRAGMA table_info(installments)")}
+        self.assertIn("payment_type", cols)
+        self.assertIn("payment_ref", cols)
+        cols2 = {r["name"] for r in self._query("PRAGMA table_info(completed_installments)")}
+        self.assertIn("payment_type", cols2)
+        self.assertIn("payment_ref", cols2)
+
+    def test_check_permissions_backfilled(self):
+        rows = self._query(
+            "SELECT role, action_key FROM permissions WHERE action_key IN"
+            " ('view_checks', 'resolve_check')")
+        pairs = {(r["role"], r["action_key"]) for r in rows}
+        self.assertIn(("salesman", "view_checks"), pairs)
+        self.assertIn(("supervisor", "view_checks"), pairs)
+        self.assertIn(("distributor", "view_checks"), pairs)
+        self.assertIn(("distributor", "resolve_check"), pairs)
+        self.assertNotIn(("salesman", "resolve_check"), pairs)
 
 
 if __name__ == "__main__":

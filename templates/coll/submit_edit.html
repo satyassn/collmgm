@@ -12,6 +12,11 @@
   <span id="payment-count">{{ paid_count }} vouchers collected</span>
   <span class="summary-total">Total: <strong id="payment-total">{{ total_collected }}</strong></span>
 </div>
+<div class="summary-box summary-box--types">
+  <span>Cash: <span id="type-cash-count">{{ type_totals.cash.count }}</span> / <strong id="type-cash-amount">{{ type_totals.cash.amount }}</strong></span>
+  <span>UPI: <span id="type-upi-count">{{ type_totals.upi.count }}</span> / <strong id="type-upi-amount">{{ type_totals.upi.amount }}</strong></span>
+  <span>Check: <span id="type-check-count">{{ type_totals.check.count }}</span> / <strong id="type-check-amount">{{ type_totals.check.amount }}</strong></span>
+</div>
 
 <form method="post" action="/coll/submit/{{ stem }}">
   <div class="table-wrapper">
@@ -24,12 +29,16 @@
           <th class="num">Total Paid</th>
           <th class="num">Balance</th>
           <th class="num">Payment</th>
+          <th>Type</th>
         </tr>
       </thead>
       <tbody>
         {% for v in vouchers %}
-        <tr>
-          <td class="mono"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
+        <tr class="{% if v.salesman_mismatch %}row-correction{% endif %}">
+          <td class="mono">
+            <a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a>
+            {% if v.salesman_mismatch %}<span class="badge badge-warn">Different salesman</span>{% endif %}
+          </td>
           <td>{{ v.get("voucher_date","") }}</td>
           <td class="num mono" data-label="Amt">{{ v.get("amount","") }}</td>
           <td class="num mono" data-label="Total">{{ v.get("total_paid","") }}</td>
@@ -44,6 +53,36 @@
                    {% if v.error %}aria-invalid="true" aria-describedby="pay-err-{{ loop.index }}"{% endif %}>
             <span class="field-error-bubble" id="pay-err-{{ loop.index }}" role="alert"
                   {% if not v.error %}hidden{% endif %}>{{ v.error or "" }}</span>
+          </td>
+          <td>
+            <select name="paytype_{{ v.bill_no }}" class="paytype-select" data-row="{{ loop.index }}">
+              <option value="cash" {% if v.get("payment_type","cash") == "cash" %}selected{% endif %}>Cash</option>
+              <option value="upi" {% if v.get("payment_type") == "upi" %}selected{% endif %}>UPI</option>
+              <option value="check" {% if v.get("payment_type") == "check" %}selected{% endif %}>Check</option>
+            </select>
+          </td>
+        </tr>
+        <tr class="paytype-detail-row" data-row="{{ loop.index }}" hidden>
+          <td colspan="7">
+            <div class="field-group paytype-detail" data-paytype="upi">
+              <label class="field-label">UPI transaction id
+                <input type="text" name="upitxn_{{ v.bill_no }}" value="{{ v.get('upi_txn_id','') }}" autocomplete="off">
+              </label>
+            </div>
+            <div class="field-group paytype-detail" data-paytype="check">
+              <label class="field-label">Bank
+                <input type="text" name="checkbank_{{ v.bill_no }}" value="{{ v.get('check_bank','') }}" autocomplete="off">
+              </label>
+              <label class="field-label">Branch
+                <input type="text" name="checkbranch_{{ v.bill_no }}" value="{{ v.get('check_branch','') }}" autocomplete="off">
+              </label>
+              <label class="field-label">Check #
+                <input type="text" name="checkno_{{ v.bill_no }}" value="{{ v.get('check_no','') }}" autocomplete="off">
+              </label>
+              <label class="field-label">Check date
+                <input type="date" name="checkdate_{{ v.bill_no }}" value="{{ v.get('check_date','') }}">
+              </label>
+            </div>
           </td>
         </tr>
         {% endfor %}
@@ -62,21 +101,59 @@
 <script>
 (function () {
   var inputs = Array.prototype.slice.call(document.querySelectorAll(".pay-input"));
+  var selects = Array.prototype.slice.call(document.querySelectorAll(".paytype-select"));
   var countEl = document.getElementById("payment-count");
   var totalEl = document.getElementById("payment-total");
+  var typeEls = {
+    cash: {count: document.getElementById("type-cash-count"), amount: document.getElementById("type-cash-amount")},
+    upi: {count: document.getElementById("type-upi-count"), amount: document.getElementById("type-upi-amount")},
+    check: {count: document.getElementById("type-check-count"), amount: document.getElementById("type-check-amount")}
+  };
+  var detailRows = {};
+  Array.prototype.forEach.call(document.querySelectorAll(".paytype-detail-row"), function (row) {
+    detailRows[row.dataset.row] = row;
+  });
 
   function recalc() {
     var total = 0, count = 0;
-    inputs.forEach(function (input) {
+    var byType = {cash: {count: 0, amount: 0}, upi: {count: 0, amount: 0}, check: {count: 0, amount: 0}};
+    inputs.forEach(function (input, idx) {
       var val = parseFloat(input.value);
       if (!isNaN(val) && val > 0) {
         total += val;
         count += 1;
+        var select = selects[idx];
+        var type = select ? select.value : "cash";
+        if (!byType[type]) type = "cash";
+        byType[type].count += 1;
+        byType[type].amount += val;
       }
     });
     countEl.textContent = count + " vouchers collected";
     totalEl.textContent = total.toFixed(2);
+    Object.keys(typeEls).forEach(function (type) {
+      typeEls[type].count.textContent = byType[type].count;
+      typeEls[type].amount.textContent = byType[type].amount.toFixed(2);
+    });
   }
+
+  function refreshDetail(select) {
+    var row = detailRows[select.dataset.row];
+    if (!row) return;
+    var type = select.value;
+    row.hidden = (type === "cash");
+    Array.prototype.forEach.call(row.querySelectorAll(".paytype-detail"), function (group) {
+      group.hidden = group.dataset.paytype !== type;
+    });
+  }
+
+  selects.forEach(function (select) {
+    refreshDetail(select);
+    select.addEventListener("change", function () {
+      refreshDetail(select);
+      recalc();
+    });
+  });
 
   function bubbleFor(input) {
     return input.parentElement.querySelector(".field-error-bubble");

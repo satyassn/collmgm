@@ -7,6 +7,18 @@
 
 {% if error %}<p class="alert alert-error">{{ error }}</p>{% endif %}
 
+{% if open_requests %}
+<div class="alert alert-warn">
+  <strong>Open amendment request{{ 's' if open_requests|length > 1 else '' }} on this voucher:</strong>
+  <ul>
+    {% for r in open_requests %}
+    <li><a href="/coll/amend-requests/{{ r.id }}?next=/coll/amend/{{ bill_no | urlencode }}">{{ r.note }}</a>
+      <span class="report-meta">— {{ r.requested_by }} · {{ r.requested_at[:10] }}</span></li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
+
 <form method="post" action="/coll/amend/{{ bill_no | urlencode }}" class="card" id="amend-form">
   <input type="hidden" name="snapshot" value='{{ snapshot_json }}'>
 
@@ -37,8 +49,11 @@
 
   <fieldset>
     <legend class="group-heading">Installments</legend>
+    {% if not installments %}
+    <p class="muted">No installments on this voucher.</p>
+    {% endif %}
     <div class="table-wrapper">
-      <table class="data-table amend-inst-table" id="inst-table">
+      <table class="data-table card-table" id="inst-table">
         <thead>
           <tr><th>Date</th><th class="num">Amount</th><th>Salesman</th><th>Delete</th></tr>
         </thead>
