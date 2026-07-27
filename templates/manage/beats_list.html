@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Manage Beats — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Manage Beats</h2>
+
+{% if not beats %}
+  <p class="empty-state">No beats found.</p>
+{% else %}
+  <ul class="report-list">
+    {% for b in beats %}
+    <li class="report-item">
+      <span class="report-label">{{ b.name }}</span>
+      <span class="report-meta">Salesman: {{ b.salesman }}</span>
+      <a class="btn btn-sm btn-secondary" href="/manage/beats/{{ b.name | urlencode }}/edit">Edit</a>
+      <form method="post" action="/manage/beats/{{ b.name | urlencode }}/delete" style="display:inline">
+        <button type="submit" class="btn btn-sm btn-danger"
+                onclick="return confirm('Delete beat {{ b.name }}? This cannot be undone.')">Delete</button>
+      </form>
+    </li>
+    {% endfor %}
+  </ul>
+{% endif %}
+
+<div class="action-row">
+  <a class="btn btn-primary" href="/manage/beats/new">+ New Beat</a>
+  <a class="btn btn-secondary" href="/menu">Back to Menu</a>
+</div>
+{% endblock %}

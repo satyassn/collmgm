@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Review New Vouchers — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Review New Vouchers</h2>
+
+{% if not vouchers %}
+  <p class="empty-state">No vouchers in this batch are assigned to you.</p>
+{% else %}
+  <ul class="report-list">
+    {% for v in vouchers %}
+    {% set status = v.get("review_status", "pending") %}
+    <li class="report-item">
+      <span class="report-label">
+        <span class="mono">{{ v.bill_no }}</span> — {{ v.date }} — <span class="mono">{{ v.amount }}</span>
+        <span class="badge badge-{{ 'ok' if status == 'reviewed' else 'warn' if status == 'flagged' else 'muted' }}">{{ status }}</span>
+      </span>
+      <span class="report-meta">{{ v.beat }}</span>
+      {% if status == "pending" %}
+      <form method="post" action="/coll/new-vouchers/{{ stem }}/review/{{ v.bill_no | urlencode }}">
+        <input type="hidden" name="action" value="clear">
+        <button type="submit" class="btn btn-sm btn-primary">Looks Good</button>
+      </form>
+      <a class="btn btn-sm btn-secondary" href="/coll/new-vouchers/{{ stem }}/review/{{ v.bill_no | urlencode }}">Raise Issue</a>
+      {% else %}
+      <a class="btn btn-sm btn-secondary" href="/coll/new-vouchers/{{ stem }}/review/{{ v.bill_no | urlencode }}">View</a>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+{% endif %}
+<a class="btn btn-secondary" href="/coll/new-vouchers">Back</a>
+{% endblock %}

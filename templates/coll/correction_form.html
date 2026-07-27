@@ -19,24 +19,31 @@
     {% endfor %}
   </fieldset>
 
+  {% if can_request_amend %}
+  <p class="muted">Need something not listed here?
+    <a href="/coll/amend-request/{{ voucher.bill_no | urlencode }}?from={{ back | urlencode }}">Raise an Amendment Request instead</a></p>
+  {% endif %}
+
   {% if "installment_amount" in kinds or "installment_delete" in kinds %}
   <div class="field-group" data-kinds="installment_amount installment_delete" hidden>
     <p class="group-heading">Which installment?</p>
     {% if installments %}
-    <table class="data-table">
+    <div class="table-wrapper">
+    <table class="data-table card-table">
       <thead><tr><th></th><th>Date</th><th class="num">Amount</th><th>Salesman</th></tr></thead>
       <tbody>
         {% for inst in installments %}
         <tr>
-          <td><input type="radio" name="installment_id" value="{{ inst.id }}"
+          <td data-label="Select"><input type="radio" name="installment_id" value="{{ inst.id }}"
                      aria-label="Installment {{ inst.date }} {{ inst.amount }}"></td>
-          <td>{{ inst.date }}</td>
-          <td class="num mono">{{ inst.amount }}</td>
-          <td>{{ inst.salesman }}</td>
+          <td data-label="Date">{{ inst.date }}</td>
+          <td class="num mono" data-label="Amount">{{ inst.amount }}</td>
+          <td data-label="Salesman">{{ inst.salesman }}</td>
         </tr>
         {% endfor %}
       </tbody>
     </table>
+    </div>
     {% else %}
     <p class="muted">This voucher has no installments recorded.</p>
     {% endif %}

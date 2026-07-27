@@ -6,18 +6,22 @@ Run via:  run_server.bat
        or uvicorn scripts.coll_api:app --host 0.0.0.0 --port 8100 --reload
 """
 
+import csv
+import io
 import json
 import re
 import secrets
 import sys
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from typing import List
+from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from fastapi import FastAPI, Form, Query, Request
+from fastapi import FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -26,37 +30,72 @@ from coll_orchestrate import (
     StageError, ValidationError,
     prepare_submit_review, apply_submit_approval,
     ActiveReportState, check_active_beat_report, generate_collection_list, apply_start_approval,
+    owning_salesman,
     set_start_verification, is_start_verification_complete,
     set_submit_verification, is_submit_verification_complete,
     apply_correction_request, _find_active_report_for_bill,
     compute_payment_dates, record_submit_payments, validate_payment,
+    validate_payment_type, payment_type_totals,
     validate_staged_report, format_submit_validation_errors,
     post_confirmed_report, return_post_stage,
     amend_voucher,
+    raise_amendment_request, resolve_amendment_request,
+    resolve_check,
+    ADDV_FLAG_KINDS,
+    addv_batch_status, addv_vouchers_for_salesman,
+    clear_addv_review, raise_addv_flag, resolve_addv_flag, reject_addv_batch,
 )
 from coll_store import (
     STAGING_DIR,
+    ASSIGNABLE_ROLES,
     AmendmentConflict,
     CorrectionConflict,
+    archive_files,
     _load_installments,
     _load_pending_start_reports,
     _load_pending_submit_reports,
     bill_no_sort_key,
     build_print_collection_html,
     cancel_staging_report,
+    change_own_password,
+    create_beat,
+    create_user,
+    delete_beat,
+    delete_user,
     ensure_db,
+    ensure_staging_dir,
+    has_any_users,
     insert_correction,
     list_staging_reports,
+    load_addv_batches,
+    load_addv_staged_bill_nos,
+    load_all_existing_bill_nos,
     load_amendment,
     load_amendments,
+    load_amendment_request,
+    load_amendment_requests,
+    load_beats_raw,
+    load_checks,
+    check_summary_counts,
     load_correction,
     load_corrections,
     load_permissions,
     load_report_json,
+    load_user,
+    load_users_admin,
+    open_amendment_requests_for_bills,
     open_corrections_for_bills,
     parse_decimal,
     read_finalize_checkpoint,
+    register_first_distributor,
+    reset_user_password,
+    sanitize_filename_component,
+    save_report_json,
+    update_beat_salesman,
+    update_user_role,
     verify_user,
+    write_new_installments,
+    write_new_vouchers,
 )
 from coll_data import (
     NUMOF_TOP_AGED_VOUCHERS,
@@ -74,6 +113,7 @@ from coll_data import (
     query_pending_by_beat,
     query_pending_by_salesman,
     search_voucher,
+    validate_addv_batch,
 )
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -120,7 +160,23 @@ def _r(url: str, code: int = 303):
     return RedirectResponse(url, status_code=code)
 
 
+def _redirect_ok(url: str, msg: str):
+    """Redirect to url with a one-shot success message for base.html's flash banner."""
+    sep = "&" if "?" in url else "?"
+    return _r(f"{url}{sep}ok={quote(msg)}")
+
+
 def _tmpl(name: str, request: Request, **ctx):
+    """Render a template, auto-injecting `nav_perms` (the rendering user's
+    permission set) whenever a `user` is in context and the caller hasn't
+    already supplied one — lets base.html's nav dropdowns gate themselves
+    without every existing route having to pass this explicitly."""
+    user = ctx.get("user")
+    if user is not None and "nav_perms" not in ctx:
+        try:
+            ctx["nav_perms"] = load_permissions().get(user.role, frozenset())
+        except FileNotFoundError:
+            ctx["nav_perms"] = frozenset()
     return templates.TemplateResponse(request=request, name=name, context=ctx)
 
 
@@ -141,11 +197,21 @@ def _enrich_vouchers(vouchers):
     return vouchers
 
 
+_FORCED_CHANGE_ALLOWED_PATHS = {"/profile", "/profile/change-password", "/logout"}
+
+
 def _require(request: Request, permission: str = None):
-    """Return (user, None) if authorised; (None, redirect/error response) otherwise."""
+    """Return (user, None) if authorised; (None, redirect/error response) otherwise.
+
+    A user with a pending forced password change is redirected to /profile
+    for every other route — the single chokepoint all protected routes
+    already call, so nothing can route around the forced change.
+    """
     user = _get_user(request)
     if not user:
         return None, _r("/login")
+    if user.must_change_password and request.url.path not in _FORCED_CHANGE_ALLOWED_PATHS:
+        return user, _r("/profile?forced=1")
     if permission:
         try:
             perms = load_permissions()
@@ -164,6 +230,18 @@ def _report_label(data: dict) -> str:
     if sel_type == "beat_salesman" and len(sel) >= 2:
         return f"{sel[0]} / {sel[1]}"
     return ", ".join(sel)
+
+
+def _flag_salesman_mismatches(vouchers, assigned_salesman):
+    """Mark each voucher whose own `salesman` differs from the beat's
+    assigned salesman — render-only, never persisted, mirrors the
+    correction_open/correction_applied pattern used elsewhere. Purely
+    informational: nothing is gated or auto-raised here, a human reviews and
+    raises an Amendment Request themselves (via the voucher lookup screen) if
+    warranted. Always a no-op for a "beat_salesman" report, since every
+    voucher's salesman equals `assigned_salesman` there by construction."""
+    for v in vouchers:
+        v["salesman_mismatch"] = v.get("salesman", "") != assigned_salesman
 
 
 # Staging report stems are built from sanitize_filename_component output, so a
@@ -217,7 +295,7 @@ def root(request: Request):
 def login_page(request: Request):
     if _get_user(request):
         return _r("/menu")
-    return _tmpl("login.html", request)
+    return _tmpl("login.html", request, show_register=not has_any_users())
 
 
 @app.post("/login", response_class=HTMLResponse)
@@ -226,8 +304,9 @@ def login_post(request: Request,
                password: str = Form(default="")):
     user = verify_user(username.strip(), password)
     if not user:
-        return _tmpl("login.html", request, error="Invalid username or password.")
-    resp = _r("/menu")
+        return _tmpl("login.html", request, error="Invalid username or password.",
+                     show_register=not has_any_users())
+    resp = _r("/profile?forced=1" if user.must_change_password else "/menu")
     _set_session(resp, user)
     return resp
 
@@ -237,6 +316,29 @@ def logout(request: Request):
     resp = _r("/login")
     _clear_session(request, resp)
     return resp
+
+
+@app.get("/register", response_class=HTMLResponse)
+def register_page(request: Request):
+    if _get_user(request):
+        return _r("/menu")
+    if has_any_users():
+        return _r("/login")
+    return _tmpl("register.html", request)
+
+
+@app.post("/register", response_class=HTMLResponse)
+def register_post(request: Request,
+                  name: str = Form(default=""),
+                  password: str = Form(default=""),
+                  confirm_password: str = Form(default="")):
+    if has_any_users():
+        return _r("/login")
+    try:
+        register_first_distributor(name.strip(), password, confirm_password)
+    except ValueError as e:
+        return _tmpl("register.html", request, error=str(e), submitted_name=name)
+    return _redirect_ok("/login", f"Distributor account '{name.strip()}' created — sign in to continue.")
 
 
 # ---------------------------------------------------------------------------
@@ -253,22 +355,24 @@ def menu(request: Request):
     except FileNotFoundError:
         perms = {}
     role_perms = perms.get(user.role, frozenset())
-    return _tmpl("menu.html", request, user=user, perms=role_perms)
+    check_summary = check_summary_counts() if "view_checks" in role_perms else None
+    return _tmpl("menu.html", request, user=user, perms=role_perms,
+                 check_summary=check_summary)
 
 
 # ---------------------------------------------------------------------------
 # Generate Collection List  (coll-start)
 # ---------------------------------------------------------------------------
 
-@app.get("/coll/start", response_class=HTMLResponse)
-def coll_start(request: Request):
-    user, err = _require(request, "coll_start")
-    if err:
-        return err
+def _render_start_beat_form(request, user, error=None, selected_beat=""):
+    """Render the Generate Collection List picker, optionally with an inline
+    error and the user's prior beat choice preserved (used both for the
+    normal GET and for recoverable validation failures on generate)."""
     try:
         beats = load_beats(user)
         summary = load_beats_pending_summary(user)
         active = load_active_beat_statuses()
+        beats_map = {b["name"]: b["salesman"] for b in load_beats_raw()}
     except Exception as e:
         return _tmpl("error.html", request, user=user, message=str(e))
     # Beats already locked by an in-flight report can't be generated again
@@ -276,104 +380,82 @@ def coll_start(request: Request):
     # in the template instead of listing them alongside selectable beats.
     beats = sorted(beats, key=lambda b: (b in active, b))
     return _tmpl("coll/start_beat.html", request, user=user,
-                 beats=beats, summary=summary, active=active)
+                 beats=beats, summary=summary, active=active, beats_map=beats_map,
+                 error=error, selected_beat=selected_beat)
 
 
-def _generate_collection_list_response(request, user, beat, salesman):
+@app.get("/coll/start", response_class=HTMLResponse)
+def coll_start(request: Request):
+    user, err = _require(request, "coll_start")
+    if err:
+        return err
+    return _render_start_beat_form(request, user)
+
+
+def _generate_collection_list_response(request, user, beat):
     """Create the staging report and render the Keep/Cancel preview.
 
-    Shared by the explicit salesman-picker step and the auto-skip path used
-    when a beat has only one possible salesman (always true for a salesman
-    generating their own list, since RBAC restricts them to assigned beats).
+    Generates a beat-wide combined list — every pending voucher for the
+    beat, regardless of which salesman is recorded on the individual
+    voucher — since the web app no longer picks a salesman at generation
+    time. A voucher whose own salesman differs from the beat's assigned
+    salesman is not auto-corrected or auto-raised as an Amendment Request;
+    it's flagged (see _flag_salesman_mismatches) for a human to review and
+    raise one themselves if warranted.
     """
-    selection_type = "beat_salesman"
-    selection_values = [beat, salesman]
+    selection_type = "beat"
+    selection_values = [beat]
 
     state, _existing_path, _existing_data = check_active_beat_report(selection_type, selection_values)
     if state != ActiveReportState.NONE:
-        return _tmpl("error.html", request, user=user,
-                     message=f"An active collection already exists for {beat} / {salesman}. "
-                              "Complete or cancel it before starting a new one.")
+        return _render_start_beat_form(
+            request, user,
+            error=f"An active collection list already exists for beat '{beat}'. "
+                   "Complete or cancel it before starting a new one.",
+            selected_beat=beat)
 
     vouchers = _load_vouchers_by_criterion(selection_type, selection_values, user)
     if not vouchers:
-        return _tmpl("error.html", request, user=user,
-                     message=f"No pending vouchers for {beat} / {salesman}.")
+        return _render_start_beat_form(
+            request, user,
+            error=f"No pending vouchers for beat '{beat}'.",
+            selected_beat=beat)
 
-    outcome = generate_collection_list(beat, salesman, vouchers)
+    beats_map = {b["name"]: b["salesman"] for b in load_beats_raw()}
+    assigned_salesman = beats_map.get(beat, "")
+
+    outcome = generate_collection_list(selection_type, selection_values, vouchers)
     if not outcome.ok:
         if outcome.reason == "lock_conflict":
-            return _tmpl("error.html", request, user=user,
-                         message=f"Beat '{beat}' is currently locked. Please retry later.")
+            return _render_start_beat_form(
+                request, user,
+                error=f"Beat '{beat}' is currently locked. Please retry later.",
+                selected_beat=beat)
         return _tmpl("error.html", request, user=user, message=f"Failed to create report: {outcome.error}")
 
     total = sum(Decimal(v["balance"]) for v in vouchers)
+    enriched = _enrich_vouchers(vouchers)
+    _flag_salesman_mismatches(enriched, assigned_salesman)
     return _tmpl("coll/start_preview.html", request, user=user,
-                 beat=beat, salesman=salesman, vouchers=_enrich_vouchers(vouchers),
+                 beat=beat, salesman=assigned_salesman, vouchers=enriched,
                  report_stem=outcome.json_path.stem, total_balance=total)
 
 
-@app.post("/coll/start/beat", response_class=HTMLResponse)
-def coll_start_pick_beat(request: Request, beat: str = Form(default="")):
+@app.post("/coll/start/generate", response_class=HTMLResponse)
+def coll_start_generate(request: Request, beat: str = Form(default="")):
     user, err = _require(request, "coll_start")
     if err:
         return err
     beat = beat.strip()
     if not beat:
-        return _r("/coll/start")
+        return _render_start_beat_form(
+            request, user, error="Select a beat.", selected_beat=beat)
 
     if user.role == "salesman" and beat not in load_beats(user):
         return _tmpl("error.html", request, user=user,
                      message="You are not assigned to that beat.")
 
-    try:
-        beat_vouchers = _load_vouchers_by_criterion("beat", [beat], user)
-    except Exception as e:
-        return _tmpl("error.html", request, user=user, message=str(e))
-    if not beat_vouchers:
-        try:
-            beats = load_beats(user)
-            summary = load_beats_pending_summary(user)
-            active = load_active_beat_statuses()
-            beats = sorted(beats, key=lambda b: (b in active, b))
-        except Exception:
-            beats, summary, active = [], {}, {}
-        return _tmpl("coll/start_beat.html", request, user=user,
-                     beats=beats, summary=summary, active=active,
-                     error=f"No pending vouchers for beat: {beat}")
-    if user.role == "salesman":
-        salesmen = [user.name] if user.name in {v["salesman"] for v in beat_vouchers} else []
-    else:
-        salesmen = sorted({v["salesman"] for v in beat_vouchers})
-
-    if len(salesmen) == 1:
-        return _generate_collection_list_response(request, user, beat, salesmen[0])
-
-    counts = {sm: sum(1 for v in beat_vouchers if v["salesman"] == sm) for sm in salesmen}
-    return _tmpl("coll/start_salesman.html", request, user=user,
-                 beat=beat, salesmen=salesmen, counts=counts)
-
-
-@app.post("/coll/start/generate", response_class=HTMLResponse)
-def coll_start_generate(request: Request,
-                         beat: str = Form(default=""),
-                         salesman: str = Form(default="")):
-    user, err = _require(request, "coll_start")
-    if err:
-        return err
-    beat, salesman = beat.strip(), salesman.strip()
-    if not beat or not salesman:
-        return _r("/coll/start")
-
-    if user.role == "salesman":
-        if salesman != user.name:
-            return _tmpl("error.html", request, user=user,
-                         message="You can only generate a collection list for yourself.")
-        if beat not in load_beats(user):
-            return _tmpl("error.html", request, user=user,
-                         message="You are not assigned to that beat.")
-
-    return _generate_collection_list_response(request, user, beat, salesman)
+    return _generate_collection_list_response(request, user, beat)
 
 
 @app.post("/coll/start/confirm", response_class=HTMLResponse)
@@ -388,7 +470,8 @@ def coll_start_confirm(request: Request,
         if json_path is None:
             return _tmpl("error.html", request, user=user, message="Report not found.")
         sel = data.get("selection", [])
-        if user.role == "salesman" and (len(sel) < 2 or sel[1] != user.name):
+        sel_type = data.get("selection_type", "beat_salesman")
+        if user.role == "salesman" and owning_salesman(sel_type, sel) != user.name:
             return _tmpl("error.html", request, user=user, message="Report not found.")
         if data.get("stages", {}).get("start") != "new":
             return _tmpl("error.html", request, user=user,
@@ -397,10 +480,8 @@ def coll_start_confirm(request: Request,
         # Beat comes from the report itself, not the form — a forged beat value
         # must not release another beat's lock.
         cancel_staging_report(json_path, sel[0] if sel else None)
-        return _tmpl("message.html", request, user=user,
-                     message="Collection list cancelled.", back="/menu")
-    return _tmpl("message.html", request, user=user,
-                 message="Collection list saved — awaiting supervisor approval.", back="/menu")
+        return _redirect_ok("/menu", "Collection list cancelled.")
+    return _redirect_ok("/menu", "Collection list saved — awaiting supervisor approval.")
 
 
 # ---------------------------------------------------------------------------
@@ -439,10 +520,12 @@ def _render_start_review(request, user, stem, data, error=None):
         v["correction_open"] = v["bill_no"] in open_map
         v["correction_applied"] = v["bill_no"] in applied_bills
     open_count = sum(len(reqs) for reqs in open_map.values())
+    salesman = owning_salesman(data.get("selection_type", "beat_salesman"), sel)
+    _flag_salesman_mismatches(vouchers, salesman)
     return _tmpl("coll/approve_start_review.html", request, user=user,
                  stem=stem, data=data, vouchers=_enrich_vouchers(vouchers),
                  beat=sel[0] if sel else "",
-                 salesman=sel[1] if len(sel) > 1 else "",
+                 salesman=salesman,
                  total_balance=total,
                  verified_count=sum(1 for v in vouchers if v["verified"]),
                  count_verified=bool(data.get("verification", {}).get("count")),
@@ -545,9 +628,8 @@ def coll_approve_start_action(request: Request, stem: str, action: str = Form(de
     if action in ("return", "cancel"):
         msg = ("Collection list returned — salesman must regenerate." if action == "return"
                else "Collection list cancelled.")
-        return _tmpl("message.html", request, user=user, message=msg, back="/coll/approve-start")
-    return _tmpl("message.html", request, user=user,
-                 message="Collection list approved.", back="/coll/approve-start")
+        return _redirect_ok("/coll/approve-start", msg)
+    return _redirect_ok("/coll/approve-start", "Collection list approved.")
 
 
 # ---------------------------------------------------------------------------
@@ -562,7 +644,8 @@ def coll_submit(request: Request):
     all_confirmed = _load_confirmed_start_reports()
     if user.role == "salesman":
         confirmed = [(p, d) for p, d in all_confirmed
-                     if d.get("selection", [None, None])[1] == user.name]
+                     if owning_salesman(d.get("selection_type", "beat_salesman"),
+                                        d.get("selection", [])) == user.name]
     else:
         confirmed = all_confirmed
     reports = [{"stem": p.stem, "label": _report_label(d), "data": d} for p, d in confirmed]
@@ -578,7 +661,9 @@ def coll_submit_edit(request: Request, stem: str):
     if json_path is None:
         return _tmpl("error.html", request, user=user, message="Report not found.")
     sel = data.get("selection", [])
-    if user.role == "salesman" and (len(sel) < 2 or sel[1] != user.name):
+    sel_type = data.get("selection_type", "beat_salesman")
+    salesman = owning_salesman(sel_type, sel)
+    if user.role == "salesman" and salesman != user.name:
         return _tmpl("error.html", request, user=user, message="Report not found.")
     stages = data.get("stages", {})
     if stages.get("submit") in ("submitted", "confirmed"):
@@ -591,13 +676,21 @@ def coll_submit_edit(request: Request, stem: str):
         if entry:
             v["payment"] = entry.get("payment", "")
             v["payment_date"] = entry.get("date", "")
+            v["payment_type"] = entry.get("payment_type", "cash")
+            v["upi_txn_id"] = entry.get("upi_txn_id", "")
+            v["check_bank"] = entry.get("check_bank", "")
+            v["check_branch"] = entry.get("check_branch", "")
+            v["check_no"] = entry.get("check_no", "")
+            v["check_date"] = entry.get("check_date", "")
     total_collected = sum(parse_decimal(v.get("payment")) for v in vouchers)
     paid_count = sum(1 for v in vouchers if parse_decimal(v.get("payment")) > 0)
+    _flag_salesman_mismatches(vouchers, salesman)
     return _tmpl("coll/submit_edit.html", request, user=user,
                  stem=stem, data=data, vouchers=_enrich_vouchers(vouchers),
                  beat=sel[0] if sel else "",
-                 salesman=sel[1] if len(sel) > 1 else "",
-                 total_collected=total_collected, paid_count=paid_count)
+                 salesman=salesman,
+                 total_collected=total_collected, paid_count=paid_count,
+                 type_totals=payment_type_totals(vouchers))
 
 
 @app.post("/coll/submit/{stem}", response_class=HTMLResponse)
@@ -609,20 +702,30 @@ async def coll_submit_save(request: Request, stem: str):
     if json_path is None:
         return _tmpl("error.html", request, user=user, message="Report not found.")
     sel = data.get("selection", [])
-    if user.role == "salesman" and (len(sel) < 2 or sel[1] != user.name):
+    sel_type = data.get("selection_type", "beat_salesman")
+    salesman = owning_salesman(sel_type, sel)
+    if user.role == "salesman" and salesman != user.name:
         return _tmpl("error.html", request, user=user, message="Report not found.")
 
     form = await request.form()
     action = (form.get("action") or "save").strip()
 
     beat = sel[0] if sel else ""
-    salesman = sel[1] if len(sel) > 1 else ""
 
     vouchers = sorted(data.get("vouchers", []), key=lambda v: bill_no_sort_key(v["bill_no"]))
     invalid = 0
     for v in vouchers:
-        raw = (form.get(f"pay_{v['bill_no']}") or "").strip()
+        bill_no = v["bill_no"]
+        raw = (form.get(f"pay_{bill_no}") or "").strip()
+        v["payment_type"] = (form.get(f"paytype_{bill_no}") or "cash").strip() or "cash"
+        v["upi_txn_id"] = (form.get(f"upitxn_{bill_no}") or "").strip()
+        v["check_bank"] = (form.get(f"checkbank_{bill_no}") or "").strip()
+        v["check_branch"] = (form.get(f"checkbranch_{bill_no}") or "").strip()
+        v["check_no"] = (form.get(f"checkno_{bill_no}") or "").strip()
+        v["check_date"] = (form.get(f"checkdate_{bill_no}") or "").strip()
         normalized, reason = validate_payment(raw, v.get("balance"))
+        if not reason and normalized:
+            reason = validate_payment_type(v)
         if reason:
             invalid += 1
             v["error"] = reason  # template renders an inline bubble on this row
@@ -632,10 +735,12 @@ async def coll_submit_save(request: Request, stem: str):
     if invalid:
         total_collected = sum(parse_decimal(v.get("payment")) for v in vouchers)
         paid_count = sum(1 for v in vouchers if parse_decimal(v.get("payment")) > 0)
+        _flag_salesman_mismatches(vouchers, salesman)
         return _tmpl("coll/submit_edit.html", request, user=user,
                      stem=stem, data=data, vouchers=_enrich_vouchers(vouchers),
                      beat=beat, salesman=salesman,
                      total_collected=total_collected, paid_count=paid_count,
+                     type_totals=payment_type_totals(vouchers),
                      error=f"Nothing saved — {invalid} payment(s) need correction")
 
     prior_installments, _ = _load_installments(json_path)
@@ -648,11 +753,9 @@ async def coll_submit_save(request: Request, stem: str):
         return _tmpl("error.html", request, user=user, message=str(e))
 
     if action == "submit":
-        return _tmpl("message.html", request, user=user,
-                     message="Collections submitted for supervisor review.", back="/coll/submit")
+        return _redirect_ok("/coll/submit", "Collections submitted for supervisor review.")
 
-    return _tmpl("message.html", request, user=user,
-                 message="Progress saved.", back="/menu")
+    return _redirect_ok("/menu", "Progress saved.")
 
 
 # ---------------------------------------------------------------------------
@@ -739,11 +842,14 @@ def _render_submit_review(request, user, stem, json_path, data, error=None):
         v["correction_applied"] = v["bill_no"] in applied_bills
         v["verified"] = v["bill_no"] in marked
     open_count = sum(len(reqs) for reqs in open_map.values())
+    salesman = owning_salesman(data.get("selection_type", "beat_salesman"), sel)
+    _flag_salesman_mismatches(vouchers, salesman)
     return _tmpl("coll/approve_submit_review.html", request, user=user,
                  stem=stem, data=data, vouchers=_enrich_vouchers(vouchers),
                  beat=sel[0] if sel else "",
-                 salesman=sel[1] if len(sel) > 1 else "",
+                 salesman=salesman,
                  total_collected=total_collected, paid_count=paid_count,
+                 type_totals=payment_type_totals(vouchers),
                  open_corrections=open_count,
                  verified_count=sum(1 for v in vouchers if v["verified"]),
                  count_verified=bool(data.get("verification", {}).get("count")),
@@ -856,11 +962,8 @@ def coll_approve_submit_action(request: Request, stem: str, action: str = Form(d
             return _tmpl("error.html", request, user=user, message=str(e))
 
     if action == "return":
-        return _tmpl("message.html", request, user=user,
-                     message="Collections returned to salesman for revision.",
-                     back="/coll/approve-submit")
-    return _tmpl("message.html", request, user=user,
-                 message="Collections approved — ready to post.", back="/coll/approve-submit")
+        return _redirect_ok("/coll/approve-submit", "Collections returned to salesman for revision.")
+    return _redirect_ok("/coll/approve-submit", "Collections approved — ready to post.")
 
 
 # ---------------------------------------------------------------------------
@@ -889,11 +992,14 @@ def coll_post_review(request: Request, stem: str):
     vouchers = sorted(data.get("vouchers", []), key=lambda v: bill_no_sort_key(v["bill_no"]))
     total_collected = sum(parse_decimal(v.get("payment")) for v in vouchers)
     paid_count = sum(1 for v in vouchers if parse_decimal(v.get("payment")) > 0)
+    salesman = owning_salesman(data.get("selection_type", "beat_salesman"), sel)
+    _flag_salesman_mismatches(vouchers, salesman)
     return _tmpl("coll/post_review.html", request, user=user,
                  stem=stem, data=data, vouchers=_enrich_vouchers(vouchers),
                  beat=sel[0] if sel else "",
-                 salesman=sel[1] if len(sel) > 1 else "",
-                 total_collected=total_collected, paid_count=paid_count)
+                 salesman=salesman,
+                 total_collected=total_collected, paid_count=paid_count,
+                 type_totals=payment_type_totals(vouchers))
 
 
 @app.post("/coll/post/{stem}", response_class=HTMLResponse)
@@ -912,8 +1018,7 @@ def coll_post_action(request: Request, stem: str, action: str = Form(default="")
             return_post_stage(json_path, data)
         except StageError as e:
             return _tmpl("error.html", request, user=user, message=str(e))
-        return _tmpl("message.html", request, user=user,
-                     message="Returned to supervisor for re-approval.", back="/coll/post")
+        return _redirect_ok("/coll/post", "Returned to supervisor for re-approval.")
 
     outcome = post_confirmed_report(json_path, posted_by=user.name)
     if not outcome.ok:
@@ -924,9 +1029,8 @@ def coll_post_action(request: Request, stem: str, action: str = Form(default="")
             message = f"Post failed: {outcome.error}"
         return _tmpl("error.html", request, user=user, message=message)
 
-    return _tmpl("message.html", request, user=user,
-                 message=f"Posted. {outcome.paid_count} vouchers collected. Total: {outcome.total_collected}",
-                 back="/menu")
+    return _redirect_ok(
+        "/menu", f"Posted. {outcome.paid_count} vouchers collected. Total: {outcome.total_collected}")
 
 
 # ---------------------------------------------------------------------------
@@ -959,12 +1063,22 @@ def voucher_detail(request: Request, bill_no: str, fragment: int = 0,
             can_raise = "raise_correction" in load_permissions().get(user.role, frozenset())
         except FileNotFoundError:
             can_raise = False
+    # Standalone — unlike Raise Correction, not tied to an approval-review
+    # context: the Amend Voucher editor itself isn't stage-gated, so its
+    # request mechanism shouldn't be either.
+    can_request_amend = False
+    if not is_completed:
+        try:
+            can_request_amend = "raise_amendment_request" in load_permissions().get(user.role, frozenset())
+        except FileNotFoundError:
+            can_request_amend = False
     # Inline expand gets the slim installments-only partial; the standalone
     # page (and Voucher Search's include) keep the full card.
     template = "_voucher_inline.html" if fragment else "voucher.html"
     return _tmpl(template, request, user=user,
                  voucher=voucher, installments=installments, is_completed=is_completed,
-                 correct_from=correct_from, can_raise=can_raise)
+                 correct_from=correct_from, can_raise=can_raise,
+                 can_request_amend=can_request_amend)
 
 
 # ---------------------------------------------------------------------------
@@ -1057,11 +1171,21 @@ def _render_correction_form(request, user, voucher, installments, back, error=No
             staged_payment = (sv.get("payment") or "").strip()
     existing = [c for c in load_corrections()
                 if c["bill_no"] == voucher["bill_no"]][:10]
+    # The amendment-request cross-link only makes sense alongside the
+    # master-data kinds (Approve Collection List) — Approve Collections only
+    # ever offers collection_amount, which an amendment never touches.
+    can_request_amend = False
+    if "collection_amount" not in kinds:
+        try:
+            can_request_amend = "raise_amendment_request" in load_permissions().get(user.role, frozenset())
+        except FileNotFoundError:
+            can_request_amend = False
     return _tmpl("coll/correction_form.html", request, user=user,
                  voucher=voucher, installments=installments, back=back,
                  kinds=kinds, kind_labels=_KIND_LABELS,
                  staged_payment=staged_payment,
-                 existing=existing, error=error)
+                 existing=existing, error=error,
+                 can_request_amend=can_request_amend)
 
 
 def _load_correction_target(request, user, bill_no):
@@ -1295,7 +1419,7 @@ def coll_correction_action(request: Request, cid: int,
             if corr["kind"] == "collection_amount"
             else "Correction applied — master data updated and staged balances refreshed.")
            if action == "apply" else "Correction rejected.")
-    return _tmpl("message.html", request, user=user, message=msg, back=back)
+    return _redirect_ok(back, msg)
 
 
 # ---------------------------------------------------------------------------
@@ -1333,10 +1457,12 @@ def _render_amend_form(request, user, bill_no, voucher, installments, snapshot, 
     except Exception as e:
         return _tmpl("error.html", request, user=user, message=str(e))
     history = load_amendments(bill_no=bill_no, limit=10)
+    open_requests = open_amendment_requests_for_bills([bill_no]).get(bill_no, [])
     return _tmpl("coll/amend_form.html", request, user=user,
                  bill_no=bill_no, voucher=voucher, installments=installments,
                  beats=beats, salesmen=salesmen,
-                 snapshot_json=json.dumps(snapshot), history=history, error=error)
+                 snapshot_json=json.dumps(snapshot), history=history, error=error,
+                 open_requests=open_requests)
 
 
 @app.get("/coll/amend", response_class=HTMLResponse)
@@ -1483,9 +1609,7 @@ async def coll_amend_submit(request: Request, bill_no: str):
         return rerender(str(e))
 
     balance = amendment["new"]["voucher"]["balance"]
-    return _tmpl("message.html", request, user=user,
-                 message=f"Amendment applied — new balance {balance}.",
-                 back="/coll/amend")
+    return _redirect_ok("/coll/amend", f"Amendment applied — new balance {balance}.")
 
 
 @app.get("/coll/amendments", response_class=HTMLResponse)
@@ -1506,6 +1630,845 @@ def coll_amendment_review(request: Request, aid: int):
     if amendment is None:
         return _tmpl("error.html", request, user=user, message="Amendment not found.")
     return _tmpl("coll/amendment_review.html", request, user=user, amendment=amendment)
+
+
+# ---------------------------------------------------------------------------
+# Amendment Requests
+# ---------------------------------------------------------------------------
+
+def _can_view_amend_requests(user):
+    try:
+        perms = load_permissions().get(user.role, frozenset())
+    except FileNotFoundError:
+        return False
+    return "raise_amendment_request" in perms or "amend_voucher" in perms
+
+
+def _require_amend_requests_view(request):
+    """Like _require(), but for the OR of raise_amendment_request/amend_voucher
+    — both raisers and the distributor who resolves them may view."""
+    user = _get_user(request)
+    if not user:
+        return None, _r("/login")
+    if not _can_view_amend_requests(user):
+        return user, _tmpl("error.html", request, user=user,
+                           message="You don't have permission for this action.")
+    return user, None
+
+
+def _load_amend_request_target(request, user, bill_no):
+    """Resolve an active (non-completed) voucher for an amendment request, or an error page."""
+    result = search_voucher(bill_no)
+    if result is None:
+        return None, _tmpl("error.html", request, user=user,
+                           message=f"No voucher found for: {bill_no.strip()}")
+    voucher, installments, is_completed = result
+    if is_completed:
+        return None, _tmpl("error.html", request, user=user,
+                           message="Completed vouchers cannot have an amendment requested.")
+    return (voucher, installments), None
+
+
+def _render_amend_request_form(request, user, voucher, installments, back, error=None):
+    existing = [r for r in load_amendment_requests()
+                if r["bill_no"] == voucher["bill_no"]][:10]
+    return _tmpl("coll/amend_request_form.html", request, user=user,
+                 voucher=voucher, installments=installments, back=back,
+                 existing=existing, error=error)
+
+
+@app.get("/coll/amend-request", response_class=HTMLResponse)
+def coll_amend_request_pick(request: Request, q: str = ""):
+    user, err = _require(request, "raise_amendment_request")
+    if err:
+        return err
+    error = None
+    if q.strip():
+        bill_no = q.strip()
+        result = search_voucher(bill_no)
+        if result is None:
+            error = f"No voucher found for: {bill_no}"
+        elif result[2]:
+            error = "Completed vouchers cannot have an amendment requested."
+        else:
+            return _r(f"/coll/amend-request/{bill_no}")
+    return _tmpl("coll/amend_request_pick.html", request, user=user, q=q, error=error)
+
+
+@app.get("/coll/amend-request/{bill_no}", response_class=HTMLResponse)
+def coll_amend_request_form(request: Request, bill_no: str,
+                            from_path: str = Query(default="/coll/amend-requests", alias="from")):
+    user, err = _require(request, "raise_amendment_request")
+    if err:
+        return err
+    target, err = _load_amend_request_target(request, user, bill_no)
+    if err:
+        return err
+    voucher, installments = target
+    return _render_amend_request_form(request, user, voucher, installments,
+                                      back=_safe_from(from_path))
+
+
+@app.post("/coll/amend-request/{bill_no}", response_class=HTMLResponse)
+def coll_amend_request_submit(request: Request, bill_no: str,
+                              action: str = Form(default="raise"),
+                              note: str = Form(default=""),
+                              req_id: str = Form(default=""),
+                              from_path: str = Form(default="/coll/amend-requests", alias="from")):
+    user, err = _require(request, "raise_amendment_request")
+    if err:
+        return err
+    back = _safe_from(from_path)
+    target, err = _load_amend_request_target(request, user, bill_no)
+    if err:
+        return err
+    voucher, installments = target
+
+    def form_error(msg):
+        return _render_amend_request_form(request, user, voucher, installments,
+                                          back=back, error=msg)
+
+    if action == "withdraw":
+        req = load_amendment_request(int(req_id)) if req_id.isdigit() else None
+        if (req is None or req["bill_no"] != voucher["bill_no"]
+                or req["requested_by"] != user.name):
+            return form_error("Only your own requests for this voucher can be withdrawn.")
+        try:
+            resolve_amendment_request(req["id"], "withdraw", user.name)
+        except ValueError as e:
+            return form_error(str(e))
+        return _r(f"/coll/amend-request/{voucher['bill_no']}?from={back}")
+
+    note = note.strip()
+    if not note:
+        return form_error("Describe what needs to be amended.")
+    try:
+        raise_amendment_request(voucher["bill_no"], user.name, note)
+    except ValueError as e:
+        return form_error(str(e))
+    return _r(back)
+
+
+@app.get("/coll/amend-requests", response_class=HTMLResponse)
+def coll_amend_requests(request: Request):
+    user, err = _require_amend_requests_view(request)
+    if err:
+        return err
+    perms = load_permissions().get(user.role, frozenset())
+    can_resolve = "amend_voucher" in perms
+    can_raise = "raise_amendment_request" in perms
+    active, history = [], []
+    for req in load_amendment_requests():
+        if req["status"] == "open":
+            active.append(req)
+        else:
+            history.append(req)
+    return _tmpl("coll/amend_requests.html", request, user=user,
+                 active=active, history=history[:20],
+                 can_resolve=can_resolve, can_raise=can_raise)
+
+
+@app.get("/coll/amend-requests/{req_id}", response_class=HTMLResponse)
+def coll_amend_request_review(request: Request, req_id: int, next: str = ""):
+    user, err = _require_amend_requests_view(request)
+    if err:
+        return err
+    req = load_amendment_request(req_id)
+    if req is None:
+        return _tmpl("error.html", request, user=user, message="Amendment request not found.")
+    result = search_voucher(req["bill_no"])
+    voucher = installments = None
+    if result is not None:
+        voucher, installments, _completed = result
+    can_resolve = "amend_voucher" in load_permissions().get(user.role, frozenset())
+    back = _safe_from(next) if next else "/coll/amend-requests"
+    return _tmpl("coll/amend_request_review.html", request, user=user,
+                 req=req, voucher=voucher, installments=installments,
+                 back=back, can_resolve=can_resolve)
+
+
+@app.post("/coll/amend-requests/{req_id}", response_class=HTMLResponse)
+def coll_amend_request_action(request: Request, req_id: int,
+                              action: str = Form(default=""),
+                              resolution_note: str = Form(default=""),
+                              next: str = Form(default="/coll/amend-requests")):
+    user, err = _require(request, "amend_voucher")
+    if err:
+        return err
+    back = _safe_from(next)
+    if action != "reject":
+        return _r(back)
+    try:
+        resolve_amendment_request(req_id, "reject", user.name, resolution_note.strip())
+    except ValueError as e:
+        return _tmpl("error.html", request, user=user, message=str(e))
+    return _redirect_ok(back, "Amendment request rejected.")
+
+
+# ---------------------------------------------------------------------------
+# Checks (view: everyone with view_checks; resolve: distributor only)
+# ---------------------------------------------------------------------------
+
+@app.get("/coll/checks", response_class=HTMLResponse)
+def coll_checks(request: Request):
+    user, err = _require(request, "view_checks")
+    if err:
+        return err
+    perms = load_permissions().get(user.role, frozenset())
+    can_resolve = "resolve_check" in perms
+    today = datetime.now().date()
+    today_iso = today.isoformat()
+    due_by_iso = (today + timedelta(days=2)).isoformat()
+    due_soon, overdue, pending_later, bounced, encashed = [], [], [], [], []
+    for c in load_checks():
+        if c["status"] == "pending":
+            if c["check_date"] < today_iso:
+                overdue.append(c)
+            elif c["check_date"] <= due_by_iso:
+                due_soon.append(c)
+            else:
+                pending_later.append(c)
+        elif c["status"] == "bounced":
+            bounced.append(c)
+        else:
+            encashed.append(c)
+    return _tmpl("coll/checks.html", request, user=user, can_resolve=can_resolve,
+                 due_soon=due_soon, overdue=overdue, pending_later=pending_later,
+                 bounced=bounced, encashed=encashed)
+
+
+@app.post("/coll/checks/{check_id}", response_class=HTMLResponse)
+def coll_checks_action(request: Request, check_id: int,
+                       action: str = Form(default=""),
+                       resolution_note: str = Form(default="")):
+    user, err = _require(request, "resolve_check")
+    if err:
+        return err
+    if action not in ("encash", "bounce"):
+        return _r("/coll/checks")
+    try:
+        resolve_check(check_id, action, user.name, resolution_note.strip())
+    except ValueError as e:
+        return _tmpl("error.html", request, user=user, message=str(e))
+    verb = "encashed" if action == "encash" else "marked bounced"
+    return _redirect_ok("/coll/checks", f"Check {verb}.")
+
+
+# ---------------------------------------------------------------------------
+# Onboarding New Vouchers (web-only): Import -> Salesman Review ->
+# Distributor Resolve -> Post. See CLAUDE.md "Voucher Amendment" /
+# "Amendment Requests" sections for the live-data analogues this mirrors;
+# unlike those, everything here lives inside the addv*.json staging file
+# itself (batch_data["flags"], per-voucher "review_status") since staged
+# vouchers aren't posted to master data yet — no DB, no snapshot/conflict
+# checks needed, the whole batch is one JSON file held for the request.
+# ---------------------------------------------------------------------------
+
+def _load_addv_report(stem: str):
+    """Resolve a client-supplied addv batch stem to (json_path, report_data).
+    Same contract as _load_staging_report: (None, None) for a malformed
+    stem, a missing file, or unreadable/non-dict JSON."""
+    if not stem or not _STEM_RE.match(stem):
+        return None, None
+    path = STAGING_DIR / f"{stem}.json"
+    if not path.exists():
+        return None, None
+    try:
+        data = load_report_json(path)
+    except Exception:
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    return path, data
+
+
+def _require_any(request: Request, permissions):
+    """Like _require(), but authorised if the user holds ANY of several
+    permission keys — the onboarding hub is a shared landing page for every
+    role in this pipeline (importer, reviewer, resolver, poster)."""
+    user = _get_user(request)
+    if not user:
+        return None, _r("/login")
+    if user.must_change_password and request.url.path not in _FORCED_CHANGE_ALLOWED_PATHS:
+        return user, _r("/profile?forced=1")
+    try:
+        perms = load_permissions().get(user.role, frozenset())
+    except FileNotFoundError:
+        perms = frozenset()
+    if not any(p in perms for p in permissions):
+        return user, _tmpl("error.html", request, user=user,
+                           message="You don't have permission for this action.")
+    return user, None
+
+
+@app.get("/coll/import-vouchers", response_class=HTMLResponse)
+def coll_import_vouchers_form(request: Request):
+    user, err = _require(request, "import_vouchers")
+    if err:
+        return err
+    return _tmpl("coll/import_vouchers.html", request, user=user, error=None)
+
+
+@app.post("/coll/import-vouchers", response_class=HTMLResponse)
+async def coll_import_vouchers_submit(request: Request,
+                                      vouchers_file: UploadFile = File(...),
+                                      installments_file: UploadFile = File(default=None)):
+    user, err = _require(request, "import_vouchers")
+    if err:
+        return err
+
+    def form_error(msg):
+        return _tmpl("coll/import_vouchers.html", request, user=user, error=msg)
+
+    def read_csv_upload(upload):
+        text = upload.file.read().decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(text))
+        return list(reader.fieldnames or []), list(reader)
+
+    try:
+        v_fields, voucher_rows = read_csv_upload(vouchers_file)
+    except Exception as e:
+        return form_error(f"Error reading vouchers CSV: {e}")
+
+    required_v = {"bill_no", "date", "amount", "beat", "salesman"}
+    missing_v = required_v - set(v_fields)
+    if missing_v:
+        return form_error(f"Vouchers CSV missing required columns: {', '.join(sorted(missing_v))}")
+    if not voucher_rows:
+        return form_error("Vouchers CSV has no data rows.")
+
+    inst_rows = []
+    if installments_file is not None and installments_file.filename:
+        try:
+            i_fields, inst_rows = read_csv_upload(installments_file)
+        except Exception as e:
+            return form_error(f"Error reading installments CSV: {e}")
+        required_i = {"bill_no", "date", "amount", "salesman"}
+        missing_i = required_i - set(i_fields)
+        if missing_i:
+            return form_error(f"Installments CSV missing required columns: {', '.join(sorted(missing_i))}")
+
+    beats = load_beats(user)
+    salesmen = load_salesmen()
+    existing_bill_nos = load_all_existing_bill_nos() | load_addv_staged_bill_nos()
+    now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    errors, vouchers, installments = validate_addv_batch(
+        voucher_rows, inst_rows, existing_bill_nos,
+        set(beats), set(salesmen), user.name, now_str,
+    )
+    if errors:
+        return form_error("; ".join(errors[:20]) + (" …" if len(errors) > 20 else ""))
+
+    for v in vouchers:
+        v["review_status"] = "pending"
+
+    ensure_staging_dir()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_user = sanitize_filename_component(user.name)
+    json_path = STAGING_DIR / f"addv{timestamp}-{safe_user}.json"
+    report_data = {
+        "type": "add_vouchers",
+        "mode": "batch",
+        "created_by": user.name,
+        "created_at": now_str,
+        "stage": "added",
+        "stages": {"add": "done", "confirm": "", "post": ""},
+        "vouchers": vouchers,
+        "installments": installments,
+        "flags": [],
+    }
+    save_report_json(json_path, report_data)
+    return _redirect_ok("/coll/new-vouchers", f"Imported {len(vouchers)} voucher(s) for review.")
+
+
+_ADDV_STATUS_LABELS = {
+    "pending_review": ("Pending Review", "warn"),
+    "awaiting_resolution": ("Awaiting Resolution", "warn"),
+    "ready_to_post": ("Ready to Post", "ok"),
+    "posted": ("Posted", "muted"),
+}
+
+
+@app.get("/coll/new-vouchers", response_class=HTMLResponse)
+def coll_new_vouchers_hub(request: Request):
+    user, err = _require_any(request, ("import_vouchers", "raise_correction",
+                                       "amend_voucher", "post_new_vouchers"))
+    if err:
+        return err
+    perms = load_permissions().get(user.role, frozenset())
+    batches = []
+    for path, data in load_addv_batches():
+        st = addv_batch_status(data)
+        label, badge = _ADDV_STATUS_LABELS[st["status"]]
+        batches.append({
+            "stem": path.stem, "data": data, "status": st["status"],
+            "label": label, "badge": badge,
+            "total": st["total"], "reviewed": st["reviewed"], "open_flags": st["open_flags"],
+        })
+    return _tmpl("coll/new_vouchers.html", request, user=user, batches=batches,
+                 can_reject="post_new_vouchers" in perms)
+
+
+@app.post("/coll/new-vouchers/{stem}/reject", response_class=HTMLResponse)
+def coll_new_vouchers_reject(request: Request, stem: str):
+    user, err = _require(request, "post_new_vouchers")
+    if err:
+        return err
+    json_path, data = _load_addv_report(stem)
+    if json_path is None:
+        return _tmpl("error.html", request, user=user, message="Batch not found.")
+    reject_addv_batch(json_path)
+    return _redirect_ok("/coll/new-vouchers", "Batch rejected and discarded.")
+
+
+# --- Salesman review -------------------------------------------------------
+
+@app.get("/coll/new-vouchers/{stem}/review", response_class=HTMLResponse)
+def coll_new_vouchers_review_list(request: Request, stem: str):
+    user, err = _require(request, "raise_correction")
+    if err:
+        return err
+    json_path, data = _load_addv_report(stem)
+    if json_path is None:
+        return _tmpl("error.html", request, user=user, message="Batch not found.")
+    mine = addv_vouchers_for_salesman(data, user.name)
+    return _tmpl("coll/new_vouchers_review.html", request, user=user,
+                 stem=stem, vouchers=mine)
+
+
+def _render_addv_review_item(request, user, stem, data, bill_no, error=None):
+    voucher = next((v for v in data.get("vouchers", []) if v.get("bill_no") == bill_no), None)
+    if voucher is None:
+        return _tmpl("error.html", request, user=user, message="Voucher not found in this batch.")
+    installments = [i for i in data.get("installments", []) if i.get("bill_no") == bill_no]
+    my_flags = [f for f in data.get("flags", []) if f.get("bill_no") == bill_no]
+    return _tmpl("coll/new_vouchers_review_item.html", request, user=user,
+                 stem=stem, voucher=voucher, installments=installments,
+                 kinds=ADDV_FLAG_KINDS, flags=my_flags, error=error)
+
+
+@app.get("/coll/new-vouchers/{stem}/review/{bill_no}", response_class=HTMLResponse)
+def coll_new_vouchers_review_item(request: Request, stem: str, bill_no: str):
+    user, err = _require(request, "raise_correction")
+    if err:
+        return err
+    json_path, data = _load_addv_report(stem)
+    if json_path is None:
+        return _tmpl("error.html", request, user=user, message="Batch not found.")
+    return _render_addv_review_item(request, user, stem, data, bill_no)
+
+
+@app.post("/coll/new-vouchers/{stem}/review/{bill_no}", response_class=HTMLResponse)
+def coll_new_vouchers_review_submit(request: Request, stem: str, bill_no: str,
+                                    action: str = Form(default="clear"),
+                                    kind: str = Form(default=""),
+                                    installment_index: str = Form(default=""),
+                                    new_amount: str = Form(default=""),
+                                    new_date: str = Form(default=""),
+                                    note: str = Form(default="")):
+    user, err = _require(request, "raise_correction")
+    if err:
+        return err
+    json_path, data = _load_addv_report(stem)
+    if json_path is None:
+        return _tmpl("error.html", request, user=user, message="Batch not found.")
+
+    def item_error(msg):
+        return _render_addv_review_item(request, user, stem, data, bill_no, error=msg)
+
+    now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    if action == "clear":
+        try:
+            clear_addv_review(data, bill_no, user.name)
+        except ValueError as e:
+            return item_error(str(e))
+        save_report_json(json_path, data)
+        return _r(f"/coll/new-vouchers/{stem}/review")
+
+    if kind not in ADDV_FLAG_KINDS:
+        return item_error("Choose what kind of issue to raise.")
+
+    installments = [i for i in data.get("installments", []) if i.get("bill_no") == bill_no]
+    target = new = None
+    if kind in ("installment_amount", "installment_delete"):
+        if not installment_index.isdigit() or int(installment_index) >= len(installments):
+            return item_error("Pick the installment this issue applies to.")
+        inst = installments[int(installment_index)]
+        target = {"date": inst["date"], "amount": inst["amount"]}
+        if kind == "installment_amount":
+            amount = _valid_amount(new_amount)
+            if amount is None:
+                return item_error("Enter a valid corrected amount (positive, max 2 decimals).")
+            new = {"amount": amount}
+    elif kind == "installment_add":
+        amount = _valid_amount(new_amount)
+        if amount is None:
+            return item_error("Enter a valid installment amount (positive, max 2 decimals).")
+        date = _valid_past_date(new_date)
+        if date is None:
+            return item_error("Enter a valid installment date (YYYY-MM-DD, not in the future).")
+        new = {"date": date, "amount": amount}
+    elif kind == "voucher_amount":
+        amount = _valid_amount(new_amount)
+        if amount is None:
+            return item_error("Enter a valid voucher amount (positive, max 2 decimals).")
+        new = {"amount": amount}
+
+    try:
+        raise_addv_flag(data, bill_no, kind, note, user.name, now_str, target=target, new=new)
+    except ValueError as e:
+        return item_error(str(e))
+    save_report_json(json_path, data)
+    return _r(f"/coll/new-vouchers/{stem}/review")
+
+
+# --- Distributor resolve ----------------------------------------------------
+
+@app.get("/coll/new-vouchers/{stem}/resolve", response_class=HTMLResponse)
+def coll_new_vouchers_resolve_list(request: Request, stem: str):
+    user, err = _require(request, "amend_voucher")
+    if err:
+        return err
+    json_path, data = _load_addv_report(stem)
+    if json_path is None:
+        return _tmpl("error.html", request, user=user, message="Batch not found.")
+    open_flags = [f for f in data.get("flags", []) if f.get("status") == "open"]
+    return _tmpl("coll/new_vouchers_resolve.html", request, user=user,
+                 stem=stem, flags=open_flags, kinds=ADDV_FLAG_KINDS)
+
+
+def _render_addv_resolve_item(request, user, stem, data, flag_id, error=None):
+    flag = next((f for f in data.get("flags", []) if f.get("id") == flag_id), None)
+    if flag is None:
+        return _tmpl("error.html", request, user=user, message="Flag not found in this batch.")
+    voucher = next((v for v in data.get("vouchers", []) if v.get("bill_no") == flag["bill_no"]), None)
+    installments = [i for i in data.get("installments", []) if i.get("bill_no") == flag["bill_no"]]
+    return _tmpl("coll/new_vouchers_resolve_item.html", request, user=user,
+                 stem=stem, flag=flag, kind_label=ADDV_FLAG_KINDS.get(flag["kind"], flag["kind"]),
+                 voucher=voucher, installments=installments,
+                 beats=load_beats_raw(), salesmen=load_salesmen(), error=error)
+
+
+@app.get("/coll/new-vouchers/{stem}/resolve/{flag_id}", response_class=HTMLResponse)
+def coll_new_vouchers_resolve_item(request: Request, stem: str, flag_id: int):
+    user, err = _require(request, "amend_voucher")
+    if err:
+        return err
+    json_path, data = _load_addv_report(stem)
+    if json_path is None:
+        return _tmpl("error.html", request, user=user, message="Batch not found.")
+    return _render_addv_resolve_item(request, user, stem, data, flag_id)
+
+
+@app.post("/coll/new-vouchers/{stem}/resolve/{flag_id}", response_class=HTMLResponse)
+def coll_new_vouchers_resolve_submit(request: Request, stem: str, flag_id: int,
+                                     voucher_date: str = Form(default=""),
+                                     voucher_amount: str = Form(default=""),
+                                     voucher_beat: str = Form(default=""),
+                                     voucher_salesman: str = Form(default=""),
+                                     inst_date: List[str] = Form(default=[]),
+                                     inst_amount: List[str] = Form(default=[]),
+                                     inst_remove: List[str] = Form(default=[])):
+    user, err = _require(request, "amend_voucher")
+    if err:
+        return err
+    json_path, data = _load_addv_report(stem)
+    if json_path is None:
+        return _tmpl("error.html", request, user=user, message="Batch not found.")
+
+    def item_error(msg):
+        return _render_addv_resolve_item(request, user, stem, data, flag_id, error=msg)
+
+    amount = _valid_amount(voucher_amount)
+    if amount is None:
+        return item_error("Enter a valid voucher amount (positive, max 2 decimals).")
+    date = _valid_past_date(voucher_date)
+    if date is None:
+        return item_error("Enter a valid voucher date (YYYY-MM-DD, not in the future).")
+    if not voucher_beat or not voucher_salesman:
+        return item_error("Beat and salesman are required.")
+
+    installments = []
+    for i, (d, a) in enumerate(zip(inst_date, inst_amount)):
+        if str(i) in inst_remove or not d.strip() or not a.strip():
+            continue
+        row_amount = _valid_amount(a)
+        row_date = _valid_past_date(d)
+        if row_amount is None or row_date is None:
+            return item_error("Every installment row needs a valid date and amount.")
+        installments.append({"date": row_date, "amount": row_amount})
+
+    now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        resolve_addv_flag(
+            data, flag_id,
+            {"date": date, "amount": amount, "beat": voucher_beat, "salesman": voucher_salesman},
+            installments, user.name, now_str,
+        )
+    except ValueError as e:
+        return item_error(str(e))
+    save_report_json(json_path, data)
+    return _r(f"/coll/new-vouchers/{stem}/resolve")
+
+
+# --- Post New Vouchers -------------------------------------------------------
+
+@app.get("/coll/new-vouchers/{stem}/post", response_class=HTMLResponse)
+def coll_new_vouchers_post_review(request: Request, stem: str):
+    user, err = _require(request, "post_new_vouchers")
+    if err:
+        return err
+    json_path, data = _load_addv_report(stem)
+    if json_path is None:
+        return _tmpl("error.html", request, user=user, message="Batch not found.")
+    st = addv_batch_status(data)
+    vouchers = sorted(data.get("vouchers", []), key=lambda v: bill_no_sort_key(v["bill_no"]))
+    total_amount = sum(parse_decimal(v.get("amount")) for v in vouchers)
+    total_installments = sum(parse_decimal(i.get("amount")) for i in data.get("installments", []))
+    return _tmpl("coll/new_vouchers_post.html", request, user=user,
+                 stem=stem, data=data, vouchers=vouchers, status=st,
+                 total_amount=total_amount, total_installments=total_installments)
+
+
+@app.post("/coll/new-vouchers/{stem}/post", response_class=HTMLResponse)
+def coll_new_vouchers_post_action(request: Request, stem: str, action: str = Form(default="")):
+    user, err = _require(request, "post_new_vouchers")
+    if err:
+        return err
+    if action != "post":
+        return _r(f"/coll/new-vouchers/{stem}/post")
+    json_path, data = _load_addv_report(stem)
+    if json_path is None:
+        return _tmpl("error.html", request, user=user, message="Batch not found.")
+    st = addv_batch_status(data)
+    if st["status"] != "ready_to_post":
+        return _tmpl("error.html", request, user=user,
+                     message="This batch isn't ready to post yet — every voucher must be "
+                             "reviewed and every raised issue resolved first.")
+
+    vouchers = data.get("vouchers", [])
+    installments = data.get("installments", [])
+    write_new_vouchers(vouchers)
+    write_new_installments(installments)
+
+    data["stages"]["confirm"] = "confirmed"
+    data["stages"]["post"] = "confirmed"
+    data["stage"] = "finalized"
+    save_report_json(json_path, data)
+    archive_files([json_path])
+
+    return _redirect_ok("/coll/new-vouchers",
+                        f"Posted. {len(vouchers)} voucher(s), {len(installments)} installment(s) written.")
+
+
+# ---------------------------------------------------------------------------
+# Manage Users (web-only, distributor-only)
+# ---------------------------------------------------------------------------
+
+@app.get("/manage/users", response_class=HTMLResponse)
+def manage_users_list(request: Request):
+    user, err = _require(request, "manage_users")
+    if err:
+        return err
+    return _tmpl("manage/users_list.html", request, user=user, users=load_users_admin())
+
+
+@app.get("/manage/users/new", response_class=HTMLResponse)
+def manage_users_new_form(request: Request):
+    user, err = _require(request, "manage_users")
+    if err:
+        return err
+    return _tmpl("manage/user_form.html", request, user=user, mode="create",
+                 roles=ASSIGNABLE_ROLES, target=None, error=None)
+
+
+@app.post("/manage/users/new", response_class=HTMLResponse)
+def manage_users_new_submit(request: Request,
+                            name: str = Form(default=""),
+                            role: str = Form(default=""),
+                            password: str = Form(default=""),
+                            confirm_password: str = Form(default="")):
+    user, err = _require(request, "manage_users")
+    if err:
+        return err
+    try:
+        create_user(name.strip(), role, password, confirm_password)
+    except ValueError as e:
+        return _tmpl("manage/user_form.html", request, user=user, mode="create",
+                     roles=ASSIGNABLE_ROLES, target={"name": name, "role": role}, error=str(e))
+    return _redirect_ok("/manage/users", f"User '{name.strip()}' created.")
+
+
+@app.get("/manage/users/{name}/edit", response_class=HTMLResponse)
+def manage_users_edit_form(request: Request, name: str):
+    user, err = _require(request, "manage_users")
+    if err:
+        return err
+    target = load_user(name)
+    if target is None:
+        return _tmpl("error.html", request, user=user, message=f"User '{name}' not found.")
+    return _tmpl("manage/user_form.html", request, user=user, mode="edit",
+                 roles=ASSIGNABLE_ROLES, target=target, error=None)
+
+
+@app.post("/manage/users/{name}/edit", response_class=HTMLResponse)
+def manage_users_edit_submit(request: Request, name: str, role: str = Form(default="")):
+    user, err = _require(request, "manage_users")
+    if err:
+        return err
+    try:
+        update_user_role(name, role)
+    except ValueError as e:
+        target = load_user(name) or {"name": name, "role": role, "must_change_password": False}
+        return _tmpl("manage/user_form.html", request, user=user, mode="edit",
+                     roles=ASSIGNABLE_ROLES, target=target, error=str(e))
+    return _redirect_ok("/manage/users", f"User '{name}' updated.")
+
+
+@app.post("/manage/users/{name}/delete", response_class=HTMLResponse)
+def manage_users_delete(request: Request, name: str):
+    user, err = _require(request, "manage_users")
+    if err:
+        return err
+    try:
+        delete_user(name, current_user_name=user.name)
+    except ValueError as e:
+        return _tmpl("error.html", request, user=user, message=str(e))
+    return _redirect_ok("/manage/users", f"User '{name}' deleted.")
+
+
+@app.get("/manage/users/{name}/reset-password", response_class=HTMLResponse)
+def manage_users_reset_password_form(request: Request, name: str):
+    user, err = _require(request, "manage_users")
+    if err:
+        return err
+    target = load_user(name)
+    if target is None:
+        return _tmpl("error.html", request, user=user, message=f"User '{name}' not found.")
+    return _tmpl("manage/user_reset_password.html", request, user=user, target=target, error=None)
+
+
+@app.post("/manage/users/{name}/reset-password", response_class=HTMLResponse)
+def manage_users_reset_password_submit(request: Request, name: str,
+                                       new_password: str = Form(default=""),
+                                       confirm_password: str = Form(default="")):
+    user, err = _require(request, "manage_users")
+    if err:
+        return err
+    try:
+        reset_user_password(name, new_password, confirm_password)
+    except ValueError as e:
+        target = load_user(name) or {"name": name}
+        return _tmpl("manage/user_reset_password.html", request, user=user, target=target, error=str(e))
+    return _redirect_ok("/manage/users",
+                        f"Password reset for '{name}' — they must set a new password at next login.")
+
+
+# ---------------------------------------------------------------------------
+# Manage Beats (web-only, distributor-only)
+# ---------------------------------------------------------------------------
+
+@app.get("/manage/beats", response_class=HTMLResponse)
+def manage_beats_list(request: Request):
+    user, err = _require(request, "manage_beats")
+    if err:
+        return err
+    return _tmpl("manage/beats_list.html", request, user=user, beats=load_beats_raw())
+
+
+@app.get("/manage/beats/new", response_class=HTMLResponse)
+def manage_beats_new_form(request: Request):
+    user, err = _require(request, "manage_beats")
+    if err:
+        return err
+    return _tmpl("manage/beat_form.html", request, user=user, mode="create",
+                 salesmen=load_salesmen(), target=None, error=None)
+
+
+@app.post("/manage/beats/new", response_class=HTMLResponse)
+def manage_beats_new_submit(request: Request,
+                            name: str = Form(default=""),
+                            salesman: str = Form(default="")):
+    user, err = _require(request, "manage_beats")
+    if err:
+        return err
+    try:
+        create_beat(name.strip(), salesman)
+    except ValueError as e:
+        return _tmpl("manage/beat_form.html", request, user=user, mode="create",
+                     salesmen=load_salesmen(), target={"name": name, "salesman": salesman}, error=str(e))
+    return _redirect_ok("/manage/beats", f"Beat '{name.strip()}' created.")
+
+
+@app.get("/manage/beats/{name}/edit", response_class=HTMLResponse)
+def manage_beats_edit_form(request: Request, name: str):
+    user, err = _require(request, "manage_beats")
+    if err:
+        return err
+    target = next((b for b in load_beats_raw() if b["name"] == name), None)
+    if target is None:
+        return _tmpl("error.html", request, user=user, message=f"Beat '{name}' not found.")
+    return _tmpl("manage/beat_form.html", request, user=user, mode="edit",
+                 salesmen=load_salesmen(), target=target, error=None)
+
+
+@app.post("/manage/beats/{name}/edit", response_class=HTMLResponse)
+def manage_beats_edit_submit(request: Request, name: str, salesman: str = Form(default="")):
+    user, err = _require(request, "manage_beats")
+    if err:
+        return err
+    try:
+        update_beat_salesman(name, salesman)
+    except ValueError as e:
+        target = {"name": name, "salesman": salesman}
+        return _tmpl("manage/beat_form.html", request, user=user, mode="edit",
+                     salesmen=load_salesmen(), target=target, error=str(e))
+    return _redirect_ok("/manage/beats", f"Beat '{name}' updated.")
+
+
+@app.post("/manage/beats/{name}/delete", response_class=HTMLResponse)
+def manage_beats_delete(request: Request, name: str):
+    user, err = _require(request, "manage_beats")
+    if err:
+        return err
+    try:
+        delete_beat(name)
+    except ValueError as e:
+        return _tmpl("error.html", request, user=user, message=str(e))
+    return _redirect_ok("/manage/beats", f"Beat '{name}' deleted.")
+
+
+# ---------------------------------------------------------------------------
+# Profile (any authenticated user) — self-service password change
+# ---------------------------------------------------------------------------
+
+@app.get("/profile", response_class=HTMLResponse)
+def profile(request: Request, forced: str = ""):
+    user, err = _require(request)
+    if err:
+        return err
+    return _tmpl("profile.html", request, user=user, forced=bool(forced), error=None)
+
+
+@app.post("/profile/change-password", response_class=HTMLResponse)
+def profile_change_password(request: Request,
+                            current_password: str = Form(default=""),
+                            new_password: str = Form(default=""),
+                            confirm_password: str = Form(default=""),
+                            forced: str = Form(default="")):
+    user, err = _require(request)
+    if err:
+        return err
+    try:
+        change_own_password(user.name, current_password, new_password, confirm_password)
+    except ValueError as e:
+        return _tmpl("profile.html", request, user=user, forced=bool(forced), error=str(e))
+    token = request.cookies.get(_SESSION_COOKIE)
+    if token in _sessions:
+        _sessions[token] = user._replace(must_change_password=False)
+    return _redirect_ok("/profile", "Password changed.")
 
 
 # ---------------------------------------------------------------------------

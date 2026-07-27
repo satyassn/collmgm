@@ -16,6 +16,11 @@
   <span>{{ paid_count }} vouchers collected</span>
   <span class="summary-total">Total: <strong>{{ total_collected }}</strong></span>
 </div>
+<div class="summary-box summary-box--types">
+  <span>Cash: {{ type_totals.cash.count }} / <strong>{{ type_totals.cash.amount }}</strong></span>
+  <span>UPI: {{ type_totals.upi.count }} / <strong>{{ type_totals.upi.amount }}</strong></span>
+  <span>Check: {{ type_totals.check.count }} / <strong>{{ type_totals.check.amount }}</strong></span>
+</div>
 
 <table class="data-table stack-table" data-accordion>
   <thead>
@@ -26,16 +31,18 @@
       <th class="num">Total Paid</th>
       <th class="num">Balance</th>
       <th class="num">Payment</th>
+      <th>Type</th>
     </tr>
   </thead>
   <tbody>
     {% for v in vouchers %}
     <tr data-bill="{{ v.bill_no }}"
-        class="{% if v.correction_open %}row-correction{% elif v.verified %}row-verified{% elif v.get('payment') %}has-payment{% endif %}">
+        class="{% if v.correction_open %}row-correction{% elif v.verified %}row-verified{% elif v.salesman_mismatch %}row-correction{% elif v.get('payment') %}has-payment{% endif %}">
       <td class="mono">
         <a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}?correct=/coll/approve-submit/{{ stem }}">{{ v.bill_no }}</a>
         {% if v.correction_open %}<span class="badge badge-warn">Correction pending</span>
         {% elif v.correction_applied %}<span class="badge badge-ok">Correction applied</span>{% endif %}
+        {% if v.salesman_mismatch %}<span class="badge badge-warn">Different salesman</span>{% endif %}
       </td>
       <td>{{ v.get("voucher_date","") }}</td>
       <td class="num mono" data-label="Amt">{{ v.get("amount","") }}</td>
@@ -49,6 +56,13 @@
               aria-label="Verified {{ v.bill_no }}">
         </span>
       </td>
+      <td data-label="Type">
+        {% if v.get("payment") %}
+          {% if v.get("payment_type") == "upi" %}UPI &middot; {{ v.get("upi_txn_id","") }}
+          {% elif v.get("payment_type") == "check" %}Check &middot; {{ v.get("check_bank","") }} {{ v.get("check_no","") }} ({{ v.get("check_date","") }})
+          {% else %}Cash{% endif %}
+        {% else %}—{% endif %}
+      </td>
     </tr>
     {% endfor %}
   </tbody>
@@ -56,6 +70,7 @@
     <tr>
       <td colspan="5"><strong>Total collected</strong></td>
       <td class="num mono"><strong>{{ total_collected }}</strong></td>
+      <td></td>
     </tr>
   </tfoot>
 </table>

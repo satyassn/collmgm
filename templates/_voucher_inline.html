@@ -11,10 +11,16 @@
   {% else %}
     <p class="muted">No installments collected yet.</p>
   {% endif %}
-  {% if correct_from and can_raise %}
+  {% if (correct_from and can_raise) or can_request_amend %}
   <div class="inline-actions">
+    {% if correct_from and can_raise %}
     <a class="btn btn-sm btn-secondary"
        href="/coll/correct/{{ voucher.bill_no | urlencode }}?from={{ correct_from | urlencode }}">Raise Correction</a>
+    {% endif %}
+    {% if can_request_amend %}
+    <a class="btn btn-sm btn-secondary"
+       href="/coll/amend-request/{{ voucher.bill_no | urlencode }}">Request Amendment</a>
+    {% endif %}
   </div>
   {% endif %}
 </div>

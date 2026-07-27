@@ -8,6 +8,7 @@ import json
 import sys
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -254,7 +255,7 @@ class TestGenerateCollectionList(OrchestrateTestCase):
         return [{"bill_no": "1", "balance": "10.00", "voucher_date": "2026-01-01", "payment": ""}]
 
     def test_creates_report_and_acquires_lock(self):
-        outcome = coll_orchestrate.generate_collection_list("beat1", "sm1", self._vouchers())
+        outcome = coll_orchestrate.generate_collection_list("beat_salesman", ["beat1", "sm1"], self._vouchers())
         self.assertTrue(outcome.ok)
         self.assertTrue(outcome.json_path.exists())
         self.assertTrue(outcome.txt_path.exists())
@@ -266,10 +267,28 @@ class TestGenerateCollectionList(OrchestrateTestCase):
 
     def test_lock_conflict_returns_not_ok(self):
         self.assertTrue(coll_store.acquire_beat_lock("beat1"))
-        outcome = coll_orchestrate.generate_collection_list("beat1", "sm1", self._vouchers())
+        outcome = coll_orchestrate.generate_collection_list("beat_salesman", ["beat1", "sm1"], self._vouchers())
         self.assertFalse(outcome.ok)
         self.assertEqual(outcome.reason, "lock_conflict")
         self.assertIsNone(outcome.json_path)
+
+
+class TestGenerateCollectionListBeatOnly(DbTestCase):
+    def _vouchers(self):
+        return [{"bill_no": "1", "balance": "10.00", "voucher_date": "2026-01-01", "payment": ""}]
+
+    def test_beat_only_selection_derives_txt_salesman_from_master(self):
+        # A "beat"-type report carries no salesman in its own selection, but
+        # the TXT sidecar should still show the beat's assigned salesman
+        # (beats.salesman), derived via owning_salesman().
+        coll_store.create_user("sm1", "salesman", "password1", "password1")
+        coll_store.create_beat("beat9", "sm1")
+        outcome = coll_orchestrate.generate_collection_list("beat", ["beat9"], self._vouchers())
+        self.assertTrue(outcome.ok)
+        persisted = json.loads(outcome.json_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["selection_type"], "beat")
+        self.assertEqual(persisted["selection"], ["beat9"])
+        self.assertIn("sm1", outcome.txt_path.read_text(encoding="utf-8"))
 
 
 class TestApproveStartStage(OrchestrateTestCase):
@@ -302,7 +321,7 @@ class TestApproveStartStage(OrchestrateTestCase):
 class TestApplyStartApproval(OrchestrateTestCase):
     def _generated_report(self):
         outcome = coll_orchestrate.generate_collection_list(
-            "beat1", "sm1", [{"bill_no": "1", "balance": "10.00"}])
+            "beat_salesman", ["beat1", "sm1"], [{"bill_no": "1", "balance": "10.00"}])
         data = json.loads(outcome.json_path.read_text(encoding="utf-8"))
         return outcome.json_path, data
 
@@ -328,7 +347,7 @@ class TestApplyStartApproval(OrchestrateTestCase):
 class TestStartVerification(OrchestrateTestCase):
     def _generated_report(self):
         outcome = coll_orchestrate.generate_collection_list(
-            "beat1", "sm1",
+            "beat_salesman", ["beat1", "sm1"],
             [{"bill_no": "10", "balance": "10.00"}, {"bill_no": "2", "balance": "5.00"}])
         data = json.loads(outcome.json_path.read_text(encoding="utf-8"))
         return outcome.json_path, data
@@ -891,6 +910,24 @@ class TestValidateStagedReport(DbTestCase):
         errors = coll_orchestrate.validate_staged_report(data)
         self.assertTrue(any("30: beat/salesman mismatch" in e for e in errors))
 
+    def test_beat_only_report_ignores_salesman_mismatch(self):
+        # A "beat"-type combined report intentionally spans several
+        # salesmen — a per-voucher salesman that differs from the beat's
+        # assigned salesman is not a validation error (it's surfaced as a
+        # review flag elsewhere), only a beat mismatch still is.
+        data = self._staged(selection_type="beat", selection=["beat1"])
+        data["vouchers"][0]["salesman"] = "sm2"
+        errors = coll_orchestrate.validate_staged_report(data)
+        self.assertFalse(any("beat/salesman mismatch" in e for e in errors))
+
+    def test_beat_only_report_still_catches_beat_mismatch(self):
+        self._insert_voucher(bill_no="30", balance="10.00", beat="beat2", salesman="sm1")
+        data = self._staged(selection_type="beat", selection=["beat1"])
+        data["vouchers"].append({"bill_no": "30", "balance": "10.00", "payment": "",
+                                 "beat": "beat1", "salesman": "sm1"})
+        errors = coll_orchestrate.validate_staged_report(data)
+        self.assertTrue(any("30: beat mismatch" in e for e in errors))
+
     def test_duplicate_bill_no_in_report(self):
         data = self._staged()
         data["vouchers"].append(dict(data["vouchers"][0]))
@@ -1243,6 +1280,234 @@ class TestValidatePayment(unittest.TestCase):
             normalized, reason = coll_orchestrate.validate_payment("10", bad_balance)
             self.assertIsNone(normalized, bad_balance)
             self.assertIn("stored balance is invalid", reason)
+
+
+class TestValidatePaymentType(unittest.TestCase):
+    def test_cash_or_unset_needs_nothing(self):
+        self.assertIsNone(coll_orchestrate.validate_payment_type({}))
+        self.assertIsNone(coll_orchestrate.validate_payment_type({"payment_type": "cash"}))
+
+    def test_upi_requires_txn_id(self):
+        self.assertEqual(
+            coll_orchestrate.validate_payment_type({"payment_type": "upi"}),
+            "UPI transaction id is required")
+        self.assertIsNone(coll_orchestrate.validate_payment_type(
+            {"payment_type": "upi", "upi_txn_id": "TXN1"}))
+
+    def test_check_requires_bank_no_and_date(self):
+        base = {"payment_type": "check"}
+        self.assertEqual(coll_orchestrate.validate_payment_type(base), "check bank is required")
+        base["check_bank"] = "Bank A"
+        self.assertEqual(coll_orchestrate.validate_payment_type(base), "check number is required")
+        base["check_no"] = "CHK1"
+        self.assertEqual(coll_orchestrate.validate_payment_type(base), "check date is required")
+        base["check_date"] = "not-a-date"
+        self.assertIn("invalid check date", coll_orchestrate.validate_payment_type(base))
+        base["check_date"] = "2026-08-01"
+        self.assertIsNone(coll_orchestrate.validate_payment_type(base))
+
+    def test_unknown_payment_type_rejected(self):
+        reason = coll_orchestrate.validate_payment_type({"payment_type": "bitcoin"})
+        self.assertIn("unknown payment type", reason)
+
+
+class TestPaymentTypeTotals(unittest.TestCase):
+    def test_buckets_by_type_and_ignores_zero_payments(self):
+        vouchers = [
+            {"payment": "10.00", "payment_type": "cash"},
+            {"payment": "20.00", "payment_type": "upi"},
+            {"payment": "5.00", "payment_type": "check"},
+            {"payment": "5.00", "payment_type": "check"},
+            {"payment": "", "payment_type": "cash"},
+            {"payment": "0", "payment_type": "upi"},
+        ]
+        totals = coll_orchestrate.payment_type_totals(vouchers)
+        self.assertEqual(totals["cash"]["count"], 1)
+        self.assertEqual(totals["cash"]["amount"], Decimal("10.00"))
+        self.assertEqual(totals["upi"]["count"], 1)
+        self.assertEqual(totals["upi"]["amount"], Decimal("20.00"))
+        self.assertEqual(totals["check"]["count"], 2)
+        self.assertEqual(totals["check"]["amount"], Decimal("10.00"))
+
+    def test_missing_or_unknown_type_counts_as_cash(self):
+        vouchers = [{"payment": "10.00"}, {"payment": "5.00", "payment_type": "bitcoin"}]
+        totals = coll_orchestrate.payment_type_totals(vouchers)
+        self.assertEqual(totals["cash"]["count"], 2)
+        self.assertEqual(totals["cash"]["amount"], Decimal("15.00"))
+
+
+class TestResolveCheck(DbTestCase):
+    def _create_check(self, bill_no="B001", balance="100.00", payment="40.00"):
+        self._insert_voucher(bill_no=bill_no, balance=balance)
+        coll_store.apply_post_to_db([{
+            "bill_no": bill_no, "payment": payment, "salesman": "sm1", "beat": "beat1",
+            "payment_type": "check", "check_bank": "Bank A", "check_no": "CHK1",
+            "check_date": "2026-08-01",
+        }])
+        return self._query("SELECT id FROM checks WHERE bill_no = ?", (bill_no,))[0]["id"]
+
+    def test_encash_dispatches_to_mark_check_encashed(self):
+        check_id = self._create_check()
+        updated = coll_orchestrate.resolve_check(check_id, "encash", "distributor1")
+        self.assertEqual(updated["status"], "encashed")
+
+    def test_bounce_dispatches_to_mark_check_bounced(self):
+        check_id = self._create_check(balance="100.00", payment="40.00")
+        updated = coll_orchestrate.resolve_check(check_id, "bounce", "distributor1")
+        self.assertEqual(updated["status"], "bounced")
+        self.assertEqual(self._query("SELECT balance FROM vouchers")[0]["balance"], "100.00")
+
+    def test_unknown_action_raises(self):
+        check_id = self._create_check()
+        with self.assertRaises(ValueError):
+            coll_orchestrate.resolve_check(check_id, "delete", "distributor1")
+
+
+class AddvBatchTestCase(OrchestrateTestCase):
+    """Onboarding new vouchers: web-only salesman review + distributor
+    resolve, operating entirely on the in-memory addv batch dict."""
+
+    def _batch(self):
+        return {
+            "type": "add_vouchers", "mode": "batch",
+            "created_by": "dist", "created_at": "2026-01-01T09:00:00",
+            "stage": "added", "stages": {"add": "done", "confirm": "", "post": ""},
+            "vouchers": [
+                {"bill_no": "B1", "date": "2026-01-01", "amount": "100.00",
+                 "balance": "100.00", "beat": "beat1", "salesman": "sm1"},
+                {"bill_no": "B2", "date": "2026-01-02", "amount": "200.00",
+                 "balance": "200.00", "beat": "beat1", "salesman": "sm1"},
+            ],
+            "installments": [
+                {"bill_no": "B1", "date": "2026-01-05", "amount": "40.00", "salesman": "sm1"},
+            ],
+            "flags": [],
+        }
+
+    def test_status_pending_review_when_unreviewed(self):
+        st = coll_orchestrate.addv_batch_status(self._batch())
+        self.assertEqual(st["status"], "pending_review")
+        self.assertEqual(st["total"], 2)
+        self.assertEqual(st["reviewed"], 0)
+
+    def test_status_treats_missing_review_status_as_pending(self):
+        # A batch staged by the pre-existing CLI import has no review_status
+        # key at all — must still show up as pending, not silently "clean".
+        batch = self._batch()
+        self.assertNotIn("review_status", batch["vouchers"][0])
+        st = coll_orchestrate.addv_batch_status(batch)
+        self.assertEqual(st["status"], "pending_review")
+
+    def test_status_ready_to_post_when_all_reviewed_no_flags(self):
+        batch = self._batch()
+        coll_orchestrate.clear_addv_review(batch, "B1", "sm1")
+        coll_orchestrate.clear_addv_review(batch, "B2", "sm1")
+        st = coll_orchestrate.addv_batch_status(batch)
+        self.assertEqual(st["status"], "ready_to_post")
+
+    def test_status_awaiting_resolution_when_open_flag(self):
+        batch = self._batch()
+        coll_orchestrate.clear_addv_review(batch, "B1", "sm1")
+        coll_orchestrate.raise_addv_flag(batch, "B2", "voucher_amount", "wrong amount", "sm1",
+                                         "2026-01-03T10:00:00", new={"amount": "250.00"})
+        st = coll_orchestrate.addv_batch_status(batch)
+        self.assertEqual(st["status"], "awaiting_resolution")
+        self.assertEqual(st["open_flags"], 1)
+        self.assertEqual(batch["vouchers"][1]["review_status"], "flagged")
+
+    def test_status_posted_when_stages_post_confirmed(self):
+        batch = self._batch()
+        batch["stages"]["post"] = "confirmed"
+        st = coll_orchestrate.addv_batch_status(batch)
+        self.assertEqual(st["status"], "posted")
+
+    def test_clear_addv_review_unknown_bill_no_raises(self):
+        with self.assertRaises(ValueError):
+            coll_orchestrate.clear_addv_review(self._batch(), "NOPE", "sm1")
+
+    def test_raise_addv_flag_unknown_kind_raises(self):
+        with self.assertRaises(ValueError):
+            coll_orchestrate.raise_addv_flag(self._batch(), "B1", "bogus", "", "sm1", "t")
+
+    def test_raise_addv_flag_unknown_bill_no_raises(self):
+        with self.assertRaises(ValueError):
+            coll_orchestrate.raise_addv_flag(self._batch(), "NOPE", "amendment", "", "sm1", "t")
+
+    def test_resolve_voucher_amount_recomputes_balance(self):
+        batch = self._batch()
+        coll_orchestrate.raise_addv_flag(batch, "B1", "voucher_amount", "should be 150", "sm1",
+                                         "2026-01-03T10:00:00", new={"amount": "150.00"})
+        flag_id = batch["flags"][0]["id"]
+        coll_orchestrate.resolve_addv_flag(
+            batch, flag_id,
+            {"date": "2026-01-01", "amount": "150.00", "beat": "beat1", "salesman": "sm1"},
+            None, "dist", "2026-01-04T11:00:00",
+        )
+        voucher = batch["vouchers"][0]
+        self.assertEqual(voucher["amount"], "150.00")
+        # 150.00 - 40.00 (the one existing installment) = 110.00
+        self.assertEqual(voucher["balance"], "110.00")
+        self.assertEqual(batch["flags"][0]["status"], "resolved")
+        self.assertEqual(batch["flags"][0]["resolved_by"], "dist")
+
+    def test_resolve_installment_add_updates_installments_and_balance(self):
+        batch = self._batch()
+        coll_orchestrate.raise_addv_flag(batch, "B1", "installment_add", "missed one", "sm1",
+                                         "2026-01-03T10:00:00", new={"date": "2026-01-10", "amount": "30.00"})
+        flag_id = batch["flags"][0]["id"]
+        coll_orchestrate.resolve_addv_flag(
+            batch, flag_id,
+            {"date": "2026-01-01", "amount": "100.00", "beat": "beat1", "salesman": "sm1"},
+            [{"date": "2026-01-05", "amount": "40.00"}, {"date": "2026-01-10", "amount": "30.00"}],
+            "dist", "2026-01-04T11:00:00",
+        )
+        voucher = batch["vouchers"][0]
+        # 100.00 - (40.00 + 30.00) = 30.00
+        self.assertEqual(voucher["balance"], "30.00")
+        b1_installments = [i for i in batch["installments"] if i["bill_no"] == "B1"]
+        self.assertEqual(len(b1_installments), 2)
+
+    def test_resolve_rejects_installments_exceeding_amount(self):
+        batch = self._batch()
+        coll_orchestrate.raise_addv_flag(batch, "B1", "amendment", "check totals", "sm1", "t")
+        flag_id = batch["flags"][0]["id"]
+        with self.assertRaises(ValueError):
+            coll_orchestrate.resolve_addv_flag(
+                batch, flag_id,
+                {"date": "2026-01-01", "amount": "50.00", "beat": "beat1", "salesman": "sm1"},
+                [{"date": "2026-01-05", "amount": "40.00"}, {"date": "2026-01-10", "amount": "30.00"}],
+                "dist", "t",
+            )
+
+    def test_resolve_unknown_flag_raises(self):
+        with self.assertRaises(ValueError):
+            coll_orchestrate.resolve_addv_flag(self._batch(), 999, {}, None, "dist", "t")
+
+    def test_resolve_already_resolved_flag_raises(self):
+        batch = self._batch()
+        coll_orchestrate.raise_addv_flag(batch, "B1", "amendment", "", "sm1", "t")
+        flag_id = batch["flags"][0]["id"]
+        coll_orchestrate.resolve_addv_flag(
+            batch, flag_id, {"date": "2026-01-01", "amount": "100.00", "beat": "beat1", "salesman": "sm1"},
+            None, "dist", "t",
+        )
+        with self.assertRaises(ValueError):
+            coll_orchestrate.resolve_addv_flag(
+                batch, flag_id, {"date": "2026-01-01", "amount": "100.00", "beat": "beat1", "salesman": "sm1"},
+                None, "dist", "t",
+            )
+
+    def test_addv_vouchers_for_salesman_filters(self):
+        batch = self._batch()
+        batch["vouchers"][1]["salesman"] = "sm2"
+        mine = coll_orchestrate.addv_vouchers_for_salesman(batch, "sm1")
+        self.assertEqual([v["bill_no"] for v in mine], ["B1"])
+
+    def test_reject_addv_batch_deletes_file(self):
+        path = self._write_staging_json("addv20260101_090000-dist.json", self._batch())
+        self.assertTrue(path.exists())
+        coll_orchestrate.reject_addv_batch(path)
+        self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":

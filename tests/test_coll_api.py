@@ -196,7 +196,11 @@ class ApiTestCase(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Gap 1 — POST /coll/start/generate must not trust client-supplied beat/salesman
+# Gap 1 — POST /coll/start/generate must not trust a client-supplied beat
+# outside a salesman's assigned beats. Salesman selection was dropped from
+# generation entirely: the form now takes only `beat`, and the resulting
+# list is a beat-wide combined list (see TestCollStartGenerateCombinedList
+# below for the multi-salesman behavior).
 # ---------------------------------------------------------------------------
 
 class TestCollStartGenerate(ApiTestCase):
@@ -210,47 +214,39 @@ class TestCollStartGenerate(ApiTestCase):
         self._add_voucher("100", "beatA", "smA")
         self._add_voucher("200", "beatB", "smB")
 
-    def test_salesman_cannot_impersonate_another_salesman(self):
-        opener = self._login("smA", "pwA")
-        status, body = self._post(opener, "/coll/start/generate",
-                                  {"beat": "beatA", "salesman": "smB"})
-        self.assertEqual(status, 200)
-        self.assertIn("You can only generate a collection list for yourself.", body)
-        self.assertEqual(list((self.tmp / "staging").glob("coll*.json")), [])
-
     def test_salesman_cannot_generate_for_unassigned_beat(self):
         opener = self._login("smA", "pwA")
-        status, body = self._post(opener, "/coll/start/generate",
-                                  {"beat": "beatB", "salesman": "smA"})
+        status, body = self._post(opener, "/coll/start/generate", {"beat": "beatB"})
         self.assertEqual(status, 200)
         self.assertIn("You are not assigned to that beat.", body)
         self.assertEqual(list((self.tmp / "staging").glob("coll*.json")), [])
 
     def test_salesman_can_generate_for_own_beat(self):
         opener = self._login("smA", "pwA")
-        status, body = self._post(opener, "/coll/start/generate",
-                                  {"beat": "beatA", "salesman": "smA"})
+        status, body = self._post(opener, "/coll/start/generate", {"beat": "beatA"})
         self.assertEqual(status, 200)
         self.assertIn('name="report_stem"', body)
         self.assertEqual(len(list((self.tmp / "staging").glob("coll*.json"))), 1)
 
     def test_distributor_is_unrestricted(self):
         opener = self._login("dist", "pwD")
-        status, body = self._post(opener, "/coll/start/generate",
-                                  {"beat": "beatB", "salesman": "smB"})
+        status, body = self._post(opener, "/coll/start/generate", {"beat": "beatB"})
         self.assertEqual(status, 200)
         self.assertIn('name="report_stem"', body)
 
+    def test_no_beat_selected_shows_error(self):
+        opener = self._login("dist", "pwD")
+        status, body = self._post(opener, "/coll/start/generate", {"beat": ""})
+        self.assertEqual(status, 200)
+        self.assertIn("Select a beat.", body)
+
 
 # ---------------------------------------------------------------------------
-# POST /coll/start/beat — the salesman-picker step ("Step 2 of 2") should be
-# skipped whenever there's only one possible salesman for the beat, which is
-# always true for a salesman generating their own list now that RBAC
-# restricts them to assigned beats. Supervisor/distributor still see the
-# picker when a beat's pending vouchers span more than one salesman.
+# GET /coll/start — beat-only picker (no salesman selection). Each beat
+# option shows its assigned salesman for reference only, from beats.salesman.
 # ---------------------------------------------------------------------------
 
-class TestCollStartPickBeatSkipsStep2(ApiTestCase):
+class TestCollStartBeatForm(ApiTestCase):
     def setUp(self):
         super().setUp()
         self._add_user("smA", "salesman", "pwA")
@@ -263,38 +259,62 @@ class TestCollStartPickBeatSkipsStep2(ApiTestCase):
         self._add_voucher("300", "beatMixed", "smA")
         self._add_voucher("400", "beatMixed", "smB")
 
-    def test_salesman_single_salesman_beat_skips_picker_straight_to_preview(self):
-        opener = self._login("smA", "pwA")
-        status, body = self._post(opener, "/coll/start/beat", {"beat": "beatA"})
+    def test_no_salesman_field_in_form(self):
+        opener = self._login("dist", "pwD")
+        status, body = self._get(opener, "/coll/start")
         self.assertEqual(status, 200)
-        self.assertIn('name="report_stem"', body)
-        self.assertNotIn("Select salesman for", body)
-        self.assertEqual(len(list((self.tmp / "staging").glob("coll*.json"))), 1)
+        self.assertNotIn('name="salesman"', body)
 
-    def test_salesman_cannot_probe_unassigned_beat(self):
+    def test_salesman_beat_list_excludes_unassigned_beats(self):
         self._add_beat("beatForeign", "smB")
         self._add_voucher("500", "beatForeign", "smB")
         opener = self._login("smA", "pwA")
-        status, body = self._post(opener, "/coll/start/beat", {"beat": "beatForeign"})
+        status, body = self._get(opener, "/coll/start")
         self.assertEqual(status, 200)
-        self.assertIn("You are not assigned to that beat.", body)
-        self.assertEqual(list((self.tmp / "staging").glob("coll*.json")), [])
+        self.assertNotIn("beatForeign", body)
 
-    def test_distributor_sees_picker_when_beat_has_multiple_salesmen(self):
-        opener = self._login("dist", "pwD")
-        status, body = self._post(opener, "/coll/start/beat", {"beat": "beatMixed"})
-        self.assertEqual(status, 200)
-        self.assertIn("Select salesman for", body)
-        self.assertIn("smA", body)
-        self.assertIn("smB", body)
-        self.assertEqual(list((self.tmp / "staging").glob("coll*.json")), [])
 
-    def test_distributor_single_salesman_beat_also_skips_picker(self):
+# ---------------------------------------------------------------------------
+# Beat-only generation produces a combined list spanning every salesman with
+# pending vouchers on the beat, and flags (never auto-raises an Amendment
+# Request for) any voucher whose own salesman differs from the beat's
+# assigned salesman — a human reviews and raises one themselves if warranted.
+# ---------------------------------------------------------------------------
+
+class TestCollStartGenerateCombinedList(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self._add_user("smA", "salesman", "pwA")
+        self._add_user("smB", "salesman", "pwB")
+        self._add_user("dist", "distributor", "pwD")
+        self._add_beat("beatMixed", "smA")
+        self._add_voucher("300", "beatMixed", "smA")
+        self._add_voucher("400", "beatMixed", "smB")
+
+    def test_combined_list_includes_all_salesmen_and_flags_mismatch(self):
         opener = self._login("dist", "pwD")
-        status, body = self._post(opener, "/coll/start/beat", {"beat": "beatA"})
+        status, body = self._post(opener, "/coll/start/generate", {"beat": "beatMixed"})
         self.assertEqual(status, 200)
         self.assertIn('name="report_stem"', body)
-        self.assertNotIn("Select salesman for", body)
+        self.assertIn("300", body)
+        self.assertIn("400", body)
+        self.assertIn("Different salesman", body)
+        # No Amendment Request auto-raised — purely a review flag.
+        self.assertEqual(coll_store.load_amendment_requests(), [])
+
+        paths = list((self.tmp / "staging").glob("coll*.json"))
+        self.assertEqual(len(paths), 1)
+        data = json.loads(paths[0].read_text(encoding="utf-8"))
+        self.assertEqual(data["selection_type"], "beat")
+        self.assertEqual(data["selection"], ["beatMixed"])
+        self.assertEqual({v["bill_no"] for v in data["vouchers"]}, {"300", "400"})
+
+    def test_salesman_generating_own_beat_sees_combined_list(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._post(opener, "/coll/start/generate", {"beat": "beatMixed"})
+        self.assertEqual(status, 200)
+        self.assertIn("400", body)
+        self.assertIn("Different salesman", body)
 
 
 # ---------------------------------------------------------------------------
@@ -1218,15 +1238,18 @@ class TestCorrections(ApiTestCase):
         self.assertEqual(corr["old"], {"date": "2026-01-01", "amount": "10.00"})
         self.assertEqual(corr["new"], {"amount": "25.00"})
 
-    def test_salesman_has_no_access(self):
+    def test_salesman_can_raise_and_view(self):
+        # raise_correction was widened to salesman alongside Amendment
+        # Requests, so a salesman can use this flow (and its "raise an
+        # amendment request instead" cross-link) same as a supervisor.
         opener = self._login("smA", "pwA")
         status, body = self._get(opener, "/coll/corrections")
-        self.assertIn("permission", body)
+        self.assertEqual(status, 200)
+        self.assertNotIn("permission", body)
         status, body = self._post(opener, "/coll/correct/900",
                                   {"action": "raise", "kind": "voucher_amount",
                                    "new_amount": "60.00", "from": self.from_path})
-        self.assertIn("permission", body)
-        self.assertEqual(self._corrections(), [])
+        self.assertEqual(self._corrections()[0]["requested_by"], "smA")
 
     def test_supervisor_views_distributor_acts(self):
         sup = self._login("sup", "pwS")
@@ -1356,7 +1379,9 @@ class TestCorrections(ApiTestCase):
         status, body = self._post(dist, f"/coll/corrections/{cid}",
                                   {"action": "apply", "next": "/coll/amend/900"})
         self.assertIn("Correction applied", body)
-        self.assertIn('href="/coll/amend/900"', body)
+        # No more Continue-page href to check — the apply action now redirects
+        # straight to `next`, so the response body is /coll/amend/900 itself.
+        self.assertIn('action="/coll/amend/900"', body)
 
     def test_next_defaults_to_corrections_list(self):
         sup = self._login("sup", "pwS")
@@ -1997,6 +2022,536 @@ class TestSubmitVerification(ApiTestCase):
         status, body = self._post(opener, f"/coll/approve-submit/{self.stem}",
                                   {"action": "approve"})
         self.assertIn("Collections approved", body)
+
+
+# ---------------------------------------------------------------------------
+# Amendment Requests: a raise->resolve lifecycle in front of Voucher
+# Amendment. Free-text note only (no structured kind/snapshot like
+# corrections); auto-resolves when the distributor lands ANY amendment on
+# the bill; the distributor may instead reject without amending, and the
+# raiser may withdraw their own open request. Not stage-gated.
+# ---------------------------------------------------------------------------
+
+class TestAmendmentRequests(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self._add_user("dist", "distributor", "pwD")
+        self._add_user("sup", "supervisor", "pwS")
+        self._add_user("smA", "salesman", "pwA")
+        self._add_beat("beatA", "smA")
+        self._add_voucher("900", "beatA", "smA", balance="100.00")
+
+    def _requests(self):
+        return coll_store.load_amendment_requests()
+
+    def _raise(self, opener, bill_no="900", note="date looks wrong", from_path=None):
+        data = {"action": "raise", "note": note}
+        if from_path is not None:
+            data["from"] = from_path
+        return self._post(opener, f"/coll/amend-request/{bill_no}", data)
+
+    def test_menu_cards(self):
+        sup = self._login("sup", "pwS")
+        status, body = self._get(sup, "/menu")
+        self.assertIn("Request Voucher Amendment", body)
+        self.assertIn("Amendment Requests", body)
+
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, "/menu")
+        self.assertNotIn("Request Voucher Amendment", body)  # distributor can't raise
+        self.assertIn("Amendment Requests", body)  # but can view/resolve
+
+    def test_distributor_cannot_raise(self):
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, "/coll/amend-request/900")
+        self.assertIn("permission", body)
+        status, body = self._raise(dist)
+        self.assertIn("permission", body)
+        self.assertEqual(self._requests(), [])
+
+    def test_salesman_can_raise(self):
+        sm = self._login("smA", "pwA")
+        status, body = self._raise(sm, note="balance seems off")
+        self.assertEqual(status, 200)  # 303 followed
+        reqs = self._requests()
+        self.assertEqual(len(reqs), 1)
+        self.assertEqual(reqs[0]["note"], "balance seems off")
+        self.assertEqual(reqs[0]["requested_by"], "smA")
+        self.assertEqual(reqs[0]["status"], "open")
+
+    def test_raise_requires_note(self):
+        sup = self._login("sup", "pwS")
+        status, body = self._raise(sup, note="")
+        self.assertIn("Describe what needs", body)
+        self.assertEqual(self._requests(), [])
+
+    def test_completed_voucher_refused(self):
+        conn = coll_store.get_db()
+        conn.execute(
+            "INSERT INTO completed_vouchers (bill_no, date, amount, balance, beat, salesman,"
+            " created_by, created_at) VALUES"
+            " ('901', '2026-01-01', '50.00', '0.00', 'beatA', 'smA', 't', 't')")
+        conn.commit()
+        conn.close()
+        sup = self._login("sup", "pwS")
+        status, body = self._get(sup, "/coll/amend-request/901")
+        self.assertIn("cannot have an amendment requested", body)
+
+    def test_withdraw_own_requests_only(self):
+        sup = self._login("sup", "pwS")
+        self._raise(sup)
+        rid = self._requests()[0]["id"]
+
+        dist = self._login("dist", "pwD")
+        status, body = self._post(dist, "/coll/amend-request/900",
+                                  {"action": "withdraw", "req_id": str(rid)})
+        self.assertIn("permission", body)  # distributor has no raise permission at all
+
+        sm = self._login("smA", "pwA")
+        status, body = self._post(sm, "/coll/amend-request/900",
+                                  {"action": "withdraw", "req_id": str(rid)})
+        self.assertIn("Only your own", body)
+        self.assertEqual(coll_store.load_amendment_request(rid)["status"], "open")
+
+        status, body = self._post(sup, "/coll/amend-request/900",
+                                  {"action": "withdraw", "req_id": str(rid)})
+        self.assertEqual(coll_store.load_amendment_request(rid)["status"], "withdrawn")
+
+    def test_list_shows_active_and_history(self):
+        sup = self._login("sup", "pwS")
+        self._raise(sup, note="please check date")
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, "/coll/amend-requests")
+        self.assertIn("900", body)
+        self.assertIn("please check date", body)
+        self.assertIn("Pending", body)
+
+    def test_reject_without_amending(self):
+        sup = self._login("sup", "pwS")
+        self._raise(sup)
+        rid = self._requests()[0]["id"]
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, f"/coll/amend-requests/{rid}")
+        self.assertIn('value="reject"', body)
+        status, body = self._post(dist, f"/coll/amend-requests/{rid}",
+                                  {"action": "reject", "resolution_note": "not needed"})
+        self.assertIn("rejected", body)
+        req = coll_store.load_amendment_request(rid)
+        self.assertEqual(req["status"], "rejected")
+        self.assertEqual(req["resolved_by"], "dist")
+
+        # Supervisor holds raise_amendment_request but not amend_voucher —
+        # cannot resolve, only raise/withdraw.
+        self._raise(sup, note="second")
+        rid2 = [r for r in self._requests() if r["status"] == "open"][0]["id"]
+        status, body = self._post(sup, f"/coll/amend-requests/{rid2}", {"action": "reject"})
+        self.assertIn("permission", body)
+
+    def test_auto_resolve_on_amendment(self):
+        sup = self._login("sup", "pwS")
+        self._raise(sup, note="date wrong")
+        rid = self._requests()[0]["id"]
+
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, "/coll/amend/900")
+        self.assertIn("Open amendment request", body)
+        self.assertIn("date wrong", body)
+
+        snap = {"voucher": {"date": "2026-01-01", "amount": "100.00", "balance": "100.00",
+                            "beat": "beatA", "salesman": "smA"}, "installments": []}
+        data = [("v_date", "2026-02-01"), ("v_amount", "100.00"), ("v_beat", "beatA"),
+                ("v_salesman", "smA"), ("note", "fixed date"), ("snapshot", json.dumps(snap))]
+        status, body = self._post(dist, "/coll/amend/900", data)
+        self.assertIn("Amendment applied", body)
+
+        req = coll_store.load_amendment_request(rid)
+        self.assertEqual(req["status"], "applied")
+        self.assertEqual(req["resolved_by"], "dist")
+        self.assertIsNotNone(req["linked_amendment_id"])
+
+    def test_correction_form_cross_link_only_on_approve_collection_list(self):
+        stem = "coll20260101-beat_salesman-beatA_smA"
+        self._write_staging_report(
+            stem, "beatA", "smA", start="new", submit="",
+            vouchers=[{"bill_no": "900", "date": "2026-01-01", "balance": "100.00",
+                       "payment": "", "payment_date": "", "beat": "beatA", "salesman": "smA"}])
+        sup = self._login("sup", "pwS")
+        status, body = self._get(sup, f"/coll/correct/900?from=/coll/approve-start/{stem}")
+        self.assertIn("Raise an Amendment Request instead", body)
+
+        # Approve Collections context (collection_amount only) — no cross-link.
+        self._write_staging_report(
+            stem, "beatA", "smA", start="confirmed", submit="submitted",
+            vouchers=[{"bill_no": "900", "date": "2026-01-01", "balance": "100.00",
+                       "payment": "10.00", "payment_date": "2026-01-01",
+                       "beat": "beatA", "salesman": "smA"}])
+        status, body = self._get(sup, f"/coll/correct/900?from=/coll/approve-submit/{stem}")
+        self.assertNotIn("Raise an Amendment Request instead", body)
+
+
+# ---------------------------------------------------------------------------
+# Manage Users / Profile — permission gating + full HTTP lifecycle
+# ---------------------------------------------------------------------------
+
+class TestManageUsersAndProfile(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self._add_user("dist", "distributor", "distpass1")
+        self._add_user("sup", "supervisor", "suppass1")
+        self._add_user("sm", "salesman", "smpass1")
+
+    # ---- permission gating ----
+
+    def test_salesman_blocked_from_manage_users(self):
+        opener = self._login("sm", "smpass1")
+        status, body = self._get(opener, "/manage/users")
+        self.assertIn("have permission for this action", body)
+
+    def test_supervisor_blocked_from_manage_users(self):
+        opener = self._login("sup", "suppass1")
+        status, body = self._get(opener, "/manage/users")
+        self.assertIn("have permission for this action", body)
+
+    def test_distributor_allowed_manage_users(self):
+        opener = self._login("dist", "distpass1")
+        status, body = self._get(opener, "/manage/users")
+        self.assertEqual(status, 200)
+        self.assertIn("Manage Users", body)
+
+    def test_profile_reachable_by_every_role(self):
+        for name, pw in (("dist", "distpass1"), ("sup", "suppass1"), ("sm", "smpass1")):
+            opener = self._login(name, pw)
+            status, body = self._get(opener, "/profile")
+            self.assertEqual(status, 200)
+            self.assertIn("Change Password", body)
+
+    # ---- create/edit/delete/reset lifecycle ----
+
+    def test_create_user_end_to_end(self):
+        dist = self._login("dist", "distpass1")
+        status, body = self._post(dist, "/manage/users/new", {
+            "name": "newsm", "role": "salesman",
+            "password": "initpass1", "confirm_password": "initpass1",
+        })
+        self.assertEqual(status, 200)
+        status, body = self._get(dist, "/manage/users")
+        self.assertIn("newsm", body)
+
+    def test_create_user_duplicate_shows_error(self):
+        dist = self._login("dist", "distpass1")
+        self._post(dist, "/manage/users/new", {
+            "name": "dupuser", "role": "salesman",
+            "password": "initpass1", "confirm_password": "initpass1",
+        })
+        status, body = self._post(dist, "/manage/users/new", {
+            "name": "dupuser", "role": "salesman",
+            "password": "initpass1", "confirm_password": "initpass1",
+        })
+        self.assertEqual(status, 200)
+        self.assertIn("already exists", body)
+
+    def test_edit_user_role(self):
+        dist = self._login("dist", "distpass1")
+        status, body = self._post(dist, "/manage/users/sm/edit", {"role": "supervisor"})
+        self.assertEqual(status, 200)
+        self.assertEqual(coll_store.load_user("sm")["role"], "supervisor")
+
+    def test_edit_role_last_distributor_blocked(self):
+        dist = self._login("dist", "distpass1")
+        status, body = self._post(dist, "/manage/users/dist/edit", {"role": "supervisor"})
+        self.assertEqual(status, 200)
+        self.assertIn("cannot be changed", body)
+        self.assertEqual(coll_store.load_user("dist")["role"], "distributor")
+
+    def test_create_user_distributor_role_rejected(self):
+        dist = self._login("dist", "distpass1")
+        status, body = self._post(dist, "/manage/users/new", {
+            "name": "seconddist", "role": "distributor",
+            "password": "initpass1", "confirm_password": "initpass1",
+        })
+        self.assertEqual(status, 200)
+        self.assertIsNone(coll_store.load_user("seconddist"))
+
+    def test_promote_to_distributor_blocked(self):
+        dist = self._login("dist", "distpass1")
+        status, body = self._post(dist, "/manage/users/sm/edit", {"role": "distributor"})
+        self.assertEqual(status, 200)
+        self.assertEqual(coll_store.load_user("sm")["role"], "salesman")
+
+    def test_manage_users_list_hides_edit_and_delete_for_distributor(self):
+        dist = self._login("dist", "distpass1")
+        status, body = self._get(dist, "/manage/users")
+        self.assertEqual(status, 200)
+        self.assertIn("/manage/users/dist/reset-password", body)
+        self.assertNotIn("/manage/users/dist/edit", body)
+        self.assertNotIn("/manage/users/dist/delete", body)
+
+    def test_delete_unreferenced_user_succeeds(self):
+        dist = self._login("dist", "distpass1")
+        self._add_user("throwaway", "salesman", "pwpwpw1")
+        status, body = self._post(dist, "/manage/users/throwaway/delete", {})
+        self.assertEqual(status, 200)
+        self.assertIsNone(coll_store.load_user("throwaway"))
+
+    def test_delete_referenced_user_blocked(self):
+        dist = self._login("dist", "distpass1")
+        self._add_beat("beatX", "sm")
+        status, body = self._post(dist, "/manage/users/sm/delete", {})
+        self.assertEqual(status, 200)
+        self.assertIn("referenced", body)
+        self.assertIsNotNone(coll_store.load_user("sm"))
+
+    def test_self_lockout_blocked(self):
+        dist = self._login("dist", "distpass1")
+        self._add_user("dist2", "distributor", "distpass2")
+        status, body = self._post(dist, "/manage/users/dist/delete", {})
+        self.assertEqual(status, 200)
+        self.assertIn("own account", body)
+        self.assertIsNotNone(coll_store.load_user("dist"))
+
+    def test_reset_password_forces_change_on_next_login(self):
+        dist = self._login("dist", "distpass1")
+        status, body = self._post(dist, "/manage/users/sm/reset-password", {
+            "new_password": "resetpass1", "confirm_password": "resetpass1",
+        })
+        self.assertEqual(status, 200)
+        opener = self._login("sm", "resetpass1")
+        status, body = self._get(opener, "/menu")
+        self.assertIn("must change your password", body)
+
+    # ---- forced first-login change: full lifecycle ----
+
+    def test_forced_change_lifecycle(self):
+        dist = self._login("dist", "distpass1")
+        self._post(dist, "/manage/users/new", {
+            "name": "freshuser", "role": "salesman",
+            "password": "initpass1", "confirm_password": "initpass1",
+        })
+
+        opener = self._login("freshuser", "initpass1")
+        status, body = self._get(opener, "/menu")
+        self.assertEqual(status, 200)
+        self.assertIn("must change your password", body)
+        self.assertIn("Change Password", body)
+
+        # A different route also bounces back to /profile — no routing around it.
+        status, body = self._get(opener, "/reports")
+        self.assertIn("must change your password", body)
+
+        status, body = self._post(opener, "/profile/change-password", {
+            "current_password": "initpass1",
+            "new_password": "changedpass1",
+            "confirm_password": "changedpass1",
+        })
+        self.assertEqual(status, 200)
+
+        # Normal access resumes without re-login.
+        status, body = self._get(opener, "/menu")
+        self.assertEqual(status, 200)
+        self.assertIn("Main Menu", body)
+        self.assertNotIn("must change your password", body)
+
+        row = coll_store.load_user("freshuser")
+        self.assertFalse(row["must_change_password"])
+
+    def test_change_password_wrong_current_shows_error(self):
+        opener = self._login("sm", "smpass1")
+        status, body = self._post(opener, "/profile/change-password", {
+            "current_password": "wrongpass",
+            "new_password": "changedpass1",
+            "confirm_password": "changedpass1",
+        })
+        self.assertEqual(status, 200)
+        self.assertIn("current password is incorrect", body)
+
+
+# ---------------------------------------------------------------------------
+# Manage Beats — permission gating + full HTTP lifecycle
+# ---------------------------------------------------------------------------
+
+class TestManageBeats(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self._add_user("dist", "distributor", "distpass1")
+        self._add_user("sm1", "salesman", "smpass1")
+        self._add_user("sm2", "salesman", "smpass2")
+
+    def test_salesman_blocked_from_manage_beats(self):
+        opener = self._login("sm1", "smpass1")
+        status, body = self._get(opener, "/manage/beats")
+        self.assertIn("have permission for this action", body)
+
+    def test_distributor_allowed_manage_beats(self):
+        opener = self._login("dist", "distpass1")
+        status, body = self._get(opener, "/manage/beats")
+        self.assertEqual(status, 200)
+        self.assertIn("Manage Beats", body)
+
+    def test_create_beat_end_to_end(self):
+        dist = self._login("dist", "distpass1")
+        status, body = self._post(dist, "/manage/beats/new", {"name": "beatX", "salesman": "sm1"})
+        self.assertEqual(status, 200)
+        status, body = self._get(dist, "/manage/beats")
+        self.assertIn("beatX", body)
+
+    def test_edit_beat_salesman(self):
+        dist = self._login("dist", "distpass1")
+        self._add_beat("beatX", "sm1")
+        status, body = self._post(dist, "/manage/beats/beatX/edit", {"salesman": "sm2"})
+        self.assertEqual(status, 200)
+        beats = coll_store.load_beats_raw()
+        self.assertEqual(next(b["salesman"] for b in beats if b["name"] == "beatX"), "sm2")
+
+    def test_delete_unreferenced_beat_succeeds(self):
+        dist = self._login("dist", "distpass1")
+        self._add_beat("beatX", "sm1")
+        status, body = self._post(dist, "/manage/beats/beatX/delete", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(coll_store.load_beats_raw(), [])
+
+    def test_delete_referenced_beat_blocked(self):
+        dist = self._login("dist", "distpass1")
+        self._add_beat("beatX", "sm1")
+        self._add_voucher("100", "beatX", "sm1")
+        status, body = self._post(dist, "/manage/beats/beatX/delete", {})
+        self.assertEqual(status, 200)
+        self.assertIn("existing vouchers", body)
+        self.assertEqual(len(coll_store.load_beats_raw()), 1)
+
+
+# ---------------------------------------------------------------------------
+# Submit Collections — payment type (cash/upi/check) round-trip + validation
+# ---------------------------------------------------------------------------
+
+class TestCollSubmitPaymentType(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self._add_user("smA", "salesman", "pwA")
+        self.stem = "coll20260101-beat_salesman-beatA_smA"
+        self._write_staging_report(
+            self.stem, "beatA", "smA",
+            vouchers=[
+                {"bill_no": "100", "date": "2026-01-01", "balance": "50.00",
+                 "payment": "", "payment_date": "", "beat": "beatA", "salesman": "smA"},
+                {"bill_no": "200", "date": "2026-01-01", "balance": "75.00",
+                 "payment": "", "payment_date": "", "beat": "beatA", "salesman": "smA"},
+            ],
+        )
+
+    def test_upi_payment_saved_and_redisplayed(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._post(opener, f"/coll/submit/{self.stem}", {
+            "action": "save",
+            "pay_100": "20.00", "paytype_100": "upi", "upitxn_100": "TXN123",
+            "pay_200": "", "paytype_200": "cash",
+        })
+        self.assertEqual(status, 200)
+        status, body = self._get(opener, f"/coll/submit/{self.stem}")
+        self.assertIn("TXN123", body)
+        installments, _ = coll_store._load_installments(self.tmp / "staging" / f"{self.stem}.json")
+        self.assertEqual(installments["100"]["payment_type"], "upi")
+        self.assertEqual(installments["100"]["upi_txn_id"], "TXN123")
+
+    def test_check_payment_saved_and_redisplayed(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._post(opener, f"/coll/submit/{self.stem}", {
+            "action": "save",
+            "pay_100": "20.00", "paytype_100": "check",
+            "checkbank_100": "Bank A", "checkbranch_100": "Main",
+            "checkno_100": "CHK1", "checkdate_100": "2026-08-01",
+        })
+        self.assertEqual(status, 200)
+        installments, _ = coll_store._load_installments(self.tmp / "staging" / f"{self.stem}.json")
+        self.assertEqual(installments["100"]["payment_type"], "check")
+        self.assertEqual(installments["100"]["check_bank"], "Bank A")
+        self.assertEqual(installments["100"]["check_no"], "CHK1")
+
+    def test_upi_without_txn_id_rejected(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._post(opener, f"/coll/submit/{self.stem}", {
+            "action": "save", "pay_100": "20.00", "paytype_100": "upi",
+        })
+        self.assertEqual(status, 200)
+        self.assertIn("UPI transaction id is required", body)
+        installments, _ = coll_store._load_installments(self.tmp / "staging" / f"{self.stem}.json")
+        self.assertEqual(installments, {})
+
+    def test_check_without_bank_rejected(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._post(opener, f"/coll/submit/{self.stem}", {
+            "action": "save", "pay_100": "20.00", "paytype_100": "check",
+        })
+        self.assertEqual(status, 200)
+        self.assertIn("check bank is required", body)
+
+
+# ---------------------------------------------------------------------------
+# Checks screen — view for everyone with view_checks, resolve for distributor
+# ---------------------------------------------------------------------------
+
+class TestCollChecks(ApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self._add_user("smA", "salesman", "pwA")
+        self._add_user("sup", "supervisor", "pwS")
+        self._add_user("dist", "distributor", "pwD")
+        self._add_voucher("100", "beatA", "smA", balance="100.00")
+        coll_store.apply_post_to_db([{
+            "bill_no": "100", "payment": "40.00", "salesman": "smA", "beat": "beatA",
+            "payment_type": "check", "check_bank": "Bank A", "check_no": "CHK1",
+            # Deliberately in the past: makes this check "overdue" regardless
+            # of the real date the test suite runs on, so the menu banner
+            # test below is deterministic.
+            "check_date": "2020-01-01",
+        }])
+        self.check_id = coll_store.load_checks()[0]["id"]
+
+    def test_salesman_can_view_but_not_resolve(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._get(opener, "/coll/checks")
+        self.assertEqual(status, 200)
+        self.assertIn("CHK1", body)
+        self.assertNotIn("Mark Encashed", body)
+
+    def test_distributor_sees_resolve_actions(self):
+        opener = self._login("dist", "pwD")
+        status, body = self._get(opener, "/coll/checks")
+        self.assertEqual(status, 200)
+        self.assertIn("Mark Encashed", body)
+        self.assertIn("Mark Bounced", body)
+
+    def test_salesman_cannot_post_resolve_action(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._post(opener, f"/coll/checks/{self.check_id}",
+                                  {"action": "encash"})
+        self.assertIn("have permission for this action", body)
+        self.assertEqual(coll_store.load_check(self.check_id)["status"], "pending")
+
+    def test_distributor_can_encash(self):
+        opener = self._login("dist", "pwD")
+        status, body = self._post(opener, f"/coll/checks/{self.check_id}",
+                                  {"action": "encash"})
+        self.assertEqual(coll_store.load_check(self.check_id)["status"], "encashed")
+
+    def test_distributor_can_bounce_and_balance_restored(self):
+        opener = self._login("dist", "pwD")
+        status, body = self._post(opener, f"/coll/checks/{self.check_id}",
+                                  {"action": "bounce", "resolution_note": "NSF"})
+        check = coll_store.load_check(self.check_id)
+        self.assertEqual(check["status"], "bounced")
+        self.assertEqual(check["resolution_note"], "NSF")
+        conn = coll_store.get_db()
+        try:
+            row = conn.execute(
+                "SELECT balance FROM vouchers WHERE bill_no='100'").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["balance"], "100.00")
+
+    def test_menu_shows_check_banner_for_view_checks_role(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._get(opener, "/menu")
+        self.assertIn("View Checks", body)
 
 
 if __name__ == "__main__":

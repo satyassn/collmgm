@@ -2,6 +2,14 @@
 {% block title %}Menu — CollMgm{% endblock %}
 {% block content %}
 <h2 class="page-heading">Main Menu</h2>
+{% if check_summary and (check_summary.due_soon or check_summary.overdue or check_summary.bounced) %}
+<p class="alert alert-warn">
+  {% if check_summary.overdue %}{{ check_summary.overdue }} check{{ 's' if check_summary.overdue != 1 }} overdue for encashment{% endif %}
+  {% if check_summary.due_soon %}{{ ' · ' if check_summary.overdue }}{{ check_summary.due_soon }} check{{ 's' if check_summary.due_soon != 1 }} due soon{% endif %}
+  {% if check_summary.bounced %}{{ ' · ' if check_summary.overdue or check_summary.due_soon }}{{ check_summary.bounced }} bounced check{{ 's' if check_summary.bounced != 1 }}{% endif %}
+  — <a href="/coll/checks">View Checks</a>
+</p>
+{% endif %}
 <nav class="menu-grid">
   {% if "coll_start" in perms %}
     <a class="menu-card" href="/coll/start">
@@ -49,6 +57,36 @@
     <a class="menu-card" href="/coll/amend">
       <span class="menu-icon">&#9998;</span>
       <span>Amend Voucher</span>
+    </a>
+  {% endif %}
+  {% if "raise_amendment_request" in perms %}
+    <a class="menu-card" href="/coll/amend-request">
+      <span class="menu-icon">&#128221;</span>
+      <span>Request Voucher Amendment</span>
+    </a>
+  {% endif %}
+  {% if "raise_amendment_request" in perms or "amend_voucher" in perms %}
+    <a class="menu-card" href="/coll/amend-requests">
+      <span class="menu-icon">&#128203;</span>
+      <span>Amendment Requests</span>
+    </a>
+  {% endif %}
+  {% if "view_checks" in perms %}
+    <a class="menu-card" href="/coll/checks">
+      <span class="menu-icon">&#128179;</span>
+      <span>Checks</span>
+    </a>
+  {% endif %}
+  {% if "import_vouchers" in perms %}
+    <a class="menu-card" href="/coll/import-vouchers">
+      <span class="menu-icon">&#128228;</span>
+      <span>Import Vouchers</span>
+    </a>
+  {% endif %}
+  {% if "import_vouchers" in perms or "raise_correction" in perms or "amend_voucher" in perms or "post_new_vouchers" in perms %}
+    <a class="menu-card" href="/coll/new-vouchers">
+      <span class="menu-icon">&#128230;</span>
+      <span>New Voucher Batches</span>
     </a>
   {% endif %}
   <a class="menu-card" href="/reports">

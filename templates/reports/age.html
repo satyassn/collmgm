@@ -5,7 +5,7 @@
 <p class="meta-line">Showing {{ vouchers|length }} oldest of {{ total_count }} pending vouchers</p>
 
 <div class="table-wrapper">
-<table class="data-table">
+<table class="data-table card-table">
   <thead>
     <tr>
       <th>Bill No</th>
@@ -19,12 +19,12 @@
   <tbody>
     {% for v in vouchers %}
     <tr>
-      <td class="mono"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
-      <td>{{ v.date }}</td>
-      <td class="num">{{ v.age }}</td>
-      <td class="num mono">{{ v.balance }}</td>
-      <td>{{ v.beat }}</td>
-      <td>{{ v.salesman }}</td>
+      <td class="mono" data-label="Bill No"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
+      <td data-label="Date">{{ v.date }}</td>
+      <td class="num" data-label="Age (days)">{{ v.age }}</td>
+      <td class="num mono" data-label="Balance">{{ v.balance }}</td>
+      <td data-label="Beat">{{ v.beat }}</td>
+      <td data-label="Salesman">{{ v.salesman }}</td>
     </tr>
     {% endfor %}
   </tbody>

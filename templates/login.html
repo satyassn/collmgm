@@ -8,6 +8,7 @@
   <link rel="apple-touch-icon" href="/static/icon-192.png">
   <link rel="stylesheet" href="/static/style.css">
   <title>Login — CollMgm</title>
+  <script src="/static/password_toggle.js" defer></script>
 </head>
 <body class="login-body">
   <div class="login-card">
@@ -15,6 +16,8 @@
     {% if error %}
       <p class="alert alert-error">{{ error }}</p>
     {% endif %}
+    {% set ok = request.query_params.get('ok') %}
+    {% if ok %}<p class="alert alert-success">{{ ok }}</p>{% endif %}
     <form method="post" action="/login">
       <label for="username">Username</label>
       <input id="username" name="username" type="text" autocomplete="username"
@@ -23,6 +26,9 @@
       <input id="password" name="password" type="password" autocomplete="current-password" required>
       <button type="submit" class="btn btn-primary btn-full">Sign in</button>
     </form>
+    {% if show_register %}
+    <p class="hint"><a href="/register">First-time setup? Register the distributor account</a></p>
+    {% endif %}
   </div>
 </body>
 </html>

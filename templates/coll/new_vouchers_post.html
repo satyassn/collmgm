@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Post New Vouchers — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Post New Vouchers</h2>
+<p class="meta-line">{{ data.get("mode","?") }} &middot; by {{ data.get("created_by","") }} &middot; {{ data.get("created_at","")[:10] }}</p>
+
+{% if status.status != "ready_to_post" %}
+<p class="alert alert-warn">
+  Not ready to post — {{ status.reviewed }}/{{ status.total }} voucher(s) reviewed,
+  {{ status.open_flags }} open issue(s).
+</p>
+<a class="btn btn-secondary" href="/coll/new-vouchers">Back</a>
+{% else %}
+
+<div class="summary-box">
+  <span>{{ vouchers|length }} voucher(s)</span>
+  <span class="summary-total">Total: <strong>{{ total_amount }}</strong></span>
+</div>
+<div class="summary-box">
+  <span>Installments total: <strong>{{ total_installments }}</strong></span>
+</div>
+
+<table class="data-table stack-table">
+  <thead>
+    <tr>
+      <th>Bill No</th>
+      <th>Date</th>
+      <th class="num">Amount</th>
+      <th class="num">Balance</th>
+      <th>Beat</th>
+      <th>Salesman</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for v in vouchers %}
+    <tr>
+      <td class="mono">{{ v.bill_no }}</td>
+      <td>{{ v.date }}</td>
+      <td class="num mono">{{ v.amount }}</td>
+      <td class="num mono">{{ v.balance }}</td>
+      <td>{{ v.beat }}</td>
+      <td>{{ v.salesman }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+  <tfoot>
+    <tr>
+      <td colspan="2"><strong>Total</strong></td>
+      <td class="num mono"><strong>{{ total_amount }}</strong></td>
+      <td colspan="3"></td>
+    </tr>
+  </tfoot>
+</table>
+
+<form method="post" action="/coll/new-vouchers/{{ stem }}/post" class="action-row action-row--sticky">
+  <button type="submit" name="action" value="post" class="btn btn-primary"
+          onclick="return confirm('Post these new vouchers to master data? This cannot be undone.')">Post</button>
+  <a class="btn btn-secondary" href="/coll/new-vouchers">Back</a>
+</form>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}New Voucher Batches — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">New Voucher Batches</h2>
+
+{% if not batches %}
+  <p class="empty-state">No voucher batches in progress.</p>
+{% else %}
+  <ul class="report-list">
+    {% for b in batches %}
+    <li class="report-item">
+      <span class="report-label">
+        {{ b.data.get("mode","?") }} &middot; {{ b.total }} voucher(s)
+        <span class="badge badge-{{ b.badge }}">{{ b.label }}</span>
+        {% if b.status != "posted" %}
+          {% if b.status == "pending_review" %}({{ b.reviewed }}/{{ b.total }} reviewed){% endif %}
+          {% if b.status == "awaiting_resolution" %}({{ b.open_flags }} open issue{{ "s" if b.open_flags != 1 }}){% endif %}
+        {% endif %}
+      </span>
+      <span class="report-meta">by {{ b.data.get("created_by","") }} &middot; {{ b.data.get("created_at","")[:10] }}</span>
+      {% if b.status == "pending_review" %}
+        <a class="btn btn-sm btn-primary" href="/coll/new-vouchers/{{ b.stem }}/review">Review</a>
+      {% elif b.status == "awaiting_resolution" %}
+        <a class="btn btn-sm btn-primary" href="/coll/new-vouchers/{{ b.stem }}/resolve">Resolve</a>
+      {% elif b.status == "ready_to_post" %}
+        <a class="btn btn-sm btn-primary" href="/coll/new-vouchers/{{ b.stem }}/post">Review &amp; Post</a>
+      {% endif %}
+      {% if can_reject and b.status != "posted" %}
+      <form method="post" action="/coll/new-vouchers/{{ b.stem }}/reject">
+        <button type="submit" class="btn btn-sm btn-secondary"
+                onclick="return confirm('Reject and discard this batch? This cannot be undone.')">Reject</button>
+      </form>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+{% endif %}
+<a class="btn btn-secondary" href="/menu">Back to Menu</a>
+{% endblock %}

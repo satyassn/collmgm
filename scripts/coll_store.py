@@ -13,13 +13,14 @@ import csv
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from collections import namedtuple
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-User = namedtuple('User', ['name', 'role'])
+User = namedtuple('User', ['name', 'role', 'must_change_password'], defaults=[False])
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT_DIR / "data"
@@ -78,9 +79,10 @@ def get_db():
 # legitimate orphans there.
 _TABLE_DDL_V1 = {
     "users": """
-    name          TEXT PRIMARY KEY NOT NULL CHECK (name <> ''),
-    role          TEXT NOT NULL CHECK (role IN ('distributor','supervisor','salesman','system')),
-    password_hash TEXT NOT NULL DEFAULT ''
+    name                 TEXT PRIMARY KEY NOT NULL CHECK (name <> ''),
+    role                 TEXT NOT NULL CHECK (role IN ('distributor','supervisor','salesman','system')),
+    password_hash        TEXT NOT NULL DEFAULT '',
+    must_change_password INTEGER NOT NULL DEFAULT 0
 """,
     "beats": """
     name     TEXT PRIMARY KEY NOT NULL CHECK (name <> ''),
@@ -102,13 +104,15 @@ _TABLE_DDL_V1 = {
     created_at TEXT NOT NULL DEFAULT ''
 """,
     "installments": """
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    bill_no    TEXT NOT NULL CHECK (bill_no <> '') REFERENCES vouchers(bill_no),
-    date       TEXT NOT NULL CHECK (date <> ''),
-    amount     TEXT NOT NULL CHECK (amount <> '' AND amount NOT GLOB '*[^0-9.]*'),
-    salesman   TEXT NOT NULL CHECK (salesman <> ''),
-    created_by TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT ''
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    bill_no      TEXT NOT NULL CHECK (bill_no <> '') REFERENCES vouchers(bill_no),
+    date         TEXT NOT NULL CHECK (date <> ''),
+    amount       TEXT NOT NULL CHECK (amount <> '' AND amount NOT GLOB '*[^0-9.]*'),
+    salesman     TEXT NOT NULL CHECK (salesman <> ''),
+    created_by   TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL DEFAULT '',
+    payment_type TEXT NOT NULL DEFAULT 'cash' CHECK (payment_type IN ('cash','upi','check')),
+    payment_ref  TEXT NOT NULL DEFAULT ''
 """,
     "completed_vouchers": """
     bill_no    TEXT PRIMARY KEY NOT NULL CHECK (bill_no <> ''),
@@ -121,28 +125,30 @@ _TABLE_DDL_V1 = {
     created_at TEXT NOT NULL DEFAULT ''
 """,
     "completed_installments": """
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    bill_no    TEXT NOT NULL CHECK (bill_no <> ''),
-    date       TEXT NOT NULL CHECK (date <> ''),
-    amount     TEXT NOT NULL CHECK (amount <> '' AND amount NOT GLOB '*[^0-9.]*'),
-    salesman   TEXT NOT NULL CHECK (salesman <> ''),
-    created_by TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT ''
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    bill_no      TEXT NOT NULL CHECK (bill_no <> ''),
+    date         TEXT NOT NULL CHECK (date <> ''),
+    amount       TEXT NOT NULL CHECK (amount <> '' AND amount NOT GLOB '*[^0-9.]*'),
+    salesman     TEXT NOT NULL CHECK (salesman <> ''),
+    created_by   TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL DEFAULT '',
+    payment_type TEXT NOT NULL DEFAULT 'cash' CHECK (payment_type IN ('cash','upi','check')),
+    payment_ref  TEXT NOT NULL DEFAULT ''
 """,
 }
 
 _TABLE_COPY_COLUMNS = {
-    "users": ["name", "role", "password_hash"],
+    "users": ["name", "role", "password_hash", "must_change_password"],
     "beats": ["name", "salesman"],
     "permissions": ["role", "action_key"],
     "vouchers": ["bill_no", "date", "amount", "balance", "beat", "salesman",
                  "created_by", "created_at"],
     "installments": ["id", "bill_no", "date", "amount", "salesman",
-                     "created_by", "created_at"],
+                     "created_by", "created_at", "payment_type", "payment_ref"],
     "completed_vouchers": ["bill_no", "date", "amount", "balance", "beat", "salesman",
                            "created_by", "created_at"],
     "completed_installments": ["id", "bill_no", "date", "amount", "salesman",
-                               "created_by", "created_at"],
+                               "created_by", "created_at", "payment_type", "payment_ref"],
 }
 
 _SCHEMA = "".join(
@@ -208,6 +214,73 @@ _AMENDMENTS_BODY = """
 
 _SCHEMA += f"CREATE TABLE IF NOT EXISTS amendments ({_AMENDMENTS_BODY});\n"
 
+# Amendment requests (added after schema v1, alongside corrections/amendments
+# — same "deliberately NOT in _TABLE_DDL_V1" rationale). A lightweight
+# raise->resolve lifecycle in front of the distributor-only Voucher Amendment
+# editor: unlike corrections there is no structured kind/old_json/new_json —
+# the raiser just flags a bill_no with a free-text note; the distributor
+# reads it and makes whatever edit is warranted through the existing raw
+# editor. linked_amendment_id records which amendments row (if any) resolved
+# the request when it was auto-settled rather than explicitly rejected.
+_AMENDMENT_REQUESTS_BODY = """
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    bill_no             TEXT NOT NULL CHECK (bill_no <> ''),
+    note                TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'open' CHECK (status IN
+                          ('open','applied','rejected','withdrawn')),
+    requested_by        TEXT NOT NULL,
+    requested_at        TEXT NOT NULL,
+    resolved_by         TEXT,
+    resolved_at         TEXT,
+    resolution_note     TEXT,
+    linked_amendment_id INTEGER
+"""
+
+_SCHEMA += f"CREATE TABLE IF NOT EXISTS amendment_requests ({_AMENDMENT_REQUESTS_BODY});\n"
+
+# Checks (added after schema v1, but — unlike corrections/amendments/
+# amendment_requests — this IS master data, same category as
+# vouchers/installments: it has a CSV counterpart (data/checks.csv, see
+# _CHK_FIELDS / _migrate_csv_to_db below) and is documented in schema.md
+# alongside the other master-data CSVs, not the "SQLite only" tables.
+# Still deliberately NOT in _TABLE_DDL_V1 — it's a purely additive table, so
+# CREATE IF NOT EXISTS via init_db() covers fresh and already-installed DBs
+# alike with no version bump needed. installment_id is an audit-only
+# pointer (NOT FK-enforced, mirrors corrections.installment_id): archiving a
+# fully-settled voucher deletes its installments row and re-inserts under a
+# new id in completed_installments, which would orphan a real FK — this
+# table is bill_no-scoped for display, so that's fine. One row per check,
+# created at post time for every payment_type='check' voucher; status moves
+# pending -> encashed | bounced and never anywhere else. "Due in 2 days" /
+# "overdue" are not stored states — computed from check_date vs today at
+# query time (check_summary_counts/load_checks).
+_CHECKS_BODY = """
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    installment_id  INTEGER,
+    bill_no         TEXT NOT NULL CHECK (bill_no <> ''),
+    beat            TEXT NOT NULL DEFAULT '',
+    salesman        TEXT NOT NULL DEFAULT '',
+    bank            TEXT NOT NULL CHECK (bank <> ''),
+    branch          TEXT NOT NULL DEFAULT '',
+    check_no        TEXT NOT NULL CHECK (check_no <> ''),
+    check_date      TEXT NOT NULL CHECK (check_date <> ''),
+    amount          TEXT NOT NULL CHECK (amount <> '' AND amount NOT GLOB '*[^0-9.]*'),
+    status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN
+                      ('pending','encashed','bounced')),
+    recorded_by     TEXT NOT NULL,
+    recorded_at     TEXT NOT NULL,
+    resolved_by     TEXT,
+    resolved_at     TEXT,
+    resolution_note TEXT
+"""
+
+_CHECKS_COLUMNS = ["id", "installment_id", "bill_no", "beat", "salesman", "bank",
+                   "branch", "check_no", "check_date", "amount", "status",
+                   "recorded_by", "recorded_at", "resolved_by", "resolved_at",
+                   "resolution_note"]
+
+_SCHEMA += f"CREATE TABLE IF NOT EXISTS checks ({_CHECKS_BODY});\n"
+
 
 class MigrationError(ValueError):
     """Existing rows violate the new schema constraints; the migration
@@ -227,10 +300,14 @@ def init_db():
         conn.executescript(_SCHEMA)
         conn.commit()
         _backfill_beats_salesman(conn)
+        _backfill_must_change_password(conn)
         _backfill_permissions(conn)
         _backfill_coll_print_permission(conn)
         _backfill_correction_permissions(conn)
         _backfill_amendment_permission(conn)
+        _backfill_amendment_request_permissions(conn)
+        _backfill_payment_type_columns(conn)
+        _backfill_check_permissions(conn)
         conn.commit()
         _migrate_corrections_kinds(conn)
         if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
@@ -358,12 +435,54 @@ def _backfill_beats_salesman(conn):
         pass
 
 
+def _backfill_must_change_password(conn):
+    """Add users.must_change_password if missing (additive column; defaults
+    to 0/false for every pre-existing row — no forced change is retroactively
+    imposed on already-provisioned accounts)."""
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+    if "must_change_password" not in cols:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
+
+
 def _backfill_permissions(conn):
-    """One-time seed of the permissions table from data/permissions.csv, if empty."""
-    count = conn.execute("SELECT COUNT(*) FROM permissions").fetchone()[0]
-    if count:
-        return
-    _migrate_csv_table(conn, "permissions", DATA_DIR / "permissions.csv", _P_FIELDS)
+    """Additive grant of the original iteration1/2 "base" RBAC keys — the
+    ones that predate every other _backfill_*_permission function below and
+    so were never given their own hardcoded backfill, relying instead on
+    data/permissions.csv being present at first boot. A packaged install's
+    data/ directory ships no CSVs at all (only collmgm.db), so that read
+    silently no-ops and these keys — including manage_users/manage_beats —
+    never reach the table. Hardcoded and unconditional like its siblings
+    (not gated on the table being empty) so it also heals an install that
+    already picked up later permission keys via those other backfills."""
+    conn.executemany(
+        "INSERT OR IGNORE INTO permissions (role, action_key) VALUES (?, ?)",
+        [
+            ("salesman", "coll_start"),
+            ("salesman", "coll_submit"),
+            ("salesman", "add_vouchers"),
+            ("salesman", "reports"),
+            ("supervisor", "coll_start"),
+            ("supervisor", "coll_approve_start"),
+            ("supervisor", "coll_submit"),
+            ("supervisor", "coll_approve_submit"),
+            ("supervisor", "add_vouchers"),
+            ("supervisor", "import_vouchers"),
+            ("supervisor", "reports"),
+            ("distributor", "coll_start"),
+            ("distributor", "coll_approve_start"),
+            ("distributor", "coll_submit"),
+            ("distributor", "coll_approve_submit"),
+            ("distributor", "coll_post"),
+            ("distributor", "add_vouchers"),
+            ("distributor", "import_vouchers"),
+            ("distributor", "approve_new_vouchers"),
+            ("distributor", "post_new_vouchers"),
+            ("distributor", "reports"),
+            ("distributor", "manage_users"),
+            ("distributor", "manage_beats"),
+        ],
+    )
 
 
 def _backfill_coll_print_permission(conn):
@@ -392,6 +511,47 @@ def _backfill_amendment_permission(conn):
     conn.executemany(
         "INSERT OR IGNORE INTO permissions (role, action_key) VALUES (?, ?)",
         [("distributor", "amend_voucher")],
+    )
+
+
+def _backfill_amendment_request_permissions(conn):
+    """Additive grant of the amendment-request keys for DBs seeded before
+    they existed: raise_amendment_request (supervisor, salesman) doubles as
+    the view permission for the amendment-requests list, same pattern as
+    raise_correction. Also widens raise_correction to salesman, so a
+    salesman reaching the Correction Requests flow can use the
+    "raise an amendment request instead" cross-link there too."""
+    conn.executemany(
+        "INSERT OR IGNORE INTO permissions (role, action_key) VALUES (?, ?)",
+        [("supervisor", "raise_amendment_request"),
+         ("salesman", "raise_amendment_request"),
+         ("salesman", "raise_correction")],
+    )
+
+
+def _backfill_payment_type_columns(conn):
+    """Add payment_type/payment_ref to installments and completed_installments
+    if missing (additive columns; existing rows default to 'cash'/'' — no
+    historical payment is retroactively reclassified)."""
+    for table in ("installments", "completed_installments"):
+        cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if "payment_type" not in cols:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN payment_type TEXT NOT NULL DEFAULT 'cash'")
+        if "payment_ref" not in cols:
+            conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN payment_ref TEXT NOT NULL DEFAULT ''")
+
+
+def _backfill_check_permissions(conn):
+    """Additive grant of the check-tracking keys for DBs seeded before they
+    existed. view_checks (everyone) covers the menu banner and the Checks
+    screen; resolve_check (distributor only) gates the mark-encashed/bounced
+    actions."""
+    conn.executemany(
+        "INSERT OR IGNORE INTO permissions (role, action_key) VALUES (?, ?)",
+        [("salesman", "view_checks"), ("supervisor", "view_checks"),
+         ("distributor", "view_checks"), ("distributor", "resolve_check")],
     )
 
 
@@ -431,6 +591,9 @@ _I_FIELDS = ["bill_no", "date", "amount", "salesman", "created_by", "created_at"
 _U_FIELDS = ["name", "role", "password_hash"]
 _B_FIELDS = ["name", "salesman"]
 _P_FIELDS = ["role", "action_key"]
+_CHK_FIELDS = ["bill_no", "beat", "salesman", "bank", "branch", "check_no",
+               "check_date", "amount", "status", "recorded_by", "recorded_at",
+               "resolved_by", "resolved_at", "resolution_note"]
 
 
 def _migrate_csv_table(conn, table, path, fields):
@@ -461,6 +624,7 @@ def _migrate_csv_to_db():
         ("installments",           DATA_DIR / "installments.csv",           _I_FIELDS),
         ("completed_vouchers",     DATA_DIR / "completed_vouchers.csv",     _V_FIELDS),
         ("completed_installments", DATA_DIR / "completed_installments.csv", _I_FIELDS),
+        ("checks",                 DATA_DIR / "checks.csv",                 _CHK_FIELDS),
     ]
     conn = get_db()
     try:
@@ -511,7 +675,7 @@ def verify_user(name: str, password: str):
     conn = get_db()
     try:
         row = conn.execute(
-            "SELECT role, password_hash FROM users WHERE name = ?", (name,)
+            "SELECT role, password_hash, must_change_password FROM users WHERE name = ?", (name,)
         ).fetchone()
     finally:
         conn.close()
@@ -520,7 +684,7 @@ def verify_user(name: str, password: str):
     role = row["role"]
     stored = row["password_hash"]
     if role in ('salesman', 'supervisor', 'distributor') and _verify_password(stored, password):
-        return User(name=name, role=role)
+        return User(name=name, role=role, must_change_password=bool(row["must_change_password"]))
     return None
 
 
@@ -540,6 +704,334 @@ def load_permissions():
         if role and key:
             result.setdefault(role, set()).add(key)
     return {r: frozenset(keys) for r, keys in result.items()}
+
+
+# ---------------------------------------------------------------------------
+# User / beat lifecycle management (create/edit/delete, password lifecycle)
+#
+# Web-only feature (distributor's Manage Users / Manage Beats screens plus
+# self-service /profile password change). Business validation lives here
+# rather than in coll_orchestrate.py because it has no stage-transition
+# sequencing to keep in sync between CLI and web (this feature has no CLI
+# counterpart), and — like apply_installment_correction/apply_voucher_amendment
+# above — each guard must run inside the same transaction as its write to
+# avoid a check-then-write race.
+# ---------------------------------------------------------------------------
+
+USER_ROLES = ("distributor", "supervisor", "salesman")  # 'system' excluded — not creatable/editable via UI
+# Roles a distributor may hand out via /manage/users. Excludes 'distributor' itself —
+# exactly one distributor may ever exist, created only by register_first_distributor().
+ASSIGNABLE_ROLES = ("supervisor", "salesman")
+_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _validate_new_name(name, kind):
+    name = (name or "").strip()
+    if not name:
+        raise ValueError(f"{kind} name is required")
+    if not _NAME_RE.match(name):
+        raise ValueError(f"{kind} name may only contain letters, digits, '.', '_', '-'")
+    return name
+
+
+def _validate_password(password, confirm=None):
+    if confirm is not None and password != confirm:
+        raise ValueError("password and confirmation do not match")
+    if not password or len(password) < 6:
+        raise ValueError("password must be at least 6 characters")
+
+
+def has_any_users() -> bool:
+    """True if the users table has at least one row (bootstrap has happened)."""
+    conn = get_db()
+    try:
+        return conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0
+    finally:
+        conn.close()
+
+
+def register_first_distributor(name, password, confirm_password):
+    """Bootstrap-only: create the first distributor account when the users
+    table is empty, so a fresh deployment with nobody able to log in can
+    stand itself up without an existing distributor session.
+
+    must_change_password=0 — the registrant already chose their own password,
+    unlike create_user() where a distributor sets a placeholder for someone
+    else. Raises ValueError for invalid name/password, or if a user already
+    exists (closes the race between the GET check and this submit).
+    """
+    name = _validate_new_name(name, "user")
+    _validate_password(password, confirm_password)
+    conn = get_db()
+    try:
+        with conn:
+            if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0:
+                raise ValueError("registration is closed — an account already exists")
+            conn.execute(
+                "INSERT INTO users (name, role, password_hash, must_change_password)"
+                " VALUES (?, 'distributor', ?, 0)",
+                (name, hash_password(password)),
+            )
+    finally:
+        conn.close()
+
+
+def create_user(name, role, password, confirm_password):
+    """Insert a new user with must_change_password=1 — creation is always
+    paired with a forced first-login password change.
+
+    Raises ValueError for an empty/invalid name, a role outside ASSIGNABLE_ROLES
+    (this also rejects 'distributor' — exactly one may ever exist, created only
+    via registration), a password/confirmation mismatch or too-short password,
+    or a duplicate name.
+    """
+    name = _validate_new_name(name, "user")
+    if role not in ASSIGNABLE_ROLES:
+        raise ValueError(f"invalid role {role!r}")
+    _validate_password(password, confirm_password)
+    conn = get_db()
+    try:
+        with conn:
+            try:
+                conn.execute(
+                    "INSERT INTO users (name, role, password_hash, must_change_password)"
+                    " VALUES (?, ?, ?, 1)",
+                    (name, role, hash_password(password)),
+                )
+            except sqlite3.IntegrityError:
+                raise ValueError(f"user {name!r} already exists")
+    finally:
+        conn.close()
+
+
+def load_user(name):
+    """Return one user's admin-view dict (name, role, must_change_password) or None. Never password_hash."""
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT name, role, must_change_password FROM users WHERE name = ?", (name,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    d = dict(row)
+    d["must_change_password"] = bool(d["must_change_password"])
+    return d
+
+
+def load_users_admin():
+    """Return every user's admin-view dict (name, role, must_change_password), ordered by name."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT name, role, must_change_password FROM users ORDER BY name"
+        ).fetchall()
+    finally:
+        conn.close()
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["must_change_password"] = bool(d["must_change_password"])
+        result.append(d)
+    return result
+
+
+def update_user_role(name, role):
+    """Change a user's role only (name is the immutable primary key).
+
+    Raises ValueError for an unknown user, a role outside ASSIGNABLE_ROLES
+    (this also rejects promoting anyone to 'distributor' — exactly one may
+    ever exist), or when the target is the distributor account (its role is
+    permanent, not just protected while it's the last one).
+    """
+    if role not in ASSIGNABLE_ROLES:
+        raise ValueError(f"invalid role {role!r}")
+    conn = get_db()
+    try:
+        with conn:
+            row = conn.execute("SELECT role FROM users WHERE name = ?", (name,)).fetchone()
+            if row is None:
+                raise ValueError(f"user {name!r} not found")
+            if row["role"] == "distributor":
+                raise ValueError("the distributor account's role cannot be changed")
+            conn.execute("UPDATE users SET role = ? WHERE name = ?", (role, name))
+    finally:
+        conn.close()
+
+
+# Live-join reference checks only. Deliberately excludes corrections.requested_by /
+# amendments.amended_by / amendment_requests.requested_by|resolved_by — those are
+# frozen audit-trail text snapshots, not live joins, so a since-deleted user's
+# name staying there is harmless and does not block deletion.
+_USER_REFERENCE_QUERIES = [
+    ("beats.salesman",                    "SELECT 1 FROM beats WHERE salesman = ? LIMIT 1"),
+    ("vouchers.salesman",                 "SELECT 1 FROM vouchers WHERE salesman = ? LIMIT 1"),
+    ("vouchers.created_by",               "SELECT 1 FROM vouchers WHERE created_by = ? LIMIT 1"),
+    ("installments.salesman",             "SELECT 1 FROM installments WHERE salesman = ? LIMIT 1"),
+    ("installments.created_by",           "SELECT 1 FROM installments WHERE created_by = ? LIMIT 1"),
+    ("completed_vouchers.salesman",       "SELECT 1 FROM completed_vouchers WHERE salesman = ? LIMIT 1"),
+    ("completed_vouchers.created_by",     "SELECT 1 FROM completed_vouchers WHERE created_by = ? LIMIT 1"),
+    ("completed_installments.salesman",   "SELECT 1 FROM completed_installments WHERE salesman = ? LIMIT 1"),
+    ("completed_installments.created_by", "SELECT 1 FROM completed_installments WHERE created_by = ? LIMIT 1"),
+]
+
+
+def user_is_referenced(conn, name):
+    """True if `name` appears in any live master-data column (see
+    _USER_REFERENCE_QUERIES). Takes an open connection so callers can check
+    inside the same transaction as a delete, avoiding a check-then-write race."""
+    return any(conn.execute(sql, (name,)).fetchone() for _, sql in _USER_REFERENCE_QUERIES)
+
+
+def delete_user(name, current_user_name):
+    """Hard delete. Raises ValueError if the user doesn't exist, is the
+    caller's own account (self-lockout guard), is the distributor account
+    (permanent — can never be deleted, not just protected while it's the
+    last one), or is referenced by existing beats/vouchers/installments."""
+    conn = get_db()
+    try:
+        with conn:
+            row = conn.execute("SELECT role FROM users WHERE name = ?", (name,)).fetchone()
+            if row is None:
+                raise ValueError(f"user {name!r} not found")
+            if name == current_user_name:
+                raise ValueError("you cannot delete your own account")
+            if row["role"] == "distributor":
+                raise ValueError("the distributor account cannot be deleted")
+            if user_is_referenced(conn, name):
+                raise ValueError(
+                    f"user {name!r} is referenced in existing vouchers/installments/beats"
+                    " and cannot be deleted")
+            conn.execute("DELETE FROM users WHERE name = ?", (name,))
+    finally:
+        conn.close()
+
+
+def set_user_password(name, password_hash_value, must_change_password):
+    """Low-level primitive: overwrite a user's password hash and forced-change flag."""
+    conn = get_db()
+    try:
+        with conn:
+            cur = conn.execute(
+                "UPDATE users SET password_hash = ?, must_change_password = ? WHERE name = ?",
+                (password_hash_value, 1 if must_change_password else 0, name),
+            )
+            if cur.rowcount == 0:
+                raise ValueError(f"user {name!r} not found")
+    finally:
+        conn.close()
+
+
+def reset_user_password(name, new_password, confirm_password):
+    """Distributor-initiated reset. Always sets must_change_password=1 — the
+    user must set their own password again at next login, same as a freshly
+    created account."""
+    _validate_password(new_password, confirm_password)
+    set_user_password(name, hash_password(new_password), must_change_password=True)
+
+
+def change_own_password(name, current_password, new_password, confirm_password):
+    """Self-service password change (/profile). Verifies current_password,
+    rejects new==current, and clears must_change_password on success — this
+    is the mechanism that resolves the forced-first-login-change flow.
+    """
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT password_hash FROM users WHERE name = ?", (name,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise ValueError(f"user {name!r} not found")
+    if not _verify_password(row["password_hash"], current_password):
+        raise ValueError("current password is incorrect")
+    if new_password != confirm_password:
+        raise ValueError("new password and confirmation do not match")
+    if new_password == current_password:
+        raise ValueError("new password must be different from the current password")
+    _validate_password(new_password)
+    set_user_password(name, hash_password(new_password), must_change_password=False)
+
+
+# ---------------------------------------------------------------------------
+# Beat lifecycle management
+# ---------------------------------------------------------------------------
+
+def create_beat(name, salesman):
+    """Raises ValueError for an empty/invalid name, an unknown/non-salesman
+    assignee, or a duplicate beat name."""
+    name = _validate_new_name(name, "beat")
+    salesman = (salesman or "").strip()
+    conn = get_db()
+    try:
+        with conn:
+            row = conn.execute(
+                "SELECT 1 FROM users WHERE name = ? AND role = 'salesman'", (salesman,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown salesman {salesman!r}")
+            try:
+                conn.execute(
+                    "INSERT INTO beats (name, salesman) VALUES (?, ?)", (name, salesman)
+                )
+            except sqlite3.IntegrityError:
+                raise ValueError(f"beat {name!r} already exists")
+    finally:
+        conn.close()
+
+
+def update_beat_salesman(name, salesman):
+    """Reassign a beat's salesman only (name is the immutable primary key).
+
+    Raises ValueError for an unknown beat or an unknown/non-salesman assignee.
+    """
+    salesman = (salesman or "").strip()
+    conn = get_db()
+    try:
+        with conn:
+            row = conn.execute(
+                "SELECT 1 FROM users WHERE name = ? AND role = 'salesman'", (salesman,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"unknown salesman {salesman!r}")
+            cur = conn.execute(
+                "UPDATE beats SET salesman = ? WHERE name = ?", (salesman, name)
+            )
+            if cur.rowcount == 0:
+                raise ValueError(f"beat {name!r} not found")
+    finally:
+        conn.close()
+
+
+_BEAT_REFERENCE_QUERIES = [
+    ("vouchers.beat",           "SELECT 1 FROM vouchers WHERE beat = ? LIMIT 1"),
+    ("completed_vouchers.beat", "SELECT 1 FROM completed_vouchers WHERE beat = ? LIMIT 1"),
+]
+
+
+def beat_is_referenced(conn, name):
+    """True if `name` appears as a beat on any current or historical voucher."""
+    return any(conn.execute(sql, (name,)).fetchone() for _, sql in _BEAT_REFERENCE_QUERIES)
+
+
+def delete_beat(name):
+    """Hard delete. Raises ValueError if the beat doesn't exist or has
+    existing vouchers (active or historical) referencing it."""
+    conn = get_db()
+    try:
+        with conn:
+            row = conn.execute("SELECT 1 FROM beats WHERE name = ?", (name,)).fetchone()
+            if row is None:
+                raise ValueError(f"beat {name!r} not found")
+            if beat_is_referenced(conn, name):
+                raise ValueError(
+                    f"beat {name!r} has existing vouchers (active or historical)"
+                    " and cannot be deleted")
+            conn.execute("DELETE FROM beats WHERE name = ?", (name,))
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -692,20 +1184,57 @@ def _append_installments(conn, vouchers, created_by="app"):
 
     created_by is the audit identity of the user performing the post —
     callers should pass the logged-in user's name. Raises ValueError on an
-    unparseable payment so the enclosing transaction rolls back.
+    unparseable payment so the enclosing transaction rolls back. Returns
+    dict[bill_no -> new installment id] for the rows just inserted, so a
+    caller (_append_checks) can link a check row to its installment.
     """
     today = datetime.now().strftime("%Y-%m-%d")
     created_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    installment_ids = {}
     for v in vouchers:
         amount = _parse_payment_strict(v)
         if amount is None or amount <= 0:
             continue
         collection_date = (v.get("payment_date") or "").strip() or today
-        conn.execute(
+        payment_type = (v.get("payment_type") or "cash").strip() or "cash"
+        payment_ref = ""
+        if payment_type == "upi" and (v.get("upi_txn_id") or "").strip():
+            payment_ref = json.dumps({"txn_id": v["upi_txn_id"].strip()})
+        cur = conn.execute(
             "INSERT INTO installments"
-            " (bill_no, date, amount, salesman, created_by, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (v["bill_no"], collection_date, str(amount), v["salesman"], created_by, created_at),
+            " (bill_no, date, amount, salesman, created_by, created_at,"
+            " payment_type, payment_ref)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (v["bill_no"], collection_date, str(amount), v["salesman"], created_by, created_at,
+             payment_type, payment_ref),
+        )
+        installment_ids[v["bill_no"]] = cur.lastrowid
+    return installment_ids
+
+
+def _append_checks(conn, vouchers, installment_ids, recorded_by="app"):
+    """Insert one 'pending' checks row per voucher paid by check, on an open
+    connection. installment_ids is the dict _append_installments just
+    returned, used only as an audit pointer (checks.installment_id is not
+    FK-enforced — see the DDL comment). Raises ValueError on an unparseable
+    payment so the enclosing transaction rolls back."""
+    recorded_at = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    for v in vouchers:
+        if (v.get("payment_type") or "").strip() != "check":
+            continue
+        amount = _parse_payment_strict(v)
+        if amount is None or amount <= 0:
+            continue
+        conn.execute(
+            "INSERT INTO checks"
+            " (installment_id, bill_no, beat, salesman, bank, branch, check_no,"
+            " check_date, amount, status, recorded_by, recorded_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+            (installment_ids.get(v["bill_no"]), v["bill_no"],
+             v.get("beat", ""), v.get("salesman", ""),
+             (v.get("check_bank") or "").strip(), (v.get("check_branch") or "").strip(),
+             (v.get("check_no") or "").strip(), (v.get("check_date") or "").strip(),
+             str(amount), recorded_by, recorded_at),
         )
 
 
@@ -804,7 +1333,8 @@ def apply_post_to_db(vouchers, created_by="app"):
             # settled vouchers are only archived (deleted) afterwards, so the
             # FK is satisfied when the installment rows are inserted.
             completed = _update_vouchers_balance(conn, vouchers)
-            _append_installments(conn, vouchers, created_by)
+            installment_ids = _append_installments(conn, vouchers, created_by)
+            _append_checks(conn, vouchers, installment_ids, created_by)
             if completed:
                 _archive_completed(conn, completed)
         return completed
@@ -1252,6 +1782,264 @@ def apply_voucher_amendment(bill_no, snapshot, new_state, amended_by, note="", n
     return load_amendment(aid)
 
 
+# ---------------------------------------------------------------------------
+# Amendment requests
+# ---------------------------------------------------------------------------
+
+def insert_amendment_request(bill_no, note, requested_by, requested_at):
+    """Insert a new open amendment request; returns its id.
+
+    Free-text note only — validation of bill_no/eligibility is the caller's
+    job (coll_orchestrate.raise_amendment_request).
+    """
+    conn = get_db()
+    try:
+        with conn:
+            cur = conn.execute(
+                "INSERT INTO amendment_requests"
+                " (bill_no, note, status, requested_by, requested_at)"
+                " VALUES (?, ?, 'open', ?, ?)",
+                (bill_no, note or "", requested_by, requested_at))
+            return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def load_amendment_request(req_id):
+    """Return one amendment request as a dict, or None."""
+    if not _db_path().exists():
+        return None
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT * FROM amendment_requests WHERE id = ?", (req_id,)).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
+
+
+def load_amendment_requests(statuses=None, limit=None):
+    """Return amendment requests (most recent first), optionally filtered by
+    an iterable of statuses and capped at `limit` rows."""
+    if not _db_path().exists():
+        return []
+    sql = "SELECT * FROM amendment_requests"
+    params = []
+    statuses = list(statuses or [])
+    if statuses:
+        sql += " WHERE status IN (%s)" % ",".join("?" * len(statuses))
+        params.extend(statuses)
+    sql += " ORDER BY id DESC"
+    if limit:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    conn = get_db()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def open_amendment_requests_for_bills(bill_nos):
+    """Return dict[bill_no -> list of open amendment-request dicts]."""
+    unique = sorted({b for b in bill_nos if b})
+    if not unique or not _db_path().exists():
+        return {}
+    conn = get_db()
+    try:
+        ph = ",".join("?" * len(unique))
+        rows = conn.execute(
+            f"SELECT * FROM amendment_requests WHERE status = 'open'"
+            f" AND bill_no IN ({ph}) ORDER BY id",
+            unique).fetchall()
+    finally:
+        conn.close()
+    result = {}
+    for r in rows:
+        result.setdefault(r["bill_no"], []).append(dict(r))
+    return result
+
+
+def resolve_amendment_request(req_id, status, resolved_by, resolution_note="", now=None):
+    """Stamp a reject/withdraw resolution on an open request (one UPDATE).
+
+    Raises ValueError if the request is missing or no longer open. For
+    'applied' use auto_resolve_amendment_requests, triggered by an actual
+    voucher amendment landing on the bill.
+    """
+    if status not in ("rejected", "withdrawn"):
+        raise ValueError(f"resolve_amendment_request cannot set status {status!r}")
+    now = now or datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    conn = get_db()
+    try:
+        with conn:
+            cur = conn.execute(
+                "UPDATE amendment_requests SET status = ?, resolved_by = ?,"
+                " resolved_at = ?, resolution_note = ? WHERE id = ? AND status = 'open'",
+                (status, resolved_by, now, resolution_note or "", req_id))
+            if cur.rowcount == 0:
+                raise ValueError(f"amendment request {req_id} is not open")
+    finally:
+        conn.close()
+    return load_amendment_request(req_id)
+
+
+def auto_resolve_amendment_requests(bill_no, resolved_by, amendment_id, now=None):
+    """Auto-close every open amendment request on `bill_no` as 'applied',
+    linking them to the amendment that resolved them. Called as a side
+    effect of apply_voucher_amendment landing on that bill — any open
+    request is presumed addressed by the edit, regardless of whether its
+    note matches the specific fields changed."""
+    now = now or datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    conn = get_db()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE amendment_requests SET status = 'applied', resolved_by = ?,"
+                " resolved_at = ?, linked_amendment_id = ? WHERE bill_no = ? AND status = 'open'",
+                (resolved_by, now, amendment_id, bill_no))
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Checks
+# ---------------------------------------------------------------------------
+
+def load_check(check_id):
+    """Return one check as a dict, or None."""
+    if not _db_path().exists():
+        return None
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT * FROM checks WHERE id = ?", (check_id,)).fetchone()
+    finally:
+        conn.close()
+    return dict(row) if row else None
+
+
+def load_checks(statuses=None, limit=None):
+    """Return checks (most recent first), optionally filtered by an iterable
+    of statuses and capped at `limit` rows."""
+    if not _db_path().exists():
+        return []
+    sql = "SELECT * FROM checks"
+    params = []
+    statuses = list(statuses or [])
+    if statuses:
+        sql += " WHERE status IN (%s)" % ",".join("?" * len(statuses))
+        params.extend(statuses)
+    sql += " ORDER BY id DESC"
+    if limit:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    conn = get_db()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def check_summary_counts(today=None, due_soon_days=2):
+    """Return {'due_soon': n, 'overdue': n, 'bounced': n} for the menu banner
+    and the Checks screen header.
+
+    due_soon / overdue are not stored states — derived here from a pending
+    check's check_date against `today` (default: real today), exactly like
+    every other "open thing blocks/flags something" query in this app is
+    computed at render time rather than persisted. bounced is an all-time
+    count: bounced is terminal and there is no dismiss/acknowledge action.
+    """
+    if not _db_path().exists():
+        return {"due_soon": 0, "overdue": 0, "bounced": 0}
+    if today is None:
+        today = datetime.now().date()
+    elif isinstance(today, str):
+        today = datetime.strptime(today, "%Y-%m-%d").date()
+    today_iso = today.isoformat()
+    due_by_iso = (today + timedelta(days=due_soon_days)).isoformat()
+    conn = get_db()
+    try:
+        due_soon = conn.execute(
+            "SELECT COUNT(*) FROM checks WHERE status = 'pending'"
+            " AND check_date >= ? AND check_date <= ?",
+            (today_iso, due_by_iso)).fetchone()[0]
+        overdue = conn.execute(
+            "SELECT COUNT(*) FROM checks WHERE status = 'pending' AND check_date < ?",
+            (today_iso,)).fetchone()[0]
+        bounced = conn.execute(
+            "SELECT COUNT(*) FROM checks WHERE status = 'bounced'").fetchone()[0]
+    finally:
+        conn.close()
+    return {"due_soon": due_soon, "overdue": overdue, "bounced": bounced}
+
+
+def mark_check_encashed(check_id, resolved_by, resolution_note="", now=None):
+    """Flip a pending check to 'encashed' (one open-only UPDATE) — the money
+    was confirmed received; no further action. Raises ValueError if the
+    check is missing or not pending. Returns the updated dict."""
+    now = now or datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    conn = get_db()
+    try:
+        with conn:
+            cur = conn.execute(
+                "UPDATE checks SET status = 'encashed', resolved_by = ?,"
+                " resolved_at = ?, resolution_note = ? WHERE id = ? AND status = 'pending'",
+                (resolved_by, now, resolution_note or "", check_id))
+            if cur.rowcount == 0:
+                raise ValueError(f"check {check_id} is not pending")
+    finally:
+        conn.close()
+    return load_check(check_id)
+
+
+def mark_check_bounced(check_id, resolved_by, resolution_note="", now=None):
+    """Bounce a pending check: delete its underlying installment (the money
+    was never actually received) and recompute the voucher balance from
+    scratch via _recompute_voucher_balance — the same invariant-preserving
+    path an installment_delete correction uses (balance = amount minus the
+    SUM of what's left in installments) — then flip status to 'bounced'.
+    One transaction.
+
+    If the voucher has already been archived (fully settled and moved to
+    completed_vouchers/completed_installments by this very check), its
+    installment row is gone and cannot be un-archived here — that's out of
+    scope for this iteration. The check is still marked bounced, with a
+    note explaining why the balance wasn't touched; the distributor can use
+    Amend Voucher for a manual fix if that edge case needs one.
+
+    Raises ValueError if the check is missing or not pending.
+    """
+    now = now or datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    conn = get_db()
+    try:
+        with conn:
+            row = conn.execute("SELECT * FROM checks WHERE id = ?", (check_id,)).fetchone()
+            if row is None or row["status"] != "pending":
+                raise ValueError(f"check {check_id} is not pending")
+            note = resolution_note or ""
+            inst = None
+            if row["installment_id"] is not None:
+                inst = conn.execute(
+                    "SELECT id FROM installments WHERE id = ? AND bill_no = ?",
+                    (row["installment_id"], row["bill_no"])).fetchone()
+            if inst is not None:
+                conn.execute("DELETE FROM installments WHERE id = ?", (inst["id"],))
+                _recompute_voucher_balance(conn, row["bill_no"])
+            else:
+                note = (note + " " if note else "") + (
+                    "(voucher already archived — balance not auto-adjusted)")
+            conn.execute(
+                "UPDATE checks SET status = 'bounced', resolved_by = ?,"
+                " resolved_at = ?, resolution_note = ? WHERE id = ?",
+                (resolved_by, now, note, check_id))
+    finally:
+        conn.close()
+    return load_check(check_id)
+
+
 def write_new_vouchers(vouchers):
     """Insert new vouchers into the vouchers table.
 
@@ -1514,11 +2302,20 @@ def _installments_path(report_path):
     return report_path.parent / f"{report_path.stem}-installments.json"
 
 
+_PAYMENT_TYPE_SIDECAR_KEYS = (
+    "payment_type", "upi_txn_id", "check_bank", "check_branch", "check_no", "check_date")
+
+
 def _save_installments(report_path, vouchers, bookmark_bill_no=None):
-    data = {
-        v["bill_no"]: {"payment": v["payment"], "date": v.get("payment_date", "")}
-        for v in vouchers if v.get("payment")
-    }
+    data = {}
+    for v in vouchers:
+        if not v.get("payment"):
+            continue
+        entry = {"payment": v["payment"], "date": v.get("payment_date", "")}
+        for key in _PAYMENT_TYPE_SIDECAR_KEYS:
+            if v.get(key):
+                entry[key] = v[key]
+        data[v["bill_no"]] = entry
     if bookmark_bill_no:
         data["__bookmark__"] = bookmark_bill_no
     with _installments_path(report_path).open("w", encoding="utf-8") as f:
@@ -1871,3 +2668,28 @@ def load_addv_pending_finalize():
         if stages.get("confirm") == "confirmed" and stages.get("post") != "confirmed":
             result.append((path, data))
     return result
+
+
+def load_addv_batches():
+    """Return (path, data) pairs for every non-archived addv batch, regardless
+    of stage — used by the web-only onboarding hub, which derives its own
+    status (pending_review/awaiting_resolution/ready_to_post) instead of
+    relying on the old stages.confirm/post flags the CLI still uses."""
+    if not STAGING_DIR.exists():
+        return []
+    result = []
+    for path in sorted(STAGING_DIR.glob("addv*.json")):
+        try:
+            with path.open(encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        result.append((path, data))
+    return result
+
+
+def delete_staged_report(path):
+    """Delete a staging JSON file outright (e.g. rejecting a bad addv batch)."""
+    path.unlink(missing_ok=True)

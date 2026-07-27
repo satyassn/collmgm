@@ -2,26 +2,27 @@
 {% block title %}Generate Collection List — CollMgm{% endblock %}
 {% block content %}
 <h2 class="page-heading">Generate Collection List</h2>
-<p class="step-label">Select beat</p>
 
 {% if error %}
   <p class="alert alert-error">{{ error }}</p>
 {% endif %}
 
-<form method="post" action="/coll/start/beat">
+<form method="post" action="/coll/start/generate" id="start-form">
   <div class="form-group">
     <label for="beat">Beat</label>
     <select id="beat" name="beat" required>
       <option value="">— choose —</option>
       {% for b in beats %}
-        <option value="{{ b }}" {% if active.get(b) %}disabled{% endif %}>{{ b }}
+        <option value="{{ b }}" {% if active.get(b) %}disabled{% endif %} {% if b == selected_beat %}selected{% endif %}>{{ b }}
           {%- if summary.get(b) %} ({{ summary[b]["total"] }} vouchers){% endif %}
+          {%- if beats_map.get(b) %} — salesman: {{ beats_map[b] }}{% endif %}
           {%- if active.get(b) %} — {{ active[b] }}{% endif %}
         </option>
       {% endfor %}
     </select>
   </div>
-  <button type="submit" class="btn btn-primary">Next</button>
+
+  <button type="submit" class="btn btn-primary">Generate</button>
   <a class="btn btn-secondary" href="/menu">Cancel</a>
 </form>
 {% endblock %}

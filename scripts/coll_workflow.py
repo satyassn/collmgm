@@ -190,7 +190,7 @@ def run_coll_start(current_user):
 
             continue  # back to beat selection
 
-        outcome = generate_collection_list(beat, chosen_salesman, vouchers)
+        outcome = generate_collection_list("beat_salesman", [beat, chosen_salesman], vouchers)
         if not outcome.ok:
             if outcome.reason == "lock_conflict":
                 print(f"\nBeat '{beat}' was just claimed by another session. Please retry.")

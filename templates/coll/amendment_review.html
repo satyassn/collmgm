@@ -23,28 +23,32 @@
 
 <h3 class="group-heading">Installments Before</h3>
 {% if amendment.old.installments %}
-<table class="data-table">
+<div class="table-wrapper">
+<table class="data-table card-table">
   <thead><tr><th>Date</th><th class="num">Amount</th><th>Salesman</th></tr></thead>
   <tbody>
     {% for i in amendment.old.installments %}
-    <tr><td>{{ i.date }}</td><td class="num mono">{{ i.amount }}</td><td>{{ i.salesman }}</td></tr>
+    <tr><td data-label="Date">{{ i.date }}</td><td class="num mono" data-label="Amount">{{ i.amount }}</td><td data-label="Salesman">{{ i.salesman }}</td></tr>
     {% endfor %}
   </tbody>
 </table>
+</div>
 {% else %}
 <p class="muted">None.</p>
 {% endif %}
 
 <h3 class="group-heading">Installments After</h3>
 {% if amendment.new.installments %}
-<table class="data-table">
+<div class="table-wrapper">
+<table class="data-table card-table">
   <thead><tr><th>Date</th><th class="num">Amount</th><th>Salesman</th></tr></thead>
   <tbody>
     {% for i in amendment.new.installments %}
-    <tr><td>{{ i.date }}</td><td class="num mono">{{ i.amount }}</td><td>{{ i.salesman }}</td></tr>
+    <tr><td data-label="Date">{{ i.date }}</td><td class="num mono" data-label="Amount">{{ i.amount }}</td><td data-label="Salesman">{{ i.salesman }}</td></tr>
     {% endfor %}
   </tbody>
 </table>
+</div>
 {% else %}
 <p class="muted">None.</p>
 {% endif %}

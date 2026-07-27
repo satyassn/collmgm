@@ -8,20 +8,22 @@
 {% else %}
   {% for beat, vouchers in grouped.items() %}
   <h3 class="group-heading">{{ beat }} <span class="group-total">({{ totals.get(beat,0) }})</span></h3>
-  <table class="data-table">
+  <div class="table-wrapper">
+  <table class="data-table card-table">
     <thead>
       <tr><th>Bill No</th><th>Date</th><th class="num">Balance</th></tr>
     </thead>
     <tbody>
       {% for v in vouchers %}
       <tr>
-        <td class="mono"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
-        <td>{{ v.date }}</td>
-        <td class="num mono">{{ v.balance }}</td>
+        <td class="mono" data-label="Bill No"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
+        <td data-label="Date">{{ v.date }}</td>
+        <td class="num mono" data-label="Balance">{{ v.balance }}</td>
       </tr>
       {% endfor %}
     </tbody>
   </table>
+  </div>
   {% endfor %}
   <p class="grand-total">Grand total: <strong>{{ grand }}</strong></p>
 {% endif %}
