@@ -128,7 +128,7 @@ Cancel: salesman at generation, supervisor/distributor at approve-list, salesman
 - Menu labels and screen headers: **Title Case**
 - Screen headers must match the corresponding menu label exactly — no technical prefixes (e.g. no `coll-start - `)
 - Document file headers (TXT/HTML): **ALL CAPS** (e.g. `COLLECTION LIST`)
-- "Confirm" is reserved for user acknowledgement prompts (e.g. "Keep this collection list? y/n"), not for supervisor sign-off actions
+- "Confirm" is reserved for user acknowledgement prompts (e.g. "Start this collection list? y/n"), not for supervisor sign-off actions
 
 ---
 

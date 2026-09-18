@@ -207,7 +207,7 @@ def run_coll_start(current_user):
         print(txt_path.read_text(encoding="utf-8"))
 
         while True:
-            confirm = read_input("Keep this collection list? (y/n): ").strip().lower()
+            confirm = read_input("Start this collection list? (y/n): ").strip().lower()
             if confirm in ("y", "yes", "n", "no"):
                 break
             print("Please enter 'y' or 'n'.")

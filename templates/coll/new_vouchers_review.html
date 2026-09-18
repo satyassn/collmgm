@@ -9,24 +9,84 @@
   <ul class="report-list">
     {% for v in vouchers %}
     {% set status = v.get("review_status", "pending") %}
-    <li class="report-item">
+    {% set insts = installments_by_bill.get(v.bill_no, []) %}
+    <li class="report-item" data-bill-no="{{ v.bill_no }}" data-review-row>
       <span class="report-label">
-        <span class="mono">{{ v.bill_no }}</span> — {{ v.date }} — <span class="mono">{{ v.amount }}</span>
-        <span class="badge badge-{{ 'ok' if status == 'reviewed' else 'warn' if status == 'flagged' else 'muted' }}">{{ status }}</span>
+        <a href="#" class="voucher-link install-toggle" data-target="inst-{{ loop.index }}" aria-expanded="false">{{ v.bill_no }}</a>
+        — {{ v.date }} — <span class="mono">{{ v.amount }}</span>
+        <span class="badge badge-{{ 'ok' if status == 'reviewed' else 'warn' if status == 'flagged' else 'muted' }}" data-review-badge>{{ status }}</span>
       </span>
       <span class="report-meta">{{ v.beat }}</span>
+      <span data-review-actions>
       {% if status == "pending" %}
-      <form method="post" action="/coll/new-vouchers/{{ stem }}/review/{{ v.bill_no | urlencode }}">
-        <input type="hidden" name="action" value="clear">
-        <button type="submit" class="btn btn-sm btn-primary">Looks Good</button>
-      </form>
-      <a class="btn btn-sm btn-secondary" href="/coll/new-vouchers/{{ stem }}/review/{{ v.bill_no | urlencode }}">Raise Issue</a>
+        <button type="button" class="btn btn-sm btn-primary looks-good-btn"
+                data-bill-no="{{ v.bill_no }}">Looks Good</button>
+        <a class="btn btn-sm btn-secondary" href="/coll/new-vouchers/{{ stem }}/review/{{ v.bill_no | urlencode }}">Raise Issue</a>
       {% else %}
-      <a class="btn btn-sm btn-secondary" href="/coll/new-vouchers/{{ stem }}/review/{{ v.bill_no | urlencode }}">View</a>
+        <a class="btn btn-sm btn-secondary" href="/coll/new-vouchers/{{ stem }}/review/{{ v.bill_no | urlencode }}">View</a>
       {% endif %}
+      </span>
+    </li>
+    <li class="report-item inline-installments-row" id="inst-{{ loop.index }}" hidden>
+      <div class="inline-installments">
+        {% if insts %}
+          {% for inst in insts %}
+          <div class="inline-inst-row">
+            <span>{{ inst.date }}</span>
+            <span class="mono">{{ inst.amount }}</span>
+          </div>
+          {% endfor %}
+        {% else %}
+          <p class="muted">No installments recorded for this voucher yet.</p>
+        {% endif %}
+      </div>
     </li>
     {% endfor %}
   </ul>
 {% endif %}
 <a class="btn btn-secondary" href="/coll/new-vouchers">Back</a>
+
+<script>
+(function () {
+  document.querySelectorAll(".install-toggle").forEach(function (link) {
+    link.addEventListener("click", function (e) {
+      e.preventDefault();
+      var target = document.getElementById(link.dataset.target);
+      if (!target) return;
+      target.hidden = !target.hidden;
+      link.setAttribute("aria-expanded", String(!target.hidden));
+    });
+  });
+
+  var list = document.querySelector(".report-list");
+  if (!list) return;
+  list.addEventListener("click", function (e) {
+    var btn = e.target.closest(".looks-good-btn");
+    if (!btn) return;
+    var row = btn.closest("[data-review-row]");
+    var billNo = btn.dataset.billNo;
+    btn.disabled = true;
+    fetch("/coll/new-vouchers/{{ stem }}/review/" + encodeURIComponent(billNo) + "/clear", {
+      method: "POST",
+      credentials: "same-origin",
+    }).then(function (resp) {
+      if (resp.status === 401) { window.location.href = "/login"; return; }
+      if (!resp.ok) {
+        btn.disabled = false;
+        window.alert("Could not save — check the connection and retry.");
+        return;
+      }
+      var badge = row.querySelector("[data-review-badge]");
+      badge.textContent = "reviewed";
+      badge.className = "badge badge-ok";
+      var actions = row.querySelector("[data-review-actions]");
+      actions.innerHTML = '<a class="btn btn-sm btn-secondary" href="/coll/new-vouchers/{{ stem }}/review/'
+        + encodeURIComponent(billNo) + '">View</a>';
+    }).catch(function () {
+      btn.disabled = false;
+      window.alert("Could not save — check the connection and retry.");
+    });
+  });
+})();
+</script>
 {% endblock %}

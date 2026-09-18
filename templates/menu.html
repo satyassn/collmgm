@@ -12,86 +12,159 @@
 {% endif %}
 <nav class="menu-grid">
   {% if "coll_start" in perms %}
-    <a class="menu-card" href="/coll/start">
-      <span class="menu-icon">&#128196;</span>
-      <span>Generate Collection List</span>
-    </a>
+    <div class="menu-card-wrap">
+      <a class="menu-card" href="/coll/start">
+        <span class="menu-icon">&#128196;</span>
+        <span>Generate Collection List</span>
+      </a>
+      <button type="button" class="menu-help-toggle" aria-expanded="false" aria-controls="help-start" aria-label="What does this do?">?</button>
+      <p class="menu-help-text" id="help-start" hidden>Creates a fresh voucher list for one beat and salesman to collect payments against today.</p>
+    </div>
   {% endif %}
   {% if "coll_approve_start" in perms %}
-    <a class="menu-card" href="/coll/approve-start">
-      <span class="menu-icon">&#9989;</span>
-      <span>Approve Collection List</span>
-    </a>
+    <div class="menu-card-wrap">
+      <a class="menu-card" href="/coll/approve-start">
+        <span class="menu-icon">&#9989;</span>
+        <span>Approve Collection List</span>
+      </a>
+      <button type="button" class="menu-help-toggle" aria-expanded="false" aria-controls="help-approve-start" aria-label="What does this do?">?</button>
+      <p class="menu-help-text" id="help-approve-start" hidden>Supervisor reviews a freshly generated list and approves it before it goes out to the field.</p>
+    </div>
   {% endif %}
   {% if "coll_submit" in perms %}
-    <a class="menu-card" href="/coll/submit">
-      <span class="menu-icon">&#128176;</span>
-      <span>Submit Collections</span>
-    </a>
+    <div class="menu-card-wrap">
+      <a class="menu-card" href="/coll/submit">
+        <span class="menu-icon">&#128176;</span>
+        <span>Submit Collections</span>
+      </a>
+      <button type="button" class="menu-help-toggle" aria-expanded="false" aria-controls="help-submit" aria-label="What does this do?">?</button>
+      <p class="menu-help-text" id="help-submit" hidden>Salesman records the payments collected against each voucher on an approved list.</p>
+    </div>
   {% endif %}
   {% if "coll_print" in perms %}
-    <a class="menu-card" href="/coll/print">
-      <span class="menu-icon">&#128424;</span>
-      <span>Print Collection List</span>
-    </a>
+    <div class="menu-card-wrap">
+      <a class="menu-card" href="/coll/print">
+        <span class="menu-icon">&#128424;</span>
+        <span>Print Collection List</span>
+      </a>
+      <button type="button" class="menu-help-toggle" aria-expanded="false" aria-controls="help-print" aria-label="What does this do?">?</button>
+      <p class="menu-help-text" id="help-print" hidden>Prints or saves a paper copy of an approved collection list.</p>
+    </div>
   {% endif %}
   {% if "coll_approve_submit" in perms %}
-    <a class="menu-card" href="/coll/approve-submit">
-      <span class="menu-icon">&#128204;</span>
-      <span>Approve Collections</span>
-    </a>
+    <div class="menu-card-wrap">
+      <a class="menu-card" href="/coll/approve-submit">
+        <span class="menu-icon">&#128204;</span>
+        <span>Approve Collections</span>
+      </a>
+      <button type="button" class="menu-help-toggle" aria-expanded="false" aria-controls="help-approve-submit" aria-label="What does this do?">?</button>
+      <p class="menu-help-text" id="help-approve-submit" hidden>Supervisor reviews the payments a salesman submitted before they can be posted.</p>
+    </div>
   {% endif %}
   {% if "coll_post" in perms %}
-    <a class="menu-card" href="/coll/post">
-      <span class="menu-icon">&#128229;</span>
-      <span>Post Collections</span>
-    </a>
+    <div class="menu-card-wrap">
+      <a class="menu-card" href="/coll/post">
+        <span class="menu-icon">&#128229;</span>
+        <span>Post Collections</span>
+      </a>
+      <button type="button" class="menu-help-toggle" aria-expanded="false" aria-controls="help-post" aria-label="What does this do?">?</button>
+      <p class="menu-help-text" id="help-post" hidden>Distributor writes approved payments into the permanent records — the final step of a collection cycle.</p>
+    </div>
   {% endif %}
   {% if "raise_correction" in perms %}
-    <a class="menu-card" href="/coll/corrections">
-      <span class="menu-icon">&#128295;</span>
-      <span>Correction Requests</span>
-    </a>
+    <div class="menu-card-wrap">
+      <a class="menu-card" href="/coll/corrections">
+        <span class="menu-icon">&#128295;</span>
+        <span>Correction Requests</span>
+      </a>
+      <button type="button" class="menu-help-toggle" aria-expanded="false" aria-controls="help-corrections" aria-label="What does this do?">?</button>
+      <p class="menu-help-text" id="help-corrections" hidden>Raise or review a request to fix a specific mistake on a voucher's amount or an installment.</p>
+    </div>
   {% endif %}
   {% if "amend_voucher" in perms %}
-    <a class="menu-card" href="/coll/amend">
-      <span class="menu-icon">&#9998;</span>
-      <span>Amend Voucher</span>
-    </a>
+    <div class="menu-card-wrap">
+      <a class="menu-card" href="/coll/amend">
+        <span class="menu-icon">&#9998;</span>
+        <span>Amend Voucher</span>
+      </a>
+      <button type="button" class="menu-help-toggle" aria-expanded="false" aria-controls="help-amend" aria-label="What does this do?">?</button>
+      <p class="menu-help-text" id="help-amend" hidden>Distributor's direct editor for fixing a voucher or its installments outright.</p>
+    </div>
   {% endif %}
   {% if "raise_amendment_request" in perms %}
-    <a class="menu-card" href="/coll/amend-request">
-      <span class="menu-icon">&#128221;</span>
-      <span>Request Voucher Amendment</span>
-    </a>
+    <div class="menu-card-wrap">
+      <a class="menu-card" href="/coll/amend-request">
+        <span class="menu-icon">&#128221;</span>
+        <span>Request Voucher Amendment</span>
+      </a>
+      <button type="button" class="menu-help-toggle" aria-expanded="false" aria-controls="help-amend-request" aria-label="What does this do?">?</button>
+      <p class="menu-help-text" id="help-amend-request" hidden>Flag a voucher that needs the distributor's attention when no specific correction fits.</p>
+    </div>
   {% endif %}
   {% if "raise_amendment_request" in perms or "amend_voucher" in perms %}
-    <a class="menu-card" href="/coll/amend-requests">
-      <span class="menu-icon">&#128203;</span>
-      <span>Amendment Requests</span>
-    </a>
+    <div class="menu-card-wrap">
+      <a class="menu-card" href="/coll/amend-requests">
+        <span class="menu-icon">&#128203;</span>
+        <span>Amendment Requests</span>
+      </a>
+      <button type="button" class="menu-help-toggle" aria-expanded="false" aria-controls="help-amend-requests" aria-label="What does this do?">?</button>
+      <p class="menu-help-text" id="help-amend-requests" hidden>See open and resolved requests asking the distributor to fix a voucher.</p>
+    </div>
   {% endif %}
   {% if "view_checks" in perms %}
-    <a class="menu-card" href="/coll/checks">
-      <span class="menu-icon">&#128179;</span>
-      <span>Checks</span>
-    </a>
+    <div class="menu-card-wrap">
+      <a class="menu-card" href="/coll/checks">
+        <span class="menu-icon">&#128179;</span>
+        <span>Checks</span>
+      </a>
+      <button type="button" class="menu-help-toggle" aria-expanded="false" aria-controls="help-checks" aria-label="What does this do?">?</button>
+      <p class="menu-help-text" id="help-checks" hidden>Track checks received as payment — due soon, overdue, or bounced.</p>
+    </div>
   {% endif %}
   {% if "import_vouchers" in perms %}
-    <a class="menu-card" href="/coll/import-vouchers">
-      <span class="menu-icon">&#128228;</span>
-      <span>Import Vouchers</span>
-    </a>
+    <div class="menu-card-wrap">
+      <a class="menu-card" href="/coll/import-vouchers">
+        <span class="menu-icon">&#128228;</span>
+        <span>Import Vouchers</span>
+      </a>
+      <button type="button" class="menu-help-toggle" aria-expanded="false" aria-controls="help-import-vouchers" aria-label="What does this do?">?</button>
+      <p class="menu-help-text" id="help-import-vouchers" hidden>Bring a batch of existing vouchers, and any payments already made on them, into the system from a CSV file.</p>
+    </div>
   {% endif %}
   {% if "import_vouchers" in perms or "raise_correction" in perms or "amend_voucher" in perms or "post_new_vouchers" in perms %}
-    <a class="menu-card" href="/coll/new-vouchers">
-      <span class="menu-icon">&#128230;</span>
-      <span>New Voucher Batches</span>
-    </a>
+    <div class="menu-card-wrap">
+      <a class="menu-card" href="/coll/new-vouchers">
+        <span class="menu-icon">&#128230;</span>
+        <span>New Voucher Batches</span>
+      </a>
+      <button type="button" class="menu-help-toggle" aria-expanded="false" aria-controls="help-new-vouchers" aria-label="What does this do?">?</button>
+      <p class="menu-help-text" id="help-new-vouchers" hidden>Review an imported batch, resolve any raised issues, and post it into the system.</p>
+    </div>
   {% endif %}
-  <a class="menu-card" href="/reports">
-    <span class="menu-icon">&#128202;</span>
-    <span>Reports</span>
-  </a>
+  <div class="menu-card-wrap">
+    <a class="menu-card" href="/reports">
+      <span class="menu-icon">&#128202;</span>
+      <span>Reports</span>
+    </a>
+    <button type="button" class="menu-help-toggle" aria-expanded="false" aria-controls="help-reports" aria-label="What does this do?">?</button>
+    <p class="menu-help-text" id="help-reports" hidden>View collection summaries by salesman, beat, age, or amount.</p>
+  </div>
 </nav>
+
+<script>
+(function () {
+  var grid = document.querySelector(".menu-grid");
+  if (!grid) return;
+  grid.addEventListener("click", function (e) {
+    var btn = e.target.closest(".menu-help-toggle");
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    var target = document.getElementById(btn.getAttribute("aria-controls"));
+    if (!target) return;
+    target.hidden = !target.hidden;
+    btn.setAttribute("aria-expanded", String(!target.hidden));
+  });
+})();
+</script>
 {% endblock %}

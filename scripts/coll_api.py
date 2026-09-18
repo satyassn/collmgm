@@ -2033,8 +2033,11 @@ def coll_new_vouchers_review_list(request: Request, stem: str):
     if json_path is None:
         return _tmpl("error.html", request, user=user, message="Batch not found.")
     mine = addv_vouchers_for_salesman(data, user.name)
+    installments_by_bill = {}
+    for inst in data.get("installments", []):
+        installments_by_bill.setdefault(inst.get("bill_no"), []).append(inst)
     return _tmpl("coll/new_vouchers_review.html", request, user=user,
-                 stem=stem, vouchers=mine)
+                 stem=stem, vouchers=mine, installments_by_bill=installments_by_bill)
 
 
 def _render_addv_review_item(request, user, stem, data, bill_no, error=None):
@@ -2122,6 +2125,31 @@ def coll_new_vouchers_review_submit(request: Request, stem: str, bill_no: str,
         return item_error(str(e))
     save_report_json(json_path, data)
     return _r(f"/coll/new-vouchers/{stem}/review")
+
+
+@app.post("/coll/new-vouchers/{stem}/review/{bill_no}/clear")
+def coll_new_vouchers_review_clear_ajax(request: Request, stem: str, bill_no: str):
+    """JSON sibling of the "clear" branch above, called by the review-list
+    page script so ticking off vouchers doesn't reload the page (and lose
+    scroll position) for every single "Looks Good" click."""
+    user = _get_user(request)
+    if not user:
+        return JSONResponse({"ok": False, "error": "auth"}, status_code=401)
+    try:
+        perms = load_permissions()
+    except FileNotFoundError:
+        return JSONResponse({"ok": False, "error": "perms"}, status_code=403)
+    if "raise_correction" not in perms.get(user.role, frozenset()):
+        return JSONResponse({"ok": False, "error": "perms"}, status_code=403)
+    json_path, data = _load_addv_report(stem)
+    if json_path is None:
+        return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+    try:
+        clear_addv_review(data, bill_no, user.name)
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=409)
+    save_report_json(json_path, data)
+    return JSONResponse({"ok": True})
 
 
 # --- Distributor resolve ----------------------------------------------------

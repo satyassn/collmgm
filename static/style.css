@@ -249,6 +249,32 @@ input:focus, select:focus, textarea:focus {
 .menu-card:hover { border-color: var(--blue); box-shadow: 0 0 0 2px rgba(26,86,219,.18); }
 .menu-icon { font-size: 1.6rem; }
 
+.menu-card-wrap { position: relative; }
+.menu-help-toggle {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  z-index: 1;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  border: 1px solid var(--gray-200);
+  background: #fff;
+  color: var(--gray-600);
+  font-size: 0.8rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: var(--shadow);
+}
+.menu-help-toggle:hover { border-color: var(--blue); color: var(--blue); }
+.menu-help-text {
+  margin: 0.35rem 0.25rem 0;
+  font-size: 0.8rem;
+  color: var(--gray-600);
+  line-height: 1.35;
+}
+
 /* ---- Report list ---- */
 .report-list { list-style: none; margin-bottom: 1rem; }
 .report-item {
@@ -514,6 +540,10 @@ input.pay-input {
   box-shadow: none;
   border: 1px solid var(--gray-200);
 }
+/* .report-item sets display:flex, which beats the [hidden] attribute's UA
+   display:none (equal specificity, but author rules always win over UA
+   rules) — restore it so the install-toggle expand/collapse actually works. */
+.report-item[hidden] { display: none; }
 .inline-installments { font-size: 0.85rem; }
 .inline-inst-row {
   display: flex;
