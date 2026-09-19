@@ -16,6 +16,7 @@
   <span>Cash: <span id="type-cash-count">{{ type_totals.cash.count }}</span> / <strong id="type-cash-amount">{{ type_totals.cash.amount }}</strong></span>
   <span>UPI: <span id="type-upi-count">{{ type_totals.upi.count }}</span> / <strong id="type-upi-amount">{{ type_totals.upi.amount }}</strong></span>
   <span>Check: <span id="type-check-count">{{ type_totals.check.count }}</span> / <strong id="type-check-amount">{{ type_totals.check.amount }}</strong></span>
+  <span>Returns: <span id="type-returns-count">{{ type_totals.returns.count }}</span> / <strong id="type-returns-amount">{{ type_totals.returns.amount }}</strong></span>
 </div>
 
 <form method="post" action="/coll/submit/{{ stem }}">
@@ -59,6 +60,7 @@
               <option value="cash" {% if v.get("payment_type","cash") == "cash" %}selected{% endif %}>Cash</option>
               <option value="upi" {% if v.get("payment_type") == "upi" %}selected{% endif %}>UPI</option>
               <option value="check" {% if v.get("payment_type") == "check" %}selected{% endif %}>Check</option>
+              <option value="returns" {% if v.get("payment_type") == "returns" %}selected{% endif %}>Returns</option>
             </select>
           </td>
         </tr>
@@ -82,6 +84,29 @@
               <label class="field-label">Check date
                 <input type="date" name="checkdate_{{ v.bill_no }}" value="{{ v.get('check_date','') }}">
               </label>
+            </div>
+            <div class="field-group paytype-detail" data-paytype="returns">
+              <p class="muted">Stock the retailer returned. The items total becomes this voucher's payment.</p>
+              <div class="ret-items" data-pay="pay-{{ loop.index }}">
+                {% for it in (v.get("return_items") or [{}]) %}
+                <div class="ret-row">
+                  <input type="text" class="ret-item" name="retitem_{{ v.bill_no }}" maxlength="50"
+                         placeholder="Item" aria-label="Item" autocomplete="off" value="{{ it.get('item','') }}">
+                  {# step="any", no min: native validation on a hidden field would silently block Save; the server validates #}
+                  <input type="number" class="ret-qty" name="retqty_{{ v.bill_no }}" step="any"
+                         inputmode="numeric" placeholder="Qty" aria-label="Quantity" value="{{ it.get('qty','') }}">
+                  <input type="number" class="ret-price" name="retprice_{{ v.bill_no }}" step="any"
+                         inputmode="decimal" placeholder="Price" aria-label="Price" value="{{ it.get('price','') }}">
+                  <input type="text" class="ret-amount mono" readonly tabindex="-1"
+                         placeholder="Amount" aria-label="Amount" value="{{ it.get('amount','') }}">
+                  <button type="button" class="btn btn-sm btn-secondary ret-remove" aria-label="Remove item">&minus;</button>
+                </div>
+                {% endfor %}
+                <div class="ret-footer">
+                  <button type="button" class="btn btn-sm btn-secondary ret-add" aria-label="Add item">+</button>
+                  <span>Items total: <strong class="ret-total mono">0.00</strong></span>
+                </div>
+              </div>
             </div>
           </td>
         </tr>
@@ -107,7 +132,8 @@
   var typeEls = {
     cash: {count: document.getElementById("type-cash-count"), amount: document.getElementById("type-cash-amount")},
     upi: {count: document.getElementById("type-upi-count"), amount: document.getElementById("type-upi-amount")},
-    check: {count: document.getElementById("type-check-count"), amount: document.getElementById("type-check-amount")}
+    check: {count: document.getElementById("type-check-count"), amount: document.getElementById("type-check-amount")},
+    returns: {count: document.getElementById("type-returns-count"), amount: document.getElementById("type-returns-amount")}
   };
   var detailRows = {};
   Array.prototype.forEach.call(document.querySelectorAll(".paytype-detail-row"), function (row) {
@@ -116,7 +142,7 @@
 
   function recalc() {
     var total = 0, count = 0;
-    var byType = {cash: {count: 0, amount: 0}, upi: {count: 0, amount: 0}, check: {count: 0, amount: 0}};
+    var byType = {cash: {count: 0, amount: 0}, upi: {count: 0, amount: 0}, check: {count: 0, amount: 0}, returns: {count: 0, amount: 0}};
     inputs.forEach(function (input, idx) {
       var val = parseFloat(input.value);
       if (!isNaN(val) && val > 0) {
@@ -145,7 +171,83 @@
     Array.prototype.forEach.call(row.querySelectorAll(".paytype-detail"), function (group) {
       group.hidden = group.dataset.paytype !== type;
     });
+    // For Returns the payment is the items total, so the amount box is
+    // read-only and filled in from the item rows.
+    var pay = inputs[selects.indexOf(select)];
+    if (pay) pay.readOnly = (type === "returns");
+    if (type === "returns") refreshReturns(row.querySelector(".ret-items"));
   }
+
+  // ---- Returns: itemised stock lines -> voucher payment ----
+  function refreshReturns(box) {
+    if (!box) return;
+    var rows = box.querySelectorAll(".ret-row");
+    var totalCents = 0;
+    Array.prototype.forEach.call(rows, function (r) {
+      var qtyRaw = r.querySelector(".ret-qty").value;
+      var priceRaw = r.querySelector(".ret-price").value;
+      // Same rules as the server (parse_return_items): whole-number qty >= 1,
+      // price with at most 2 decimals.
+      var qtyOk = /^[1-9]\d*$/.test(qtyRaw);
+      var priceOk = /^\d+(\.\d{1,2})?$/.test(priceRaw);
+      var amount = r.querySelector(".ret-amount");
+      if (qtyOk && priceOk) {
+        var lineCents = parseInt(qtyRaw, 10) * Math.round(parseFloat(priceRaw) * 100);
+        amount.value = (lineCents / 100).toFixed(2);
+        totalCents += lineCents;
+      } else {
+        amount.value = "";
+      }
+      var filled = r.querySelector(".ret-item").value.trim() !== "" || qtyRaw !== "" || priceRaw !== "";
+      r.querySelector(".ret-remove").style.display = (filled || rows.length > 1) ? "" : "none";
+    });
+    box.querySelector(".ret-total").textContent = (totalCents / 100).toFixed(2);
+    var pay = document.getElementById(box.dataset.pay);
+    if (pay && pay.readOnly) {
+      pay.value = totalCents > 0 ? (totalCents / 100).toFixed(2) : "";
+      liveValidate(pay);
+    }
+    recalc();
+  }
+
+  document.addEventListener("input", function (e) {
+    var box = e.target.closest ? e.target.closest(".ret-items") : null;
+    if (!box) return;
+    if (e.target.classList.contains("ret-price")) {
+      var extra = e.target.value.match(/^(-?\d*\.\d\d)\d+$/);
+      if (extra) e.target.value = extra[1];
+    }
+    refreshReturns(box);
+  });
+
+  document.addEventListener("keydown", function (e) {
+    // Enter inside an item row must not fall through to the implicit form submit (Save).
+    if (e.key === "Enter" && e.target.tagName === "INPUT" && e.target.closest(".ret-items")) e.preventDefault();
+    if ((e.key === "e" || e.key === "E" || e.key === "+" || e.key === "-") &&
+        e.target.classList && (e.target.classList.contains("ret-qty") || e.target.classList.contains("ret-price"))) {
+      e.preventDefault();
+    }
+  });
+
+  document.addEventListener("click", function (e) {
+    var target = e.target.closest ? e.target.closest(".ret-add, .ret-remove") : null;
+    if (!target) return;
+    var box = target.closest(".ret-items");
+    if (target.classList.contains("ret-add")) {
+      var clone = box.querySelector(".ret-row").cloneNode(true);
+      Array.prototype.forEach.call(clone.querySelectorAll("input"), function (i) { i.value = ""; });
+      box.insertBefore(clone, box.querySelector(".ret-footer"));
+      clone.querySelector(".ret-item").focus();
+    } else {
+      var row = target.closest(".ret-row");
+      if (box.querySelectorAll(".ret-row").length > 1) {
+        row.parentNode.removeChild(row);
+      } else {
+        Array.prototype.forEach.call(row.querySelectorAll("input"), function (i) { i.value = ""; });
+      }
+    }
+    refreshReturns(box);
+  });
 
   selects.forEach(function (select) {
     refreshDetail(select);

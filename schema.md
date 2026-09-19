@@ -184,12 +184,19 @@ TL;DR: Define a proof-of-concept data schema, validation rules, and operational 
     - `created_by`: login creating the record
     = `created_at`: time of record creation
     - `payment_type` (additive column, iteration5, web-only — see
-      `checks.csv` below): `cash` (default) | `upi` | `check`. The CLI never
-      sets this; every CLI-recorded (and pre-iteration5) installment is
-      implicitly `cash`.
-    - `payment_ref` (additive column, iteration5): free-form JSON, only
-      populated for `upi` (`{"txn_id": "..."}`); empty for `cash`/`check` —
-      check detail lives in `checks.csv` instead, not duplicated here.
+      `checks.csv` below): `cash` (default) | `upi` | `check` | `returns`
+      (retailer returned stock in lieu of money; `returns` added after
+      iteration5 — the DB CHECK on `installments`/`completed_installments`
+      is widened by the self-detecting `_migrate_payment_type_returns`).
+      The CLI never sets this; every CLI-recorded (and pre-iteration5)
+      installment is implicitly `cash`.
+    - `payment_ref` (additive column, iteration5): free-form JSON, populated
+      for `upi` (`{"txn_id": "..."}`) and `returns`
+      (`{"items": [{"item", "qty", "price", "amount"}, ...]}` — item name
+      <= 50 chars, whole-number qty, 2dp price, `amount` = qty x price, and
+      the installment `amount` equals the sum of the items); empty for
+      `cash`/`check` — check detail lives in `checks.csv` instead, not
+      duplicated here.
 
 - `checks.csv` (master data, added iteration5 — Payment Type Tracking + Check
   Lifecycle)

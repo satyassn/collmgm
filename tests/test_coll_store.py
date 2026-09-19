@@ -5,6 +5,7 @@ Run:  python -m unittest discover -s tests -v
 """
 
 import json
+import sqlite3
 import sys
 import unittest
 from decimal import Decimal
@@ -1872,6 +1873,133 @@ class TestPaymentTypeAndChecks(StoreTestCase):
             self._check_voucher("B002", ""),
         ])
         self.assertEqual(self._query("SELECT * FROM checks"), [])
+
+    RETURN_ITEMS = [{"item": "Soap", "qty": "3", "price": "10.50", "amount": "31.50"}]
+
+    def test_returns_payment_stores_items_in_payment_ref(self):
+        self._insert_rows("vouchers", [self._v_row("B001", balance="100.00")])
+        coll_store.apply_post_to_db([self._staged(
+            "B001", "31.50", payment_type="returns", return_items=self.RETURN_ITEMS)])
+        row = self._query("SELECT * FROM installments")[0]
+        self.assertEqual(row["payment_type"], "returns")
+        self.assertEqual(json.loads(row["payment_ref"]), {"items": self.RETURN_ITEMS})
+        self.assertEqual(row["amount"], "31.50")
+        self.assertEqual(self._query("SELECT balance FROM vouchers")[0]["balance"], "68.50")
+        self.assertEqual(self._query("SELECT * FROM checks"), [])
+
+    def test_archive_keeps_payment_type_and_ref(self):
+        self._insert_rows("vouchers", [self._v_row("B001", balance="31.50")])
+        completed = coll_store.apply_post_to_db([self._staged(
+            "B001", "31.50", payment_type="returns", return_items=self.RETURN_ITEMS)])
+        self.assertEqual(completed, ["B001"])
+        row = self._query("SELECT * FROM completed_installments")[0]
+        self.assertEqual(row["payment_type"], "returns")
+        self.assertEqual(json.loads(row["payment_ref"]), {"items": self.RETURN_ITEMS})
+
+    def test_init_db_widens_legacy_payment_type_check(self):
+        legacy = ("CREATE TABLE {t} (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                  " bill_no TEXT NOT NULL, date TEXT NOT NULL, amount TEXT NOT NULL,"
+                  " salesman TEXT NOT NULL, created_by TEXT NOT NULL DEFAULT '',"
+                  " created_at TEXT NOT NULL DEFAULT '',"
+                  " payment_type TEXT NOT NULL DEFAULT 'cash'"
+                  " CHECK (payment_type IN ('cash','upi','check')),"
+                  " payment_ref TEXT NOT NULL DEFAULT '')")
+        self._insert_rows("vouchers", [self._v_row("B001", balance="100.00")])
+        conn = coll_store.get_db()
+        try:
+            for t in ("installments", "completed_installments"):
+                conn.execute(f"DROP TABLE {t}")
+                conn.execute(legacy.format(t=t))
+                conn.execute(
+                    f"INSERT INTO {t} (id, bill_no, date, amount, salesman, payment_type)"
+                    " VALUES (7, 'B001', '2026-01-01', '5.00', 's1', 'upi')")
+            conn.commit()
+        finally:
+            conn.close()
+
+        coll_store.init_db()
+
+        for t in ("installments", "completed_installments"):
+            sql = self._query("SELECT sql FROM sqlite_master WHERE name = ?", (t,))[0]["sql"]
+            self.assertIn("'returns'", sql)
+            rows = self._query(f"SELECT * FROM {t}")
+            self.assertEqual([(r["id"], r["payment_type"]) for r in rows], [(7, "upi")])
+        # New rows: returns accepted, junk still rejected.
+        conn = coll_store.get_db()
+        try:
+            conn.execute(
+                "INSERT INTO installments (bill_no, date, amount, salesman, payment_type)"
+                " VALUES ('B001', '2026-01-02', '1.00', 's1', 'returns')")
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO installments (bill_no, date, amount, salesman, payment_type)"
+                    " VALUES ('B001', '2026-01-02', '1.00', 's1', 'bitcoin')")
+        finally:
+            conn.close()
+        coll_store.init_db()  # idempotent second run
+
+    def test_widening_migration_keeps_the_autoincrement_high_water_mark(self):
+        # Ids deleted from the top of the table must not be handed out again:
+        # checks.installment_id points at installment ids.
+        conn = coll_store.get_db()
+        try:
+            for t in ("installments", "completed_installments"):
+                conn.execute(f"DROP TABLE {t}")
+                conn.execute(
+                    f"CREATE TABLE {t} (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    " bill_no TEXT NOT NULL, date TEXT NOT NULL, amount TEXT NOT NULL,"
+                    " salesman TEXT NOT NULL, created_by TEXT NOT NULL DEFAULT '',"
+                    " created_at TEXT NOT NULL DEFAULT '',"
+                    " payment_type TEXT NOT NULL DEFAULT 'cash'"
+                    " CHECK (payment_type IN ('cash','upi','check')),"
+                    " payment_ref TEXT NOT NULL DEFAULT '')")
+            conn.commit()
+        finally:
+            conn.close()
+        self._insert_rows("vouchers", [self._v_row("B001", balance="100.00")])
+        conn = coll_store.get_db()
+        try:
+            for t in ("installments", "completed_installments"):
+                for i in (1, 2, 3):
+                    conn.execute(
+                        f"INSERT INTO {t} (id, bill_no, date, amount, salesman)"
+                        " VALUES (?, 'B001', '2026-01-01', '1.00', 's1')", (i,))
+                conn.execute(f"DELETE FROM {t} WHERE id = 3")  # seq stays 3
+            conn.commit()
+        finally:
+            conn.close()
+
+        coll_store.init_db()
+
+        conn = coll_store.get_db()
+        try:
+            for t in ("installments", "completed_installments"):
+                cur = conn.execute(
+                    f"INSERT INTO {t} (bill_no, date, amount, salesman)"
+                    " VALUES ('B001', '2026-01-02', '1.00', 's1')")
+                self.assertEqual(cur.lastrowid, 4, t)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_widening_migration_of_an_empty_table_still_works(self):
+        conn = coll_store.get_db()
+        try:
+            conn.execute("DROP TABLE completed_installments")
+            conn.execute(
+                "CREATE TABLE completed_installments (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " bill_no TEXT NOT NULL, date TEXT NOT NULL, amount TEXT NOT NULL,"
+                " salesman TEXT NOT NULL, created_by TEXT NOT NULL DEFAULT '',"
+                " created_at TEXT NOT NULL DEFAULT '',"
+                " payment_type TEXT NOT NULL DEFAULT 'cash'"
+                " CHECK (payment_type IN ('cash','upi','check')),"
+                " payment_ref TEXT NOT NULL DEFAULT '')")
+            conn.commit()
+        finally:
+            conn.close()
+        coll_store.init_db()
+        sql = self._query("SELECT sql FROM sqlite_master WHERE name = 'completed_installments'")[0]["sql"]
+        self.assertIn("'returns'", sql)
 
     # ------------------------------------------------------------------
     # mark_check_encashed

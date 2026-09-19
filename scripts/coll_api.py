@@ -35,7 +35,7 @@ from coll_orchestrate import (
     set_submit_verification, is_submit_verification_complete,
     apply_correction_request, _find_active_report_for_bill,
     compute_payment_dates, record_submit_payments, validate_payment,
-    validate_payment_type, payment_type_totals,
+    validate_payment_type, payment_type_totals, parse_return_items,
     validate_staged_report, format_submit_validation_errors,
     post_confirmed_report, return_post_stage,
     amend_voucher,
@@ -682,6 +682,7 @@ def coll_submit_edit(request: Request, stem: str):
             v["check_branch"] = entry.get("check_branch", "")
             v["check_no"] = entry.get("check_no", "")
             v["check_date"] = entry.get("check_date", "")
+            v["return_items"] = entry.get("return_items", [])
     total_collected = sum(parse_decimal(v.get("payment")) for v in vouchers)
     paid_count = sum(1 for v in vouchers if parse_decimal(v.get("payment")) > 0)
     _flag_salesman_mismatches(vouchers, salesman)
@@ -723,8 +724,24 @@ async def coll_submit_save(request: Request, stem: str):
         v["check_branch"] = (form.get(f"checkbranch_{bill_no}") or "").strip()
         v["check_no"] = (form.get(f"checkno_{bill_no}") or "").strip()
         v["check_date"] = (form.get(f"checkdate_{bill_no}") or "").strip()
-        normalized, reason = validate_payment(raw, v.get("balance"))
+        v["return_items"] = []
+        items_reason = None
+        if v["payment_type"] == "returns":
+            # The payment IS the items total: recomputed server-side from
+            # qty x price, the typed/auto-filled pay_ value is ignored.
+            rows = [{"item": i, "qty": q, "price": p} for i, q, p in zip(
+                form.getlist(f"retitem_{bill_no}"),
+                form.getlist(f"retqty_{bill_no}"),
+                form.getlist(f"retprice_{bill_no}"))]
+            items, total, items_reason = parse_return_items(rows)
+            v["return_items"] = items if not items_reason else rows
+            raw = total if not items_reason else ""
+        if items_reason:
+            normalized, reason = None, items_reason
+        else:
+            normalized, reason = validate_payment(raw, v.get("balance"))
         if not reason and normalized:
+            v["payment"] = normalized  # validate_payment_type cross-checks it (returns total)
             reason = validate_payment_type(v)
         if reason:
             invalid += 1
@@ -1262,6 +1279,10 @@ def coll_correction_submit(request: Request, bill_no: str,
         _, rdata, sv = _find_active_report_for_bill(voucher["bill_no"])
         if sv is None or (rdata.get("stages", {}).get("submit") or "") != "submitted":
             return form_error("This voucher is not in a collection report awaiting approval.")
+        if (sv.get("payment_type") or "") == "returns":
+            return form_error(
+                "This voucher is paid by returned stock — the payment is the items total, "
+                "so it can't be corrected by amount. Return the report to the salesman to revise the items.")
         staged_payment = (sv.get("payment") or "").strip()
         corrected = (new_amount or "").strip()
         if corrected:

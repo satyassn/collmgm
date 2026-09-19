@@ -1767,6 +1767,16 @@ class TestCollectionCorrections(ApiTestCase):
         self.assertEqual(corr["new"], {"payment": "45.00"})
         self.assertEqual(corr["origin_stage"], "submit")
 
+    def test_raise_refused_for_a_returns_voucher(self):
+        data = json.loads(self.report_path.read_text(encoding="utf-8"))
+        data["vouchers"][0].update(payment_type="returns", return_items=[
+            {"item": "Soap", "qty": "3", "price": "10.00", "amount": "30.00"}])
+        self.report_path.write_text(json.dumps(data), encoding="utf-8")
+        opener = self._login("sup", "pwS")
+        status, body = self._raise_collection(opener)
+        self.assertIn("paid by returned stock", body)
+        self.assertEqual(coll_store.load_corrections(), [])
+
     def test_raise_validation(self):
         opener = self._login("sup", "pwS")
         status, body = self._raise_collection(opener, new_amount="30.00")
@@ -2483,6 +2493,73 @@ class TestCollSubmitPaymentType(ApiTestCase):
         })
         self.assertEqual(status, 200)
         self.assertIn("check bank is required", body)
+
+    def _returns_form(self, rows, **extra):
+        data = [("action", "save"), ("paytype_100", "returns"), ("pay_100", "999.00")]
+        for item, qty, price in rows:
+            data += [("retitem_100", item), ("retqty_100", qty), ("retprice_100", price)]
+        data += list(extra.items())
+        return data
+
+    def test_returns_total_becomes_the_payment_and_redisplays(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._post(opener, f"/coll/submit/{self.stem}", self._returns_form([
+            ("Soap", "3", "4.50"), ("Tea", "2", "10"), ("", "", ""),
+        ]))
+        self.assertEqual(status, 200)
+        installments, _ = coll_store._load_installments(self.tmp / "staging" / f"{self.stem}.json")
+        entry = installments["100"]
+        # 3 x 4.50 + 2 x 10 = 33.50; the posted "999.00" pay_ value is ignored.
+        self.assertEqual(entry["payment"], "33.50")
+        self.assertEqual(entry["payment_type"], "returns")
+        self.assertEqual([i["item"] for i in entry["return_items"]], ["Soap", "Tea"])
+        self.assertEqual(entry["return_items"][0]["amount"], "13.50")
+        status, body = self._get(opener, f"/coll/submit/{self.stem}")
+        self.assertIn("Soap", body)
+        self.assertIn("Tea", body)
+
+    def test_returns_over_balance_rejected(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._post(opener, f"/coll/submit/{self.stem}",
+                                  self._returns_form([("Soap", "11", "5")]))
+        self.assertIn("exceeds balance", body)
+        installments, _ = coll_store._load_installments(self.tmp / "staging" / f"{self.stem}.json")
+        self.assertEqual(installments, {})
+
+    def test_returns_invalid_item_rejected_and_rows_kept(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._post(opener, f"/coll/submit/{self.stem}",
+                                  self._returns_form([("Soap", "1.5", "5")]))
+        self.assertIn("quantity must be a whole number", body)
+        self.assertIn('value="Soap"', body)
+        installments, _ = coll_store._load_installments(self.tmp / "staging" / f"{self.stem}.json")
+        self.assertEqual(installments, {})
+
+    def test_returns_with_no_items_records_no_payment(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._post(opener, f"/coll/submit/{self.stem}",
+                                  self._returns_form([("", "", "")]))
+        self.assertEqual(status, 200)
+        installments, _ = coll_store._load_installments(self.tmp / "staging" / f"{self.stem}.json")
+        self.assertEqual(installments, {})
+
+    def test_switching_away_from_returns_drops_items(self):
+        opener = self._login("smA", "pwA")
+        self._post(opener, f"/coll/submit/{self.stem}",
+                   self._returns_form([("Soap", "1", "5")]))
+        self._post(opener, f"/coll/submit/{self.stem}", {
+            "action": "save", "pay_100": "5.00", "paytype_100": "cash"})
+        installments, _ = coll_store._load_installments(self.tmp / "staging" / f"{self.stem}.json")
+        self.assertEqual(installments["100"]["payment_type"], "cash")
+        self.assertNotIn("return_items", installments["100"])
+
+    def test_item_text_is_escaped_on_redisplay(self):
+        opener = self._login("smA", "pwA")
+        self._post(opener, f"/coll/submit/{self.stem}",
+                   self._returns_form([("<script>alert(1)</script>", "1", "5")]))
+        status, body = self._get(opener, f"/coll/submit/{self.stem}")
+        self.assertNotIn("<script>alert(1)</script>", body)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", body)
 
 
 # ---------------------------------------------------------------------------

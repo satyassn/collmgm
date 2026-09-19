@@ -417,6 +417,18 @@ input:focus, select:focus, textarea:focus {
 }
 .field-group { margin-bottom: 0.75rem; }
 
+/* ---- Returns: itemised stock lines (Submit Collections) ---- */
+.ret-items { display: flex; flex-direction: column; gap: 0.4rem; }
+.ret-row { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; }
+.ret-row input { font-size: 1rem; padding: 6px 8px; }
+.ret-row input.ret-item  { flex: 2 1 10rem; min-width: 0; width: auto; }
+.ret-row input.ret-qty   { flex: 0 1 5rem; width: 5rem; }
+.ret-row input.ret-price { flex: 0 1 6.5rem; width: 6.5rem; }
+.ret-row input.ret-amount { flex: 0 1 6.5rem; width: 6.5rem; text-align: right; background: var(--gray-50); }
+.ret-footer { display: flex; align-items: center; gap: 1rem; }
+.ret-detail summary { cursor: pointer; }
+.ret-list { margin: 0.25rem 0 0 1rem; padding: 0; font-size: 0.85rem; }
+
 /* ---- Payment input ---- */
 .payment-table .pay-cell { padding: 4px 8px; }
 /* input.pay-input: must outrank the base input[type=number] rule above,

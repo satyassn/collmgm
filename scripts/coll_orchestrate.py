@@ -583,15 +583,78 @@ def validate_payment_type(voucher):
         except ValueError:
             return f"invalid check date '{check_date}'"
         return None
+    if payment_type == "returns":
+        items, total, reason = parse_return_items(voucher.get("return_items"))
+        if reason:
+            return reason
+        if not items:
+            return "at least one return item is required"
+        if parse_decimal(voucher.get("payment")) != Decimal(total):
+            return "payment does not match the return items total"
+        return None
     return f"unknown payment type '{payment_type}'"
 
 
+RETURN_ITEM_NAME_MAX = 50
+
+
+def parse_return_items(rows):
+    """Normalize and validate the returned-stock line items of a 'returns'
+    payment (retailer hands stock back in lieu of money).
+
+    rows: list of dicts with item / qty / price (strings or numbers). Rows
+    with all three empty are untouched blank form rows and are skipped. The
+    line amount (qty * price) and the total are always recomputed here —
+    never taken from the client — so a tampered form can't skew them.
+
+    Returns (items, total, reason): items is a list of normalized dicts
+    {item, qty, price, amount} (all strings, 2dp money), total is the 2dp
+    string sum ('' when there are no items), reason is None on success or a
+    message on the first invalid row (items/total are then empty).
+    """
+    if rows is None:
+        rows = []
+    if not isinstance(rows, list):
+        return [], "", "return items are malformed"
+    items = []
+    total = Decimal("0")
+    for n, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            return [], "", "return items are malformed"
+        name = str(row.get("item") or "").strip()
+        qty_raw = str(row.get("qty") or "").strip()
+        price_raw = str(row.get("price") or "").strip()
+        if not (name or qty_raw or price_raw):
+            continue
+        label = f"return item {n}"
+        if not name:
+            return [], "", f"{label}: item name is required"
+        if len(name) > RETURN_ITEM_NAME_MAX:
+            return [], "", f"{label}: item name is too long (max {RETURN_ITEM_NAME_MAX} characters)"
+        if not re.fullmatch(r"[1-9]\d{0,8}", qty_raw):
+            return [], "", f"{label}: quantity must be a whole number of at least 1"
+        if not re.fullmatch(r"\d{1,9}(?:\.\d{1,2})?", price_raw):
+            return [], "", f"{label}: price must be a number with at most 2 decimal places"
+        price = Decimal(price_raw)
+        if price <= 0:
+            return [], "", f"{label}: price must be greater than zero"
+        amount = (price * int(qty_raw)).quantize(Decimal("0.01"))
+        items.append({"item": name, "qty": str(int(qty_raw)),
+                      "price": str(price.quantize(Decimal("0.01"))),
+                      "amount": str(amount)})
+        total += amount
+    if not items:
+        return [], "", None
+    return items, str(total.quantize(Decimal("0.01"))), None
+
+
 def payment_type_totals(vouchers):
-    """Return {'cash': {'count', 'amount'}, 'upi': {...}, 'check': {...}} for
-    the vouchers with a non-empty staged payment > 0 — the cash/UPI/check
-    breakdown shown on the Submit/Approve Collections/Post Collections
+    """Return {'cash': {'count', 'amount'}, 'upi': {...}, 'check': {...},
+    'returns': {...}} for the vouchers with a non-empty staged payment > 0 —
+    the breakdown shown on the Submit/Approve Collections/Post Collections
     summary boxes. An unrecognized/missing payment_type counts as cash."""
-    totals = {t: {"count": 0, "amount": Decimal("0")} for t in ("cash", "upi", "check")}
+    totals = {t: {"count": 0, "amount": Decimal("0")}
+              for t in ("cash", "upi", "check", "returns")}
     for v in vouchers:
         amount = parse_decimal(v.get("payment"))
         if amount <= 0:
@@ -838,6 +901,13 @@ def _apply_collection_correction(corr, resolved_by, resolution_note=None):
         raise ValueError(
             f"correction {corr['id']}: the report is no longer awaiting"
             " Collections approval — the request is stale")
+    if (v.get("payment_type") or "") == "returns":
+        # The payment of a Returns voucher is its items total; rewriting just
+        # the amount would leave it disagreeing with return_items and block
+        # approval/post. The salesman revises the items instead (Return).
+        raise ValueError(
+            f"correction {corr['id']}: voucher {bill_no} is paid by returned stock —"
+            " return the report to the salesman to revise the items, then reject this request")
     old_payment = ((corr.get("old") or {}).get("payment") or "").strip()
     if (v.get("payment") or "").strip() != old_payment:
         raise CorrectionConflict(

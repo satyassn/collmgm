@@ -111,7 +111,7 @@ _TABLE_DDL_V1 = {
     salesman     TEXT NOT NULL CHECK (salesman <> ''),
     created_by   TEXT NOT NULL DEFAULT '',
     created_at   TEXT NOT NULL DEFAULT '',
-    payment_type TEXT NOT NULL DEFAULT 'cash' CHECK (payment_type IN ('cash','upi','check')),
+    payment_type TEXT NOT NULL DEFAULT 'cash' CHECK (payment_type IN ('cash','upi','check','returns')),
     payment_ref  TEXT NOT NULL DEFAULT ''
 """,
     "completed_vouchers": """
@@ -132,7 +132,7 @@ _TABLE_DDL_V1 = {
     salesman     TEXT NOT NULL CHECK (salesman <> ''),
     created_by   TEXT NOT NULL DEFAULT '',
     created_at   TEXT NOT NULL DEFAULT '',
-    payment_type TEXT NOT NULL DEFAULT 'cash' CHECK (payment_type IN ('cash','upi','check')),
+    payment_type TEXT NOT NULL DEFAULT 'cash' CHECK (payment_type IN ('cash','upi','check','returns')),
     payment_ref  TEXT NOT NULL DEFAULT ''
 """,
 }
@@ -312,6 +312,7 @@ def init_db():
         _migrate_corrections_kinds(conn)
         if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
             _migrate_schema_v1(conn)
+        _migrate_payment_type_returns(conn)
     finally:
         conn.close()
 
@@ -409,6 +410,54 @@ def _migrate_schema_v1(conn):
                 raise MigrationError(
                     "Foreign key check failed after the schema rebuild — migration rolled back.")
             conn.execute("PRAGMA user_version = 1")
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
+def _migrate_payment_type_returns(conn):
+    """Rebuild installments/completed_installments when their payment_type
+    CHECK predates the 'returns' value. Self-detecting via the stored CREATE
+    SQL (SQLite cannot widen a CHECK in place). Tables with no payment_type
+    CHECK at all (columns added by ALTER) are left alone. Pure widening: every
+    existing row satisfies the new CHECK, and ids are copied so they survive.
+    """
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        for table in ("installments", "completed_installments"):
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,)).fetchone()
+            sql = (row["sql"] or "") if row else ""
+            if "payment_type IN" not in sql or "'returns'" in sql:
+                continue
+            cols = ", ".join(_TABLE_COPY_COLUMNS[table])
+            seq = conn.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = ?", (table,)).fetchone()
+            with conn:
+                conn.execute(f"DROP TABLE IF EXISTS {table}_rt")
+                conn.execute(f"CREATE TABLE {table}_rt ({_TABLE_DDL_V1[table]})")
+                conn.execute(f"INSERT INTO {table}_rt ({cols}) SELECT {cols} FROM {table}")
+                conn.execute(f"DROP TABLE {table}")
+                conn.execute(f"ALTER TABLE {table}_rt RENAME TO {table}")
+                if seq is not None:
+                    # AUTOINCREMENT high-water mark: without this, ids deleted
+                    # from the top of the table would be reused, and
+                    # checks.installment_id (an audit pointer) could then
+                    # reference a different installment.
+                    cur = conn.execute(
+                        "UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = ?",
+                        (seq[0], table))
+                    if cur.rowcount == 0:
+                        conn.execute(
+                            "INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)",
+                            (table, seq[0]))
+                # Scoped to this table: an unrelated pre-existing orphan
+                # elsewhere must not stop the app from starting.
+                if conn.execute(f"PRAGMA foreign_key_check({table})").fetchall():
+                    raise MigrationError(
+                        f"Foreign key check failed on {table} after widening"
+                        " payment_type — migration rolled back.")
     finally:
         conn.execute("PRAGMA foreign_keys=ON")
 
@@ -1200,6 +1249,8 @@ def _append_installments(conn, vouchers, created_by="app"):
         payment_ref = ""
         if payment_type == "upi" and (v.get("upi_txn_id") or "").strip():
             payment_ref = json.dumps({"txn_id": v["upi_txn_id"].strip()})
+        elif payment_type == "returns" and v.get("return_items"):
+            payment_ref = json.dumps({"items": v["return_items"]})
         cur = conn.execute(
             "INSERT INTO installments"
             " (bill_no, date, amount, salesman, created_by, created_at,"
@@ -1300,17 +1351,20 @@ def _archive_completed(conn, bill_nos):
         )
 
     inst_rows = conn.execute(
-        f"SELECT bill_no, date, amount, salesman, created_by, created_at"
+        f"SELECT bill_no, date, amount, salesman, created_by, created_at,"
+        f" payment_type, payment_ref"
         f" FROM installments WHERE bill_no IN ({ph})",
         bill_list,
     ).fetchall()
     for r in inst_rows:
         conn.execute(
             "INSERT INTO completed_installments"
-            " (bill_no, date, amount, salesman, created_by, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
+            " (bill_no, date, amount, salesman, created_by, created_at,"
+            " payment_type, payment_ref)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (r["bill_no"], r["date"], r["amount"],
-             r["salesman"], r["created_by"], r["created_at"]),
+             r["salesman"], r["created_by"], r["created_at"],
+             r["payment_type"], r["payment_ref"]),
         )
     # Installments reference vouchers via FK, so they must go first.
     conn.execute(f"DELETE FROM installments WHERE bill_no IN ({ph})", bill_list)
@@ -2303,7 +2357,8 @@ def _installments_path(report_path):
 
 
 _PAYMENT_TYPE_SIDECAR_KEYS = (
-    "payment_type", "upi_txn_id", "check_bank", "check_branch", "check_no", "check_date")
+    "payment_type", "upi_txn_id", "check_bank", "check_branch", "check_no", "check_date",
+    "return_items")
 
 
 def _save_installments(report_path, vouchers, bookmark_bill_no=None):
