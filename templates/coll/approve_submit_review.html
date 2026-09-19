@@ -20,6 +20,7 @@
   <span>Cash: {{ type_totals.cash.count }} / <strong>{{ type_totals.cash.amount }}</strong></span>
   <span>UPI: {{ type_totals.upi.count }} / <strong>{{ type_totals.upi.amount }}</strong></span>
   <span>Check: {{ type_totals.check.count }} / <strong>{{ type_totals.check.amount }}</strong></span>
+  <span>Returns: {{ type_totals.returns.count }} / <strong>{{ type_totals.returns.amount }}</strong></span>
 </div>
 
 <table class="data-table stack-table" data-accordion>
@@ -60,6 +61,8 @@
         {% if v.get("payment") %}
           {% if v.get("payment_type") == "upi" %}UPI &middot; {{ v.get("upi_txn_id","") }}
           {% elif v.get("payment_type") == "check" %}Check &middot; {{ v.get("check_bank","") }} {{ v.get("check_no","") }} ({{ v.get("check_date","") }})
+          {% elif v.get("payment_type") == "returns" %}
+            {% include "coll/_return_items.html" %}
           {% else %}Cash{% endif %}
         {% else %}—{% endif %}
       </td>

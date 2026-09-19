@@ -132,6 +132,7 @@ TL;DR: Define a proof-of-concept data schema, validation rules, and operational 
     - `role`: `distributor` or `salesman` or `system` or `supervisor` (enforced).
     - `password_hash`: `salt_hex:hash_hex`, PBKDF2-HMAC-SHA256 (`coll_store.hash_password`/`_verify_password`). Only `distributor`/`supervisor`/`salesman` roles can authenticate (`verify_user`) — `system` never can.
     - `must_change_password`: `0`/`1` (SQLite `INTEGER`, additive column — see `coll_store._backfill_must_change_password`). Set to `1` whenever a user is created or has their password reset by a distributor (web `/manage/users`); cleared to `0` when the user successfully changes their own password (web `/profile`). Enforced web-only: `coll_api._require()` redirects any user with this flag set to `/profile` before allowing any other route. The CLI does not read or enforce this column.
+    - `secret_question` / `secret_answer_hash` (SQLite `TEXT`, nullable, additive columns — see `coll_store._backfill_secret_question_columns`; DB-only, not in `users.csv`): the distributor's "Forgot password?" recovery. Only ever set on the `distributor` row — at web `/register` (required for new installs) or from `/profile` (existing installs; needs the current password). `secret_question` is free text (5-200 chars) shown on the `/forgot-password` page; `secret_answer_hash` is the PBKDF2 `salt:hash` (same scheme as `password_hash`) of the answer trimmed, case-folded and whitespace-collapsed (3-100 chars), never the plain answer. NULL means no reset is available and the login screen hides the link. Five wrong answers lock the reset flow for 15 minutes (in server memory, not stored). Web-only; the CLI has no forgot-password flow.
   - Initial data:
     ```
     name,role
@@ -184,12 +185,19 @@ TL;DR: Define a proof-of-concept data schema, validation rules, and operational 
     - `created_by`: login creating the record
     = `created_at`: time of record creation
     - `payment_type` (additive column, iteration5, web-only — see
-      `checks.csv` below): `cash` (default) | `upi` | `check`. The CLI never
-      sets this; every CLI-recorded (and pre-iteration5) installment is
-      implicitly `cash`.
-    - `payment_ref` (additive column, iteration5): free-form JSON, only
-      populated for `upi` (`{"txn_id": "..."}`); empty for `cash`/`check` —
-      check detail lives in `checks.csv` instead, not duplicated here.
+      `checks.csv` below): `cash` (default) | `upi` | `check` | `returns`
+      (retailer returned stock in lieu of money; `returns` added after
+      iteration5 — the DB CHECK on `installments`/`completed_installments`
+      is widened by the self-detecting `_migrate_payment_type_returns`).
+      The CLI never sets this; every CLI-recorded (and pre-iteration5)
+      installment is implicitly `cash`.
+    - `payment_ref` (additive column, iteration5): free-form JSON, populated
+      for `upi` (`{"txn_id": "..."}`) and `returns`
+      (`{"items": [{"item", "qty", "price", "amount"}, ...]}` — item name
+      <= 50 chars, whole-number qty, 2dp price, `amount` = qty x price, and
+      the installment `amount` equals the sum of the items); empty for
+      `cash`/`check` — check detail lives in `checks.csv` instead, not
+      duplicated here.
 
 - `checks.csv` (master data, added iteration5 — Payment Type Tracking + Check
   Lifecycle)

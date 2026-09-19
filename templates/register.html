@@ -25,6 +25,13 @@
       <input id="password" name="password" type="password" autocomplete="new-password" required minlength="6">
       <label for="confirm_password">Confirm Password</label>
       <input id="confirm_password" name="confirm_password" type="password" autocomplete="new-password" required minlength="6">
+      <label for="secret_question">Secret Question</label>
+      <input id="secret_question" name="secret_question" type="text" value="{{ submitted_question or '' }}"
+             maxlength="200" minlength="5" autocomplete="off" placeholder="e.g. Name of my first school" required>
+      <label for="secret_answer">Answer</label>
+      <input id="secret_answer" name="secret_answer" type="text" maxlength="100" minlength="3"
+             autocomplete="off" autocapitalize="off" required>
+      <p class="hint">Used to reset your password if you forget it. Not case-sensitive. Pick an answer other people can't guess.</p>
       <button type="submit" class="btn btn-primary btn-full">Create Distributor Account</button>
     </form>
     <p class="hint"><a href="/login">Back to sign in</a></p>

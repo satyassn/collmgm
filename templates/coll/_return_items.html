@@ -1,0 +1,10 @@
+{# Returns payment type cell: item count with the returned lines expandable. #}
+{% set ritems = v.get("return_items") or [] %}
+<details class="ret-detail">
+  <summary>Returns &middot; {{ ritems|length }} item{{ "s" if ritems|length != 1 }}</summary>
+  <ul class="ret-list">
+    {% for it in ritems %}
+    <li>{{ it.item }} &times; {{ it.qty }} @ {{ it.price }} = <span class="mono">{{ it.amount }}</span></li>
+    {% endfor %}
+  </ul>
+</details>

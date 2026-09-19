@@ -5,6 +5,7 @@ Run:  python -m unittest discover -s tests -v
 """
 
 import json
+import sqlite3
 import sys
 import unittest
 from decimal import Decimal
@@ -1873,6 +1874,133 @@ class TestPaymentTypeAndChecks(StoreTestCase):
         ])
         self.assertEqual(self._query("SELECT * FROM checks"), [])
 
+    RETURN_ITEMS = [{"item": "Soap", "qty": "3", "price": "10.50", "amount": "31.50"}]
+
+    def test_returns_payment_stores_items_in_payment_ref(self):
+        self._insert_rows("vouchers", [self._v_row("B001", balance="100.00")])
+        coll_store.apply_post_to_db([self._staged(
+            "B001", "31.50", payment_type="returns", return_items=self.RETURN_ITEMS)])
+        row = self._query("SELECT * FROM installments")[0]
+        self.assertEqual(row["payment_type"], "returns")
+        self.assertEqual(json.loads(row["payment_ref"]), {"items": self.RETURN_ITEMS})
+        self.assertEqual(row["amount"], "31.50")
+        self.assertEqual(self._query("SELECT balance FROM vouchers")[0]["balance"], "68.50")
+        self.assertEqual(self._query("SELECT * FROM checks"), [])
+
+    def test_archive_keeps_payment_type_and_ref(self):
+        self._insert_rows("vouchers", [self._v_row("B001", balance="31.50")])
+        completed = coll_store.apply_post_to_db([self._staged(
+            "B001", "31.50", payment_type="returns", return_items=self.RETURN_ITEMS)])
+        self.assertEqual(completed, ["B001"])
+        row = self._query("SELECT * FROM completed_installments")[0]
+        self.assertEqual(row["payment_type"], "returns")
+        self.assertEqual(json.loads(row["payment_ref"]), {"items": self.RETURN_ITEMS})
+
+    def test_init_db_widens_legacy_payment_type_check(self):
+        legacy = ("CREATE TABLE {t} (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                  " bill_no TEXT NOT NULL, date TEXT NOT NULL, amount TEXT NOT NULL,"
+                  " salesman TEXT NOT NULL, created_by TEXT NOT NULL DEFAULT '',"
+                  " created_at TEXT NOT NULL DEFAULT '',"
+                  " payment_type TEXT NOT NULL DEFAULT 'cash'"
+                  " CHECK (payment_type IN ('cash','upi','check')),"
+                  " payment_ref TEXT NOT NULL DEFAULT '')")
+        self._insert_rows("vouchers", [self._v_row("B001", balance="100.00")])
+        conn = coll_store.get_db()
+        try:
+            for t in ("installments", "completed_installments"):
+                conn.execute(f"DROP TABLE {t}")
+                conn.execute(legacy.format(t=t))
+                conn.execute(
+                    f"INSERT INTO {t} (id, bill_no, date, amount, salesman, payment_type)"
+                    " VALUES (7, 'B001', '2026-01-01', '5.00', 's1', 'upi')")
+            conn.commit()
+        finally:
+            conn.close()
+
+        coll_store.init_db()
+
+        for t in ("installments", "completed_installments"):
+            sql = self._query("SELECT sql FROM sqlite_master WHERE name = ?", (t,))[0]["sql"]
+            self.assertIn("'returns'", sql)
+            rows = self._query(f"SELECT * FROM {t}")
+            self.assertEqual([(r["id"], r["payment_type"]) for r in rows], [(7, "upi")])
+        # New rows: returns accepted, junk still rejected.
+        conn = coll_store.get_db()
+        try:
+            conn.execute(
+                "INSERT INTO installments (bill_no, date, amount, salesman, payment_type)"
+                " VALUES ('B001', '2026-01-02', '1.00', 's1', 'returns')")
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO installments (bill_no, date, amount, salesman, payment_type)"
+                    " VALUES ('B001', '2026-01-02', '1.00', 's1', 'bitcoin')")
+        finally:
+            conn.close()
+        coll_store.init_db()  # idempotent second run
+
+    def test_widening_migration_keeps_the_autoincrement_high_water_mark(self):
+        # Ids deleted from the top of the table must not be handed out again:
+        # checks.installment_id points at installment ids.
+        conn = coll_store.get_db()
+        try:
+            for t in ("installments", "completed_installments"):
+                conn.execute(f"DROP TABLE {t}")
+                conn.execute(
+                    f"CREATE TABLE {t} (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    " bill_no TEXT NOT NULL, date TEXT NOT NULL, amount TEXT NOT NULL,"
+                    " salesman TEXT NOT NULL, created_by TEXT NOT NULL DEFAULT '',"
+                    " created_at TEXT NOT NULL DEFAULT '',"
+                    " payment_type TEXT NOT NULL DEFAULT 'cash'"
+                    " CHECK (payment_type IN ('cash','upi','check')),"
+                    " payment_ref TEXT NOT NULL DEFAULT '')")
+            conn.commit()
+        finally:
+            conn.close()
+        self._insert_rows("vouchers", [self._v_row("B001", balance="100.00")])
+        conn = coll_store.get_db()
+        try:
+            for t in ("installments", "completed_installments"):
+                for i in (1, 2, 3):
+                    conn.execute(
+                        f"INSERT INTO {t} (id, bill_no, date, amount, salesman)"
+                        " VALUES (?, 'B001', '2026-01-01', '1.00', 's1')", (i,))
+                conn.execute(f"DELETE FROM {t} WHERE id = 3")  # seq stays 3
+            conn.commit()
+        finally:
+            conn.close()
+
+        coll_store.init_db()
+
+        conn = coll_store.get_db()
+        try:
+            for t in ("installments", "completed_installments"):
+                cur = conn.execute(
+                    f"INSERT INTO {t} (bill_no, date, amount, salesman)"
+                    " VALUES ('B001', '2026-01-02', '1.00', 's1')")
+                self.assertEqual(cur.lastrowid, 4, t)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_widening_migration_of_an_empty_table_still_works(self):
+        conn = coll_store.get_db()
+        try:
+            conn.execute("DROP TABLE completed_installments")
+            conn.execute(
+                "CREATE TABLE completed_installments (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " bill_no TEXT NOT NULL, date TEXT NOT NULL, amount TEXT NOT NULL,"
+                " salesman TEXT NOT NULL, created_by TEXT NOT NULL DEFAULT '',"
+                " created_at TEXT NOT NULL DEFAULT '',"
+                " payment_type TEXT NOT NULL DEFAULT 'cash'"
+                " CHECK (payment_type IN ('cash','upi','check')),"
+                " payment_ref TEXT NOT NULL DEFAULT '')")
+            conn.commit()
+        finally:
+            conn.close()
+        coll_store.init_db()
+        sql = self._query("SELECT sql FROM sqlite_master WHERE name = 'completed_installments'")[0]["sql"]
+        self.assertIn("'returns'", sql)
+
     # ------------------------------------------------------------------
     # mark_check_encashed
     # ------------------------------------------------------------------
@@ -1994,6 +2122,127 @@ class TestPaymentTypeAndChecks(StoreTestCase):
         self.assertIn(("distributor", "view_checks"), pairs)
         self.assertIn(("distributor", "resolve_check"), pairs)
         self.assertNotIn(("salesman", "resolve_check"), pairs)
+
+
+class TestSecretQuestion(StoreTestCase):
+    """Distributor "Forgot password?" via a secret question/answer."""
+
+    def _register(self, **kw):
+        kw.setdefault("secret_question", "Name of my first school?")
+        kw.setdefault("secret_answer", "St Mary's")
+        coll_store.register_first_distributor("dist", "password1", "password1", **kw)
+
+    def _reset(self, name="dist", answer="st mary's", pw="newpass1"):
+        coll_store.reset_password_with_secret_answer(name, answer, pw, pw)
+
+    def _user_row(self, name="dist"):
+        return self._query("SELECT * FROM users WHERE name = ?", (name,))[0]
+
+    def test_init_db_adds_columns_to_legacy_users_table(self):
+        conn = coll_store.get_db()
+        try:
+            conn.execute("DROP TABLE users")
+            conn.execute(
+                "CREATE TABLE users (name TEXT PRIMARY KEY NOT NULL, role TEXT NOT NULL,"
+                " password_hash TEXT NOT NULL DEFAULT '',"
+                " must_change_password INTEGER NOT NULL DEFAULT 0)")
+            conn.execute("INSERT INTO users (name, role, password_hash)"
+                         " VALUES ('dist', 'distributor', 'x')")
+            conn.commit()
+        finally:
+            conn.close()
+        coll_store.init_db()
+        row = self._user_row()
+        self.assertIsNone(row["secret_question"])
+        self.assertIsNone(row["secret_answer_hash"])
+        self.assertIsNone(coll_store.get_distributor_secret_question())
+
+    def test_register_without_question_still_works_but_offers_no_reset(self):
+        coll_store.register_first_distributor("dist", "password1", "password1")
+        self.assertIsNone(coll_store.get_distributor_secret_question())
+        with self.assertRaises(ValueError):
+            self._reset()
+
+    def test_register_stores_question_and_hashed_answer(self):
+        self._register()
+        row = self._user_row()
+        self.assertEqual(row["secret_question"], "Name of my first school?")
+        self.assertNotIn("mary", row["secret_answer_hash"].lower())
+        self.assertEqual(coll_store.get_distributor_secret_question(), "Name of my first school?")
+        self.assertEqual(coll_store.get_secret_question_for("dist"), "Name of my first school?")
+
+    def test_register_rejects_bad_question_or_answer(self):
+        for q, a in [("", "abc"), ("hey", "abc"), ("Valid question?", ""), ("Valid question?", "ab"),
+                     ("q" * 201, "abc"), ("Valid question?", "a" * 101)]:
+            with self.assertRaises(ValueError, msg=(q[:10], a[:5])):
+                coll_store.register_first_distributor("dist", "password1", "password1", q, a)
+        self.assertFalse(coll_store.has_any_users())
+
+    def test_answer_is_case_and_whitespace_insensitive(self):
+        self._register()
+        self._reset(answer="  ST   MARY'S  ")
+        self.assertIsNotNone(coll_store.verify_user("dist", "newpass1"))
+
+    def test_reset_sets_new_password_without_forced_change(self):
+        self._register()
+        conn = coll_store.get_db()
+        try:
+            conn.execute("UPDATE users SET must_change_password = 1")
+            conn.commit()
+        finally:
+            conn.close()
+        self._reset()
+        user = coll_store.verify_user("dist", "newpass1")
+        self.assertIsNotNone(user)
+        self.assertFalse(user.must_change_password)
+        self.assertIsNone(coll_store.verify_user("dist", "password1"))
+
+    def test_wrong_answer_ineligible_and_missing_accounts_share_one_error(self):
+        self._register()
+        coll_store.create_user("sales1", "salesman", "temp1234", "temp1234")
+        msgs = set()
+        for name, answer in [("dist", "wrong"), ("sales1", "st mary's"), ("ghost", "st mary's")]:
+            with self.assertRaises(ValueError) as cm:
+                self._reset(name=name, answer=answer)
+            msgs.add(str(cm.exception))
+        self.assertEqual(msgs, {coll_store.RESET_WRONG_ANSWER})
+        self.assertIsNotNone(coll_store.verify_user("dist", "password1"))
+
+    def test_short_or_mismatched_new_password_rejected_after_answer_ok(self):
+        self._register()
+        with self.assertRaises(ValueError):
+            coll_store.reset_password_with_secret_answer("dist", "st mary's", "abc", "abc")
+        with self.assertRaises(ValueError):
+            coll_store.reset_password_with_secret_answer("dist", "st mary's", "newpass1", "other11")
+        self.assertIsNotNone(coll_store.verify_user("dist", "password1"))
+
+    def test_set_secret_question_requires_current_password(self):
+        coll_store.register_first_distributor("dist", "password1", "password1")
+        with self.assertRaises(ValueError):
+            coll_store.set_secret_question("dist", "wrongpass", "Favourite colour?", "blue")
+        self.assertIsNone(coll_store.get_distributor_secret_question())
+        coll_store.set_secret_question("dist", "password1", "Favourite colour?", "Blue")
+        self.assertEqual(coll_store.get_distributor_secret_question(), "Favourite colour?")
+        self._reset(answer="blue")
+
+    def test_set_secret_question_refused_for_non_distributor(self):
+        coll_store.register_first_distributor("dist", "password1", "password1")
+        coll_store.create_user("sales1", "salesman", "temp1234", "temp1234")
+        with self.assertRaises(ValueError):
+            coll_store.set_secret_question("sales1", "temp1234", "Favourite colour?", "blue")
+
+    def test_non_distributor_never_gets_a_question_even_if_columns_set(self):
+        coll_store.register_first_distributor("dist", "password1", "password1")
+        coll_store.create_user("sales1", "salesman", "temp1234", "temp1234")
+        conn = coll_store.get_db()
+        try:
+            conn.execute("UPDATE users SET secret_question = 'q?????', secret_answer_hash = 'x:y'"
+                         " WHERE name = 'sales1'")
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertIsNone(coll_store.get_secret_question_for("sales1"))
+        self.assertIsNone(coll_store.get_distributor_secret_question())
 
 
 if __name__ == "__main__":

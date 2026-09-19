@@ -1161,6 +1161,23 @@ class TestCollectionCorrectionApply(DbTestCase):
         # Master data untouched.
         self.assertEqual(self._query("SELECT balance FROM vouchers")[0]["balance"], "80.00")
 
+    def test_apply_refused_for_a_returns_voucher(self):
+        # A Returns payment IS its items total; rewriting only the amount
+        # would leave payment != items and block approve/post.
+        cid, path = self._seed()
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["vouchers"][0].update(payment_type="returns", return_items=[
+            {"item": "Soap", "qty": "3", "price": "10.00", "amount": "30.00"}])
+        path.write_text(json.dumps(data), encoding="utf-8")
+        with self.assertRaises(ValueError) as ctx:
+            coll_orchestrate.apply_correction_request(cid, "apply", "sup")
+        self.assertIn("returned stock", str(ctx.exception))
+        self.assertEqual(coll_store.load_correction(cid)["status"], "open")
+        self.assertEqual(self._staged(path)["payment"], "30.00")
+        # It can still be rejected.
+        coll_orchestrate.apply_correction_request(cid, "reject", "sup", "salesman will revise")
+        self.assertEqual(coll_store.load_correction(cid)["status"], "rejected")
+
     def test_empty_correction_clears_payment_and_date(self):
         cid, path = self._seed(corr_new="")
         coll_orchestrate.apply_correction_request(cid, "apply", "dist")
@@ -1310,8 +1327,72 @@ class TestValidatePaymentType(unittest.TestCase):
         reason = coll_orchestrate.validate_payment_type({"payment_type": "bitcoin"})
         self.assertIn("unknown payment type", reason)
 
+    def test_returns_requires_items_matching_the_payment(self):
+        items = [{"item": "Soap", "qty": "3", "price": "10.50"}]
+        voucher = {"payment_type": "returns", "return_items": items, "payment": "31.50"}
+        self.assertIsNone(coll_orchestrate.validate_payment_type(voucher))
+        voucher["payment"] = "30.00"
+        self.assertIn("does not match", coll_orchestrate.validate_payment_type(voucher))
+        self.assertIn("at least one return item", coll_orchestrate.validate_payment_type(
+            {"payment_type": "returns", "return_items": [], "payment": "5.00"}))
+
+
+class TestParseReturnItems(unittest.TestCase):
+    def test_amounts_and_total_are_recomputed(self):
+        items, total, reason = coll_orchestrate.parse_return_items([
+            {"item": " Soap ", "qty": "3", "price": "10.5"},
+            {"item": "Tea", "qty": "2", "price": "99.99", "amount": "1.00"},
+        ])
+        self.assertIsNone(reason)
+        self.assertEqual(items[0], {"item": "Soap", "qty": "3", "price": "10.50", "amount": "31.50"})
+        self.assertEqual(items[1]["amount"], "199.98")
+        self.assertEqual(total, "231.48")
+
+    def test_blank_rows_skipped_and_all_blank_is_no_items(self):
+        blank = {"item": "", "qty": "", "price": ""}
+        self.assertEqual(coll_orchestrate.parse_return_items([blank, blank]), ([], "", None))
+        self.assertEqual(coll_orchestrate.parse_return_items(None), ([], "", None))
+        items, total, reason = coll_orchestrate.parse_return_items(
+            [blank, {"item": "Soap", "qty": "1", "price": "2"}])
+        self.assertIsNone(reason)
+        self.assertEqual(total, "2.00")
+
+    def test_invalid_rows_rejected(self):
+        bad = [
+            {"item": "", "qty": "1", "price": "2"},
+            {"item": "x" * 51, "qty": "1", "price": "2"},
+            {"item": "Soap", "qty": "0", "price": "2"},
+            {"item": "Soap", "qty": "1.5", "price": "2"},
+            {"item": "Soap", "qty": "-1", "price": "2"},
+            {"item": "Soap", "qty": "", "price": "2"},
+            {"item": "Soap", "qty": "1", "price": ""},
+            {"item": "Soap", "qty": "1", "price": "0"},
+            {"item": "Soap", "qty": "1", "price": "1.234"},
+            {"item": "Soap", "qty": "1", "price": "1e3"},
+        ]
+        for row in bad:
+            items, total, reason = coll_orchestrate.parse_return_items([row])
+            self.assertTrue(reason, row)
+            self.assertEqual((items, total), ([], ""), row)
+
+    def test_max_length_name_accepted(self):
+        _, _, reason = coll_orchestrate.parse_return_items(
+            [{"item": "x" * 50, "qty": "1", "price": "1"}])
+        self.assertIsNone(reason)
+
+    def test_malformed_input_rejected(self):
+        self.assertTrue(coll_orchestrate.parse_return_items("nope")[2])
+        self.assertTrue(coll_orchestrate.parse_return_items(["nope"])[2])
+
 
 class TestPaymentTypeTotals(unittest.TestCase):
+    def test_returns_bucketed_separately(self):
+        totals = coll_orchestrate.payment_type_totals(
+            [{"payment": "31.50", "payment_type": "returns"}, {"payment": "10.00"}])
+        self.assertEqual(totals["returns"]["count"], 1)
+        self.assertEqual(totals["returns"]["amount"], Decimal("31.50"))
+        self.assertEqual(totals["cash"]["count"], 1)
+
     def test_buckets_by_type_and_ignores_zero_payments(self):
         vouchers = [
             {"payment": "10.00", "payment_type": "cash"},

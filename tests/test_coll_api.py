@@ -1767,6 +1767,16 @@ class TestCollectionCorrections(ApiTestCase):
         self.assertEqual(corr["new"], {"payment": "45.00"})
         self.assertEqual(corr["origin_stage"], "submit")
 
+    def test_raise_refused_for_a_returns_voucher(self):
+        data = json.loads(self.report_path.read_text(encoding="utf-8"))
+        data["vouchers"][0].update(payment_type="returns", return_items=[
+            {"item": "Soap", "qty": "3", "price": "10.00", "amount": "30.00"}])
+        self.report_path.write_text(json.dumps(data), encoding="utf-8")
+        opener = self._login("sup", "pwS")
+        status, body = self._raise_collection(opener)
+        self.assertIn("paid by returned stock", body)
+        self.assertEqual(coll_store.load_corrections(), [])
+
     def test_raise_validation(self):
         opener = self._login("sup", "pwS")
         status, body = self._raise_collection(opener, new_amount="30.00")
@@ -2484,6 +2494,73 @@ class TestCollSubmitPaymentType(ApiTestCase):
         self.assertEqual(status, 200)
         self.assertIn("check bank is required", body)
 
+    def _returns_form(self, rows, **extra):
+        data = [("action", "save"), ("paytype_100", "returns"), ("pay_100", "999.00")]
+        for item, qty, price in rows:
+            data += [("retitem_100", item), ("retqty_100", qty), ("retprice_100", price)]
+        data += list(extra.items())
+        return data
+
+    def test_returns_total_becomes_the_payment_and_redisplays(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._post(opener, f"/coll/submit/{self.stem}", self._returns_form([
+            ("Soap", "3", "4.50"), ("Tea", "2", "10"), ("", "", ""),
+        ]))
+        self.assertEqual(status, 200)
+        installments, _ = coll_store._load_installments(self.tmp / "staging" / f"{self.stem}.json")
+        entry = installments["100"]
+        # 3 x 4.50 + 2 x 10 = 33.50; the posted "999.00" pay_ value is ignored.
+        self.assertEqual(entry["payment"], "33.50")
+        self.assertEqual(entry["payment_type"], "returns")
+        self.assertEqual([i["item"] for i in entry["return_items"]], ["Soap", "Tea"])
+        self.assertEqual(entry["return_items"][0]["amount"], "13.50")
+        status, body = self._get(opener, f"/coll/submit/{self.stem}")
+        self.assertIn("Soap", body)
+        self.assertIn("Tea", body)
+
+    def test_returns_over_balance_rejected(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._post(opener, f"/coll/submit/{self.stem}",
+                                  self._returns_form([("Soap", "11", "5")]))
+        self.assertIn("exceeds balance", body)
+        installments, _ = coll_store._load_installments(self.tmp / "staging" / f"{self.stem}.json")
+        self.assertEqual(installments, {})
+
+    def test_returns_invalid_item_rejected_and_rows_kept(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._post(opener, f"/coll/submit/{self.stem}",
+                                  self._returns_form([("Soap", "1.5", "5")]))
+        self.assertIn("quantity must be a whole number", body)
+        self.assertIn('value="Soap"', body)
+        installments, _ = coll_store._load_installments(self.tmp / "staging" / f"{self.stem}.json")
+        self.assertEqual(installments, {})
+
+    def test_returns_with_no_items_records_no_payment(self):
+        opener = self._login("smA", "pwA")
+        status, body = self._post(opener, f"/coll/submit/{self.stem}",
+                                  self._returns_form([("", "", "")]))
+        self.assertEqual(status, 200)
+        installments, _ = coll_store._load_installments(self.tmp / "staging" / f"{self.stem}.json")
+        self.assertEqual(installments, {})
+
+    def test_switching_away_from_returns_drops_items(self):
+        opener = self._login("smA", "pwA")
+        self._post(opener, f"/coll/submit/{self.stem}",
+                   self._returns_form([("Soap", "1", "5")]))
+        self._post(opener, f"/coll/submit/{self.stem}", {
+            "action": "save", "pay_100": "5.00", "paytype_100": "cash"})
+        installments, _ = coll_store._load_installments(self.tmp / "staging" / f"{self.stem}.json")
+        self.assertEqual(installments["100"]["payment_type"], "cash")
+        self.assertNotIn("return_items", installments["100"])
+
+    def test_item_text_is_escaped_on_redisplay(self):
+        opener = self._login("smA", "pwA")
+        self._post(opener, f"/coll/submit/{self.stem}",
+                   self._returns_form([("<script>alert(1)</script>", "1", "5")]))
+        status, body = self._get(opener, f"/coll/submit/{self.stem}")
+        self.assertNotIn("<script>alert(1)</script>", body)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", body)
+
 
 # ---------------------------------------------------------------------------
 # Checks screen — view for everyone with view_checks, resolve for distributor
@@ -2552,6 +2629,251 @@ class TestCollChecks(ApiTestCase):
         opener = self._login("smA", "pwA")
         status, body = self._get(opener, "/menu")
         self.assertIn("View Checks", body)
+
+
+# ---------------------------------------------------------------------------
+# First-time registration + distributor "Forgot password?" (secret question)
+# ---------------------------------------------------------------------------
+
+class TestForgotPassword(ApiTestCase):
+    Q = "Name of my first school?"
+
+    def setUp(self):
+        super().setUp()
+        coll_api._reset_clear_failures()
+
+    def tearDown(self):
+        coll_api._reset_clear_failures()
+        super().tearDown()
+
+    def _register(self, opener=None, **over):
+        data = {"name": "dist", "password": "password1", "confirm_password": "password1",
+                "secret_question": self.Q, "secret_answer": "St Mary's"}
+        data.update(over)
+        return self._post(opener or self._client(), "/register", data)
+
+    def _setup_distributor(self):
+        self._register()
+        self._add_user("smA", "salesman", "pwA")
+
+    def _start_reset(self, opener, username="dist"):
+        return self._post(opener, "/forgot-password", {"username": username})
+
+    def _do_reset(self, opener, answer="st mary's", pw="newpass1", confirm=None, username="dist"):
+        return self._post(opener, "/forgot-password/reset", {
+            "username": username, "secret_answer": answer,
+            "new_password": pw, "confirm_password": pw if confirm is None else confirm})
+
+    # ---- registration ------------------------------------------------------
+
+    def test_register_requires_question_and_answer(self):
+        for over in ({"secret_question": ""}, {"secret_answer": ""},
+                     {"secret_question": "hey"}, {"secret_answer": "ab"}):
+            status, body = self._register(**over)
+            self.assertIn("alert-error", body, over)
+            self.assertFalse(coll_store.has_any_users(), over)
+
+    def test_register_error_keeps_typed_question(self):
+        status, body = self._register(secret_answer="")
+        self.assertIn(self.Q, body)
+
+    def test_register_creates_distributor_with_question(self):
+        status, body = self._register()
+        self.assertIn("created", body)
+        self.assertEqual(coll_store.get_distributor_secret_question(), self.Q)
+
+    # ---- login-page link ---------------------------------------------------
+
+    def test_forgot_link_hidden_before_setup_and_without_question(self):
+        status, body = self._get(self._client(), "/login")
+        self.assertNotIn("/forgot-password", body)
+        self.assertIn("/register", body)
+        coll_store.register_first_distributor("dist", "password1", "password1")  # no question
+        status, body = self._get(self._client(), "/login")
+        self.assertNotIn("/forgot-password", body)
+
+    def test_forgot_link_shown_after_setup_with_question(self):
+        self._setup_distributor()
+        status, body = self._get(self._client(), "/login")
+        self.assertIn("/forgot-password", body)
+        self.assertNotIn("/register", body)
+
+    def test_forgot_page_redirects_to_login_when_unavailable(self):
+        status, body = self._get(self._client(), "/forgot-password")
+        self.assertIn("Sign in", body)  # followed the redirect to /login
+        self.assertNotIn("Reset the distributor password", body)
+
+    # ---- two-step reset ----------------------------------------------------
+
+    def test_full_reset_flow(self):
+        self._setup_distributor()
+        op = self._client()
+        status, body = self._start_reset(op)
+        self.assertIn(self.Q, body)
+        status, body = self._do_reset(op)
+        self.assertIn("Password reset", body)
+        self.assertIsNotNone(coll_store.verify_user("dist", "newpass1"))
+        self.assertIsNone(coll_store.verify_user("dist", "password1"))
+        # New password logs in and lands on the menu without a forced change.
+        status, body = self._get(self._login("dist", "newpass1"), "/menu")
+        self.assertIn("Main Menu", body)
+
+    def test_reset_invalidates_existing_sessions(self):
+        self._setup_distributor()
+        old = self._login("dist", "password1")
+        self.assertIn("Main Menu", self._get(old, "/menu")[1])
+        self._do_reset(self._client())
+        status, body = self._get(old, "/menu")
+        self.assertNotIn("Main Menu", body)
+
+    def test_other_users_sessions_survive_a_reset(self):
+        self._setup_distributor()
+        sm = self._login("smA", "pwA")
+        self._do_reset(self._client())
+        self.assertIn("Main Menu", self._get(sm, "/menu")[1])
+
+    def test_unknown_and_non_distributor_usernames_get_same_generic_message(self):
+        self._setup_distributor()
+        bodies = []
+        for name in ("ghost", "smA"):
+            status, body = self._start_reset(self._client(), name)
+            self.assertIn("available for this account", body)
+            self.assertNotIn(self.Q, body)
+            bodies.append(re.sub(r'value="[^"]*"', "", body))
+        self.assertEqual(bodies[0], bodies[1])
+
+    def test_reset_step_rechecks_eligibility_server_side(self):
+        self._setup_distributor()
+        status, body = self._do_reset(self._client(), username="smA")
+        self.assertIn("available for this account", body)
+        self.assertIsNotNone(coll_store.verify_user("smA", "pwA"))
+
+    def test_wrong_answer_and_bad_password_do_not_change_anything(self):
+        self._setup_distributor()
+        op = self._client()
+        status, body = self._do_reset(op, answer="wrong")
+        self.assertIn("That answer is incorrect", body)
+        self.assertIn(self.Q, body)  # stays on step 2
+        status, body = self._do_reset(op, pw="short")
+        self.assertIn("alert-error", body)
+        status, body = self._do_reset(op, pw="newpass1", confirm="different1")
+        self.assertIn("alert-error", body)
+        self.assertIsNotNone(coll_store.verify_user("dist", "password1"))
+
+    def test_logged_in_user_is_sent_to_menu(self):
+        self._setup_distributor()
+        op = self._login("dist", "password1")
+        status, body = self._get(op, "/forgot-password")
+        self.assertIn("Main Menu", body)
+
+    # ---- lockout -----------------------------------------------------------
+
+    def test_five_wrong_answers_lock_the_flow_even_for_the_right_answer(self):
+        self._setup_distributor()
+        op = self._client()
+        for i in range(4):
+            status, body = self._do_reset(op, answer="wrong")
+            self.assertIn("That answer is incorrect", body, i)
+        status, body = self._do_reset(op, answer="wrong")
+        self.assertIn("Too many incorrect attempts", body)
+        status, body = self._do_reset(op, answer="st mary's")
+        self.assertIn("Too many incorrect attempts", body)
+        self.assertIsNotNone(coll_store.verify_user("dist", "password1"))
+        # The lookup step is locked as well.
+        status, body = self._start_reset(op)
+        self.assertIn("Too many incorrect attempts", body)
+
+    def test_lock_expires_after_fifteen_minutes(self):
+        self._setup_distributor()
+        op = self._client()
+        for _ in range(5):
+            self._do_reset(op, answer="wrong")
+        coll_api._reset_state["locked_until"] = time.time() - 1
+        status, body = self._do_reset(op)
+        self.assertIn("Password reset", body)
+
+    def test_each_successive_lock_is_longer_until_a_success(self):
+        self._setup_distributor()
+        op = self._client()
+        expected = [15, 60, 24 * 60, 24 * 60]  # minutes; the last tier repeats
+        for i, mins in enumerate(expected):
+            for _ in range(5):
+                self._do_reset(op, answer="wrong")
+            self.assertAlmostEqual(coll_api._reset_locked_minutes(), mins, delta=1, msg=i)
+            # Still locked against the right answer, then let it expire.
+            status, body = self._do_reset(op, answer="st mary's")
+            self.assertIn("Too many incorrect attempts", body)
+            coll_api._reset_state["locked_until"] = time.time() - 1
+        # A correct reset finally clears the escalation.
+        status, body = self._do_reset(op)
+        self.assertIn("Password reset", body)
+        self.assertEqual(coll_api._reset_state["locks"], 0)
+
+    def test_slow_drip_guessing_does_not_reset_the_counter(self):
+        self._setup_distributor()
+        op = self._client()
+        for _ in range(5):
+            self._do_reset(op, answer="wrong")
+        coll_api._reset_state["locked_until"] = time.time() - 1  # first lock expires
+        for _ in range(4):
+            self._do_reset(op, answer="wrong")
+        self.assertEqual(coll_api._reset_locked_minutes(), 0)  # 4 of 5: not yet locked
+        self._do_reset(op, answer="wrong")
+        self.assertGreater(coll_api._reset_locked_minutes(), 15)  # second lock is 1 h
+
+    def test_long_lock_is_shown_in_hours(self):
+        self.assertEqual(coll_api._format_wait(1), "1 minute")
+        self.assertEqual(coll_api._format_wait(15), "15 minutes")
+        self.assertEqual(coll_api._format_wait(1440), "24 hours")
+
+    def test_success_clears_the_failure_counter(self):
+        self._setup_distributor()
+        op = self._client()
+        for _ in range(4):
+            self._do_reset(op, answer="wrong")
+        self.assertEqual(coll_api._reset_state["failures"], 4)
+        self._do_reset(op, pw="newpass1")
+        self.assertEqual(coll_api._reset_state["failures"], 0)
+        self.assertEqual(coll_api._reset_locked_minutes(), 0)
+
+    # ---- Profile: set / change the question -------------------------------
+
+    def _profile_post(self, op, **over):
+        data = {"current_password": "password1", "secret_question": "Favourite colour?",
+                "secret_answer": "Blue"}
+        data.update(over)
+        return self._post(op, "/profile/set-secret-question", data)
+
+    def test_existing_distributor_can_set_question_from_profile(self):
+        coll_store.register_first_distributor("dist", "password1", "password1")  # legacy: none
+        op = self._login("dist", "password1")
+        status, body = self._get(op, "/profile")
+        self.assertIn("None set yet", body)
+        status, body = self._profile_post(op)
+        self.assertIn("Secret question saved", body)
+        self.assertIn("Favourite colour?", body)
+        self.assertNotIn("Blue", body)  # the answer is never echoed
+        self.assertEqual(coll_store.get_distributor_secret_question(), "Favourite colour?")
+        self.assertIn("/forgot-password", self._get(self._client(), "/login")[1])
+
+    def test_profile_rejects_wrong_current_password(self):
+        coll_store.register_first_distributor("dist", "password1", "password1")
+        op = self._login("dist", "password1")
+        status, body = self._profile_post(op, current_password="nope")
+        self.assertIn("Current password is incorrect", body)
+        self.assertIsNone(coll_store.get_distributor_secret_question())
+
+    def test_profile_card_is_distributor_only_and_post_is_refused_for_others(self):
+        self._setup_distributor()
+        status, body = self._get(self._login("smA", "pwA"), "/profile")
+        self.assertNotIn("Secret Question", body)
+        status, body = self._profile_post(self._login("smA", "pwA"), current_password="pwA")
+        self.assertNotIn("Secret question saved", body)
+        self.assertEqual(coll_store.get_secret_question_for("smA"), None)
+        self.assertEqual(coll_store.get_distributor_secret_question(), self.Q)
+        status, body = self._get(self._login("dist", "password1"), "/profile")
+        self.assertIn("Secret Question", body)
+        self.assertIn(self.Q, body)
 
 
 if __name__ == "__main__":

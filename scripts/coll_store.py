@@ -82,7 +82,9 @@ _TABLE_DDL_V1 = {
     name                 TEXT PRIMARY KEY NOT NULL CHECK (name <> ''),
     role                 TEXT NOT NULL CHECK (role IN ('distributor','supervisor','salesman','system')),
     password_hash        TEXT NOT NULL DEFAULT '',
-    must_change_password INTEGER NOT NULL DEFAULT 0
+    must_change_password INTEGER NOT NULL DEFAULT 0,
+    secret_question      TEXT,
+    secret_answer_hash   TEXT
 """,
     "beats": """
     name     TEXT PRIMARY KEY NOT NULL CHECK (name <> ''),
@@ -111,7 +113,7 @@ _TABLE_DDL_V1 = {
     salesman     TEXT NOT NULL CHECK (salesman <> ''),
     created_by   TEXT NOT NULL DEFAULT '',
     created_at   TEXT NOT NULL DEFAULT '',
-    payment_type TEXT NOT NULL DEFAULT 'cash' CHECK (payment_type IN ('cash','upi','check')),
+    payment_type TEXT NOT NULL DEFAULT 'cash' CHECK (payment_type IN ('cash','upi','check','returns')),
     payment_ref  TEXT NOT NULL DEFAULT ''
 """,
     "completed_vouchers": """
@@ -132,13 +134,14 @@ _TABLE_DDL_V1 = {
     salesman     TEXT NOT NULL CHECK (salesman <> ''),
     created_by   TEXT NOT NULL DEFAULT '',
     created_at   TEXT NOT NULL DEFAULT '',
-    payment_type TEXT NOT NULL DEFAULT 'cash' CHECK (payment_type IN ('cash','upi','check')),
+    payment_type TEXT NOT NULL DEFAULT 'cash' CHECK (payment_type IN ('cash','upi','check','returns')),
     payment_ref  TEXT NOT NULL DEFAULT ''
 """,
 }
 
 _TABLE_COPY_COLUMNS = {
-    "users": ["name", "role", "password_hash", "must_change_password"],
+    "users": ["name", "role", "password_hash", "must_change_password",
+              "secret_question", "secret_answer_hash"],
     "beats": ["name", "salesman"],
     "permissions": ["role", "action_key"],
     "vouchers": ["bill_no", "date", "amount", "balance", "beat", "salesman",
@@ -301,6 +304,7 @@ def init_db():
         conn.commit()
         _backfill_beats_salesman(conn)
         _backfill_must_change_password(conn)
+        _backfill_secret_question_columns(conn)
         _backfill_permissions(conn)
         _backfill_coll_print_permission(conn)
         _backfill_correction_permissions(conn)
@@ -312,6 +316,7 @@ def init_db():
         _migrate_corrections_kinds(conn)
         if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
             _migrate_schema_v1(conn)
+        _migrate_payment_type_returns(conn)
     finally:
         conn.close()
 
@@ -413,6 +418,54 @@ def _migrate_schema_v1(conn):
         conn.execute("PRAGMA foreign_keys=ON")
 
 
+def _migrate_payment_type_returns(conn):
+    """Rebuild installments/completed_installments when their payment_type
+    CHECK predates the 'returns' value. Self-detecting via the stored CREATE
+    SQL (SQLite cannot widen a CHECK in place). Tables with no payment_type
+    CHECK at all (columns added by ALTER) are left alone. Pure widening: every
+    existing row satisfies the new CHECK, and ids are copied so they survive.
+    """
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        for table in ("installments", "completed_installments"):
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,)).fetchone()
+            sql = (row["sql"] or "") if row else ""
+            if "payment_type IN" not in sql or "'returns'" in sql:
+                continue
+            cols = ", ".join(_TABLE_COPY_COLUMNS[table])
+            seq = conn.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = ?", (table,)).fetchone()
+            with conn:
+                conn.execute(f"DROP TABLE IF EXISTS {table}_rt")
+                conn.execute(f"CREATE TABLE {table}_rt ({_TABLE_DDL_V1[table]})")
+                conn.execute(f"INSERT INTO {table}_rt ({cols}) SELECT {cols} FROM {table}")
+                conn.execute(f"DROP TABLE {table}")
+                conn.execute(f"ALTER TABLE {table}_rt RENAME TO {table}")
+                if seq is not None:
+                    # AUTOINCREMENT high-water mark: without this, ids deleted
+                    # from the top of the table would be reused, and
+                    # checks.installment_id (an audit pointer) could then
+                    # reference a different installment.
+                    cur = conn.execute(
+                        "UPDATE sqlite_sequence SET seq = MAX(seq, ?) WHERE name = ?",
+                        (seq[0], table))
+                    if cur.rowcount == 0:
+                        conn.execute(
+                            "INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)",
+                            (table, seq[0]))
+                # Scoped to this table: an unrelated pre-existing orphan
+                # elsewhere must not stop the app from starting.
+                if conn.execute(f"PRAGMA foreign_key_check({table})").fetchall():
+                    raise MigrationError(
+                        f"Foreign key check failed on {table} after widening"
+                        " payment_type — migration rolled back.")
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
 def _backfill_beats_salesman(conn):
     """Add beats.salesman if missing, then fill it in from data/beats.csv by name."""
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(beats)").fetchall()]
@@ -433,6 +486,15 @@ def _backfill_beats_salesman(conn):
                     )
     except Exception:
         pass
+
+
+def _backfill_secret_question_columns(conn):
+    """Add users.secret_question / users.secret_answer_hash if missing
+    (additive, nullable — existing accounts simply have no question set)."""
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+    for col in ("secret_question", "secret_answer_hash"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
 
 
 def _backfill_must_change_password(conn):
@@ -750,30 +812,142 @@ def has_any_users() -> bool:
         conn.close()
 
 
-def register_first_distributor(name, password, confirm_password):
+SECRET_QUESTION_MIN = 5
+SECRET_QUESTION_MAX = 200
+SECRET_ANSWER_MIN = 3
+SECRET_ANSWER_MAX = 100
+
+
+def _normalize_secret_answer(answer):
+    """Trim, casefold and collapse inner whitespace so "  Fluffy  Dog " and
+    "fluffy dog" hash identically."""
+    return " ".join((answer or "").split()).casefold()
+
+
+def _validate_secret_question(question, answer):
+    """Return (question, normalized_answer) or raise ValueError."""
+    question = " ".join((question or "").split())
+    if not (SECRET_QUESTION_MIN <= len(question) <= SECRET_QUESTION_MAX):
+        raise ValueError(
+            f"secret question must be {SECRET_QUESTION_MIN}-{SECRET_QUESTION_MAX} characters")
+    normalized = _normalize_secret_answer(answer)
+    if not (SECRET_ANSWER_MIN <= len(normalized) <= SECRET_ANSWER_MAX):
+        raise ValueError(
+            f"secret answer must be {SECRET_ANSWER_MIN}-{SECRET_ANSWER_MAX} characters")
+    return question, normalized
+
+
+def register_first_distributor(name, password, confirm_password,
+                               secret_question=None, secret_answer=None):
     """Bootstrap-only: create the first distributor account when the users
     table is empty, so a fresh deployment with nobody able to log in can
     stand itself up without an existing distributor session.
 
     must_change_password=0 — the registrant already chose their own password,
     unlike create_user() where a distributor sets a placeholder for someone
-    else. Raises ValueError for invalid name/password, or if a user already
-    exists (closes the race between the GET check and this submit).
+    else. When a secret question/answer is supplied (the web form requires
+    it) it is stored in the same insert, enabling "Forgot password?".
+    Raises ValueError for invalid name/password/question, or if a user
+    already exists (closes the race between the GET check and this submit).
     """
     name = _validate_new_name(name, "user")
     _validate_password(password, confirm_password)
+    question = answer_hash = None
+    if secret_question is not None or secret_answer is not None:
+        question, normalized = _validate_secret_question(secret_question, secret_answer)
+        answer_hash = hash_password(normalized)
     conn = get_db()
     try:
         with conn:
             if conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0:
                 raise ValueError("registration is closed — an account already exists")
             conn.execute(
-                "INSERT INTO users (name, role, password_hash, must_change_password)"
-                " VALUES (?, 'distributor', ?, 0)",
-                (name, hash_password(password)),
+                "INSERT INTO users (name, role, password_hash, must_change_password,"
+                " secret_question, secret_answer_hash)"
+                " VALUES (?, 'distributor', ?, 0, ?, ?)",
+                (name, hash_password(password), question, answer_hash),
             )
     finally:
         conn.close()
+
+
+def get_distributor_secret_question():
+    """The distributor's secret question, or None when there is no
+    distributor or none has been set — drives whether "Forgot password?" is
+    offered at all."""
+    if not _db_path().exists():
+        return None
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT secret_question FROM users WHERE role = 'distributor'"
+            " AND secret_question IS NOT NULL AND secret_question <> '' AND"
+            " secret_answer_hash IS NOT NULL AND secret_answer_hash <> ''"
+            " LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    return row["secret_question"] if row else None
+
+
+def get_secret_question_for(name):
+    """The secret question for `name` only if that account is the distributor
+    with a question set, else None (callers must not distinguish the reasons)."""
+    if not _db_path().exists():
+        return None
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT secret_question FROM users WHERE name = ? AND role = 'distributor'"
+            " AND secret_question IS NOT NULL AND secret_question <> ''"
+            " AND secret_answer_hash IS NOT NULL AND secret_answer_hash <> ''",
+            (name,)).fetchone()
+    finally:
+        conn.close()
+    return row["secret_question"] if row else None
+
+
+def set_secret_question(name, current_password, question, answer):
+    """Distributor sets/changes their secret question (Profile). Requires the
+    current password so a walk-up on an unlocked session can't plant their
+    own answer. Raises ValueError otherwise."""
+    question, normalized = _validate_secret_question(question, answer)
+    conn = get_db()
+    try:
+        with conn:
+            row = conn.execute(
+                "SELECT role, password_hash FROM users WHERE name = ?", (name,)).fetchone()
+            if row is None or row["role"] != "distributor":
+                raise ValueError("only the distributor can set a secret question")
+            if not _verify_password(row["password_hash"], current_password):
+                raise ValueError("current password is incorrect")
+            conn.execute(
+                "UPDATE users SET secret_question = ?, secret_answer_hash = ? WHERE name = ?",
+                (question, hash_password(normalized), name))
+    finally:
+        conn.close()
+
+
+RESET_WRONG_ANSWER = "the answer is incorrect"
+
+
+def reset_password_with_secret_answer(name, answer, new_password, confirm_password):
+    """Forgot-password reset for the distributor. Refuses unless `name` is the
+    distributor with a question set. Wrong answer and ineligible account raise
+    the SAME generic ValueError (RESET_WRONG_ANSWER) so callers can't tell
+    them apart. Writes the new password with must_change_password=False — the
+    user chose it themselves, exactly like /register."""
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT secret_answer_hash FROM users WHERE name = ? AND role = 'distributor'",
+            (name,)).fetchone()
+    finally:
+        conn.close()
+    stored = (row["secret_answer_hash"] or "") if row else ""
+    if not stored or not _verify_password(stored, _normalize_secret_answer(answer)):
+        raise ValueError(RESET_WRONG_ANSWER)
+    _validate_password(new_password, confirm_password)
+    set_user_password(name, hash_password(new_password), must_change_password=False)
 
 
 def create_user(name, role, password, confirm_password):
@@ -1200,6 +1374,8 @@ def _append_installments(conn, vouchers, created_by="app"):
         payment_ref = ""
         if payment_type == "upi" and (v.get("upi_txn_id") or "").strip():
             payment_ref = json.dumps({"txn_id": v["upi_txn_id"].strip()})
+        elif payment_type == "returns" and v.get("return_items"):
+            payment_ref = json.dumps({"items": v["return_items"]})
         cur = conn.execute(
             "INSERT INTO installments"
             " (bill_no, date, amount, salesman, created_by, created_at,"
@@ -1300,17 +1476,20 @@ def _archive_completed(conn, bill_nos):
         )
 
     inst_rows = conn.execute(
-        f"SELECT bill_no, date, amount, salesman, created_by, created_at"
+        f"SELECT bill_no, date, amount, salesman, created_by, created_at,"
+        f" payment_type, payment_ref"
         f" FROM installments WHERE bill_no IN ({ph})",
         bill_list,
     ).fetchall()
     for r in inst_rows:
         conn.execute(
             "INSERT INTO completed_installments"
-            " (bill_no, date, amount, salesman, created_by, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
+            " (bill_no, date, amount, salesman, created_by, created_at,"
+            " payment_type, payment_ref)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (r["bill_no"], r["date"], r["amount"],
-             r["salesman"], r["created_by"], r["created_at"]),
+             r["salesman"], r["created_by"], r["created_at"],
+             r["payment_type"], r["payment_ref"]),
         )
     # Installments reference vouchers via FK, so they must go first.
     conn.execute(f"DELETE FROM installments WHERE bill_no IN ({ph})", bill_list)
@@ -2303,7 +2482,8 @@ def _installments_path(report_path):
 
 
 _PAYMENT_TYPE_SIDECAR_KEYS = (
-    "payment_type", "upi_txn_id", "check_bank", "check_branch", "check_no", "check_date")
+    "payment_type", "upi_txn_id", "check_bank", "check_branch", "check_no", "check_date",
+    "return_items")
 
 
 def _save_installments(report_path, vouchers, bookmark_bill_no=None):

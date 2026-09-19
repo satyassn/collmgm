@@ -30,4 +30,27 @@
     {% if not forced %}<a class="btn btn-secondary" href="/menu">Back to Menu</a>{% endif %}
   </div>
 </form>
+
+{% if user.role == "distributor" %}
+<h3 class="group-heading">Secret Question</h3>
+<p class="muted">Lets you reset your password from the login screen if you forget it. Pick an answer other people can't guess.
+  {% if current_question %}Current question: <strong>{{ current_question }}</strong>{% else %}<strong>None set yet</strong> — "Forgot password?" is unavailable until you set one.{% endif %}</p>
+{% if sq_error %}<p class="alert alert-error">{{ sq_error }}</p>{% endif %}
+<form method="post" action="/profile/set-secret-question" class="card">
+  <label class="field-label">Secret Question
+    <input type="text" name="secret_question" required minlength="5" maxlength="200" autocomplete="off"
+           placeholder="e.g. Name of my first school">
+  </label>
+  <label class="field-label">Answer
+    <input type="text" name="secret_answer" required minlength="3" maxlength="100" autocomplete="off"
+           autocapitalize="off">
+  </label>
+  <label class="field-label">Current Password
+    <input type="password" name="current_password" required autocomplete="current-password">
+  </label>
+  <div class="action-row">
+    <button type="submit" class="btn btn-primary">{{ "Change" if current_question else "Set" }} Secret Question</button>
+  </div>
+</form>
+{% endif %}
 {% endblock %}
