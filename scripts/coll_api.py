@@ -13,6 +13,7 @@ import re
 import secrets
 import sys
 import threading
+import time
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -48,6 +49,7 @@ from coll_orchestrate import (
 from coll_store import (
     STAGING_DIR,
     ASSIGNABLE_ROLES,
+    RESET_WRONG_ANSWER,
     AmendmentConflict,
     CorrectionConflict,
     archive_files,
@@ -87,8 +89,12 @@ from coll_store import (
     open_corrections_for_bills,
     parse_decimal,
     read_finalize_checkpoint,
+    get_distributor_secret_question,
+    get_secret_question_for,
     register_first_distributor,
+    reset_password_with_secret_answer,
     reset_user_password,
+    set_secret_question,
     sanitize_filename_component,
     save_report_json,
     update_beat_salesman,
@@ -132,6 +138,47 @@ _SESSION_COOKIE = "collmgm_session"
 # writes is narrowed — not eliminated — by re-loading the report after the
 # lock is taken.
 _verify_lock = threading.Lock()
+
+# Forgot-password lockout: every 5 wrong secret answers lock the whole reset
+# flow, and each successive lock is longer (15 min, 1 h, then 24 h) until a
+# successful reset — so slow-drip guessing is capped at 5 tries per lock
+# instead of ~480 a day. Process-local like _sessions (a service restart
+# clears it, which an attacker on the LAN cannot trigger). Global, not
+# per-IP: there is one distributor, and LAN clients often share an address.
+_RESET_MAX_FAILURES = 5
+_RESET_LOCK_TIERS = (15 * 60, 60 * 60, 24 * 60 * 60)  # seconds; last tier repeats
+_reset_state = {"failures": 0, "locks": 0, "locked_until": 0.0}
+_reset_state_lock = threading.Lock()
+
+
+def _reset_locked_minutes():
+    """Whole minutes (>=1) left on the reset lockout, or 0 when not locked."""
+    with _reset_state_lock:
+        remaining = _reset_state["locked_until"] - time.time()
+        if remaining <= 0:
+            return 0
+        return int(remaining // 60) + 1
+
+
+def _reset_record_failure():
+    with _reset_state_lock:
+        _reset_state["failures"] += 1
+        if _reset_state["failures"] >= _RESET_MAX_FAILURES:
+            tier = min(_reset_state["locks"], len(_RESET_LOCK_TIERS) - 1)
+            _reset_state["locks"] += 1
+            _reset_state["failures"] = 0
+            _reset_state["locked_until"] = time.time() + _RESET_LOCK_TIERS[tier]
+
+
+def _reset_clear_failures():
+    with _reset_state_lock:
+        _reset_state.update(failures=0, locks=0, locked_until=0.0)
+
+
+def _format_wait(minutes):
+    if minutes >= 120:
+        return f"{(minutes + 59) // 60} hours"
+    return f"{minutes} minute{'s' if minutes != 1 else ''}"
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +342,16 @@ def root(request: Request):
 def login_page(request: Request):
     if _get_user(request):
         return _r("/menu")
-    return _tmpl("login.html", request, show_register=not has_any_users())
+    return _tmpl("login.html", request, **_login_flags())
+
+
+def _login_flags():
+    """Which first-run/recovery links the login screen offers. The forgot link
+    only appears once setup is done AND the distributor has a secret question
+    on file, so it never leads to a dead end."""
+    registered = has_any_users()
+    return {"show_register": not registered,
+            "show_forgot": registered and get_distributor_secret_question() is not None}
 
 
 @app.post("/login", response_class=HTMLResponse)
@@ -305,7 +361,7 @@ def login_post(request: Request,
     user = verify_user(username.strip(), password)
     if not user:
         return _tmpl("login.html", request, error="Invalid username or password.",
-                     show_register=not has_any_users())
+                     **_login_flags())
     resp = _r("/profile?forced=1" if user.must_change_password else "/menu")
     _set_session(resp, user)
     return resp
@@ -331,14 +387,100 @@ def register_page(request: Request):
 def register_post(request: Request,
                   name: str = Form(default=""),
                   password: str = Form(default=""),
-                  confirm_password: str = Form(default="")):
+                  confirm_password: str = Form(default=""),
+                  secret_question: str = Form(default=""),
+                  secret_answer: str = Form(default="")):
     if has_any_users():
         return _r("/login")
     try:
-        register_first_distributor(name.strip(), password, confirm_password)
+        # Both are required here (empty strings are validated, not skipped):
+        # the question is what makes "Forgot password?" possible later.
+        register_first_distributor(name.strip(), password, confirm_password,
+                                   secret_question=secret_question, secret_answer=secret_answer)
     except ValueError as e:
-        return _tmpl("register.html", request, error=str(e), submitted_name=name)
+        return _tmpl("register.html", request, error=str(e), submitted_name=name,
+                     submitted_question=secret_question)
     return _redirect_ok("/login", f"Distributor account '{name.strip()}' created — sign in to continue.")
+
+
+# ---------------------------------------------------------------------------
+# Forgot password (distributor only, secret question)
+# ---------------------------------------------------------------------------
+
+_RESET_UNAVAILABLE_MSG = ("Password reset isn't available for this account. "
+                          "Ask the distributor to reset it in Manage Users.")
+
+
+def _forgot_locked_page(request, minutes):
+    return _tmpl("forgot_password.html", request, step=1,
+                 error=f"Too many incorrect attempts. Try again in {_format_wait(minutes)}.")
+
+
+@app.get("/forgot-password", response_class=HTMLResponse)
+def forgot_password_page(request: Request):
+    if _get_user(request):
+        return _r("/menu")
+    if get_distributor_secret_question() is None:
+        return _r("/login")
+    return _tmpl("forgot_password.html", request, step=1)
+
+
+@app.post("/forgot-password", response_class=HTMLResponse)
+def forgot_password_lookup(request: Request, username: str = Form(default="")):
+    if _get_user(request):
+        return _r("/menu")
+    minutes = _reset_locked_minutes()
+    if minutes:
+        return _forgot_locked_page(request, minutes)
+    username = username.strip()
+    question = get_secret_question_for(username)
+    if question is None:
+        # One message for "no such user", "not the distributor" and "no
+        # question set". Note the flip side is unavoidable: a username that DOES
+        # get the question page is the distributor, so anyone on the LAN can
+        # learn the distributor's username and question (not the answer).
+        return _tmpl("forgot_password.html", request, step=1, error=_RESET_UNAVAILABLE_MSG,
+                     submitted_name=username)
+    return _tmpl("forgot_password.html", request, step=2, username=username, question=question)
+
+
+@app.post("/forgot-password/reset", response_class=HTMLResponse)
+def forgot_password_reset(request: Request,
+                          username: str = Form(default=""),
+                          secret_answer: str = Form(default=""),
+                          new_password: str = Form(default=""),
+                          confirm_password: str = Form(default="")):
+    if _get_user(request):
+        return _r("/menu")
+    minutes = _reset_locked_minutes()
+    if minutes:
+        return _forgot_locked_page(request, minutes)
+    username = username.strip()
+    question = get_secret_question_for(username)
+    if question is None:
+        return _tmpl("forgot_password.html", request, step=1, error=_RESET_UNAVAILABLE_MSG,
+                     submitted_name=username)
+
+    def step2_error(msg):
+        return _tmpl("forgot_password.html", request, step=2, username=username,
+                     question=question, error=msg)
+
+    # The store checks the answer before the new password, so a wrong answer
+    # can never skip the attempt counter by also being a bad password.
+    try:
+        reset_password_with_secret_answer(username, secret_answer, new_password, confirm_password)
+    except ValueError as e:
+        if str(e) == RESET_WRONG_ANSWER:
+            _reset_record_failure()
+            minutes = _reset_locked_minutes()
+            if minutes:
+                return _forgot_locked_page(request, minutes)
+            return step2_error("That answer is incorrect.")
+        return step2_error(str(e).capitalize() + ".")
+    _reset_clear_failures()
+    for token in [t for t, u in list(_sessions.items()) if u.name == username]:
+        _sessions.pop(token, None)
+    return _redirect_ok("/login", "Password reset — sign in with your new password.")
 
 
 # ---------------------------------------------------------------------------
@@ -2498,7 +2640,31 @@ def profile(request: Request, forced: str = ""):
     user, err = _require(request)
     if err:
         return err
-    return _tmpl("profile.html", request, user=user, forced=bool(forced), error=None)
+    return _profile_page(request, user, forced=bool(forced))
+
+
+def _profile_page(request, user, forced=False, error=None, sq_error=None):
+    """Render /profile. The Secret Question card is distributor-only; the
+    current question is shown (never the answer)."""
+    current_question = (get_secret_question_for(user.name)
+                        if user.role == "distributor" else None)
+    return _tmpl("profile.html", request, user=user, forced=forced, error=error,
+                 sq_error=sq_error, current_question=current_question)
+
+
+@app.post("/profile/set-secret-question", response_class=HTMLResponse)
+def profile_set_secret_question(request: Request,
+                                current_password: str = Form(default=""),
+                                secret_question: str = Form(default=""),
+                                secret_answer: str = Form(default="")):
+    user, err = _require(request)
+    if err:
+        return err
+    try:
+        set_secret_question(user.name, current_password, secret_question, secret_answer)
+    except ValueError as e:
+        return _profile_page(request, user, sq_error=str(e).capitalize() + ".")
+    return _redirect_ok("/profile", "Secret question saved.")
 
 
 @app.post("/profile/change-password", response_class=HTMLResponse)
@@ -2513,7 +2679,7 @@ def profile_change_password(request: Request,
     try:
         change_own_password(user.name, current_password, new_password, confirm_password)
     except ValueError as e:
-        return _tmpl("profile.html", request, user=user, forced=bool(forced), error=str(e))
+        return _profile_page(request, user, forced=bool(forced), error=str(e))
     token = request.cookies.get(_SESSION_COOKIE)
     if token in _sessions:
         _sessions[token] = user._replace(must_change_password=False)

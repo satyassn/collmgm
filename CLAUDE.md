@@ -147,6 +147,8 @@ Cancel: salesman at generation, supervisor/distributor at approve-list, salesman
 1. **beta0.1** — Three-stage collection workflow CLI (released).
 2. **Login + RBAC** — Login at startup, role-based gates for all workflow steps (released in alpha).
 
+**First-run setup + distributor recovery (web-only):** on an empty users table `/login` offers `/register`, which creates the one distributor (username, password, and a required **secret question + answer**) and then closes for good. Once a question is on file the login screen shows **Forgot password?** (distributor only): `/forgot-password` asks for the username, shows the question, and takes the answer + new password. The answer is stored hashed and compared case/whitespace-insensitively; 5 wrong answers lock the flow for 15 minutes (in-memory); a successful reset drops that user's sessions. Installs whose distributor has no question yet set one in Profile — until then the link stays hidden.
+
 ## Planned next milestones (see roadmap.md for detail)
 
 **LAN Web App** — browser-based access over the local network, PWA home-screen icon, no client install. Three sub-milestones in order:

@@ -26,6 +26,9 @@
       <input id="password" name="password" type="password" autocomplete="current-password" required>
       <button type="submit" class="btn btn-primary btn-full">Sign in</button>
     </form>
+    {% if show_forgot %}
+    <p class="hint"><a href="/forgot-password">Forgot password? (distributor)</a></p>
+    {% endif %}
     {% if show_register %}
     <p class="hint"><a href="/register">First-time setup? Register the distributor account</a></p>
     {% endif %}
