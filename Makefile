@@ -8,7 +8,7 @@ DIST       := packaging/dist
 
 .DEFAULT_GOAL := help
 
-.PHONY: help build deploy run serve install-service uninstall-service clean
+.PHONY: help build deploy release run serve install-service uninstall-service clean
 
 help:
 	@echo "Usage: make [target] [RELEASE=alpha] [STAMP=yyyymmddhhmmss]"
@@ -17,6 +17,7 @@ help:
 	@echo "                     Requires: Inno Setup 6, packaging/python/, packaging/nssm/"
 	@echo "                     Run packaging/setup_build_env.bat before first build"
 	@echo "  deploy             Install & start the newest built installer as a service (needs admin)"
+	@echo "  release            Publish a GitHub Release for a customer build (needs 'gh', pushes the tag)"
 	@echo "  run                Launch the CLI (system Python)"
 	@echo "  serve              Start the web server (system Python, port 8100)"
 	@echo "  install-service    Register collmgm-server Windows Service (dev, needs admin)"
@@ -51,6 +52,31 @@ deploy:
 	echo "Installed. Service status:"; \
 	sc query collmgm-server || true; \
 	echo "CollMgm is running at http://localhost:8100 (LAN: http://$$COMPUTERNAME:8100)"
+
+# Publish a GitHub Release for a build already produced by 'make build'.
+# Only for builds actually handed to a customer — routine builds stay as
+# plain git tags. Pushes the build tag, then attaches the matching
+# installer EXE as a release asset. Requires 'gh' installed and authenticated.
+release:
+	@set -e; \
+	if [ -n "$(STAMP)" ]; then \
+	  TAG="build/$(RELEASE)-$(STAMP)"; \
+	else \
+	  TAG=$$(git tag -l "build/$(RELEASE)-*" | sort | tail -1); \
+	fi; \
+	if [ -z "$$TAG" ]; then \
+	  echo "ERROR: no build/$(RELEASE)-* tag found. Run 'make build' first."; \
+	  exit 1; \
+	fi; \
+	STAMP_RESOLVED=$${TAG#build/$(RELEASE)-}; \
+	EXE="$(DIST)/CollMgm-$(RELEASE)-$$STAMP_RESOLVED-Setup.exe"; \
+	if [ ! -f "$$EXE" ]; then \
+	  echo "ERROR: $$EXE not found. Run 'make build RELEASE=$(RELEASE) STAMP=$$STAMP_RESOLVED' first."; \
+	  exit 1; \
+	fi; \
+	echo "Publishing $$TAG with $$EXE ..."; \
+	git push origin "$$TAG"; \
+	gh release create "$$TAG" "$$EXE" --title "CollMgm $(RELEASE) $$STAMP_RESOLVED" --generate-notes
 
 run:
 	python -c "import sys; sys.path.insert(0, 'scripts'); import collmenu; collmenu.main()"
