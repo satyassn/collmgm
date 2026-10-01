@@ -6,6 +6,7 @@
 - [Inno Setup 6.x](https://jrsoftware.org/isinfo.php)
 - Python + pip on PATH (system Python, for `setup_build_env.bat`)
 - Internet access to download Python embeddable package and NSSM (one-time per new version)
+- [GitHub CLI](https://cli.github.com/) (`gh`), authenticated via `gh auth login` — only needed for `make release` (Step 7)
 
 ---
 
@@ -149,7 +150,16 @@ Test on a clean Windows machine (or VM) that does **not** have Python installed:
 
 ## Step 7 — Deliver to Customer
 
-Send the `CollMgm-alpha-<stamp>-Setup.exe` (~20–30 MB) and `BETA_GUIDE.txt`.
+For a build that's actually going to a customer, publish it as a GitHub Release so they have one authoritative download link:
+
+```bat
+make release                 # publishes the newest build/alpha-* tag + its EXE
+make release RELEASE=beta STAMP=20260701143022   # publish a specific build
+```
+
+This pushes the build's git tag and attaches the matching `.exe` to a new GitHub Release (auto-generated notes from commits since the last release). Requires `gh` installed and authenticated — see Prerequisites.
+
+If GitHub access isn't available, fall back to sending the `CollMgm-alpha-<stamp>-Setup.exe` (~20–30 MB) and `BETA_GUIDE.txt` directly.
 
 ---
 
