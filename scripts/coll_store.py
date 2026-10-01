@@ -312,6 +312,7 @@ def init_db():
         _backfill_amendment_request_permissions(conn)
         _backfill_payment_type_columns(conn)
         _backfill_check_permissions(conn)
+        _backfill_supervisor_approve_new_vouchers(conn)
         conn.commit()
         _migrate_corrections_kinds(conn)
         if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
@@ -603,6 +604,15 @@ def _backfill_payment_type_columns(conn):
         if "payment_ref" not in cols:
             conn.execute(
                 f"ALTER TABLE {table} ADD COLUMN payment_ref TEXT NOT NULL DEFAULT ''")
+
+
+def _backfill_supervisor_approve_new_vouchers(conn):
+    """Additive grant: the supervisor approves salesman-reviewed onboarding
+    vouchers (web "New Voucher Batches"). The distributor already held this
+    key from the original CLI Approve New Vouchers flow."""
+    conn.execute(
+        "INSERT OR IGNORE INTO permissions (role, action_key) VALUES (?, ?)",
+        ("supervisor", "approve_new_vouchers"))
 
 
 def _backfill_check_permissions(conn):

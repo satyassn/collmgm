@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}{{ beat }} — CollMgm{% endblock %}
 {% block content %}
+{% from "_vcard.html" import vcard %}
 <h2 class="page-heading">Pending: {{ beat }}</h2>
 
 {% if not grouped %}
@@ -8,21 +9,10 @@
 {% else %}
   {% for salesman, vouchers in grouped.items() %}
   <h3 class="group-heading">{{ salesman }} <span class="group-total">({{ totals.get(salesman,0) }})</span></h3>
-  <div class="table-wrapper">
-  <table class="data-table card-table">
-    <thead>
-      <tr><th>Bill No</th><th>Date</th><th class="num">Balance</th></tr>
-    </thead>
-    <tbody>
-      {% for v in vouchers %}
-      <tr>
-        <td class="mono" data-label="Bill No"><a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a></td>
-        <td data-label="Date">{{ v.date }}</td>
-        <td class="num mono" data-label="Balance">{{ v.balance }}</td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+  <div class="vc-list">
+  {% for v in vouchers %}
+    {{ vcard(v.bill_no, "min", date=v.date, amount=v.amount, paid=v.paid, balance=v.balance, href="/voucher/" ~ (v.bill_no | urlencode)) }}
+  {% endfor %}
   </div>
   {% endfor %}
   <p class="grand-total">Grand total: <strong>{{ grand }}</strong></p>

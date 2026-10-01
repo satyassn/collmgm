@@ -12,6 +12,7 @@ supervisor,coll_submit
 supervisor,coll_approve_submit
 supervisor,add_vouchers
 supervisor,import_vouchers
+supervisor,approve_new_vouchers
 supervisor,reports
 supervisor,coll_print
 supervisor,raise_correction

@@ -1479,28 +1479,48 @@ class AddvBatchTestCase(OrchestrateTestCase):
         st = coll_orchestrate.addv_batch_status(batch)
         self.assertEqual(st["status"], "pending_review")
 
-    def test_status_ready_to_post_when_all_reviewed_no_flags(self):
+    def test_reviewed_vouchers_wait_for_the_supervisor_not_the_distributor(self):
         batch = self._batch()
         coll_orchestrate.clear_addv_review(batch, "B1", "sm1")
         coll_orchestrate.clear_addv_review(batch, "B2", "sm1")
         st = coll_orchestrate.addv_batch_status(batch)
+        self.assertEqual(st["status"], "awaiting_approval")
+        self.assertEqual(coll_orchestrate.addv_ready_to_post(batch), ([], []))
+
+    def test_status_ready_to_post_once_approved_with_no_flags(self):
+        batch = self._batch()
+        coll_orchestrate.clear_addv_review(batch, "B1", "sm1")
+        coll_orchestrate.clear_addv_review(batch, "B2", "sm1")
+        coll_orchestrate.approve_addv_vouchers(batch, ["B1", "B2"], "sup", "t")
+        st = coll_orchestrate.addv_batch_status(batch)
         self.assertEqual(st["status"], "ready_to_post")
+        self.assertEqual(st["counts"]["ready_to_post"], 2)
 
     def test_status_awaiting_resolution_when_open_flag(self):
         batch = self._batch()
         coll_orchestrate.clear_addv_review(batch, "B1", "sm1")
         coll_orchestrate.raise_addv_flag(batch, "B2", "voucher_amount", "wrong amount", "sm1",
                                          "2026-01-03T10:00:00", new={"amount": "250.00"})
+        # A flagged voucher is approvable straight away — it is not held back by
+        # the rest of the batch or by its own open flag.
+        self.assertEqual(coll_orchestrate.addv_voucher_stage(batch["vouchers"][1], batch["flags"]),
+                         "awaiting_approval")
+        coll_orchestrate.approve_addv_vouchers(batch, ["B1", "B2"], "sup", "t")
         st = coll_orchestrate.addv_batch_status(batch)
-        self.assertEqual(st["status"], "awaiting_resolution")
+        self.assertEqual(st["counts"]["awaiting_resolution"], 1)
+        self.assertEqual(st["counts"]["ready_to_post"], 1)
         self.assertEqual(st["open_flags"], 1)
         self.assertEqual(batch["vouchers"][1]["review_status"], "flagged")
 
-    def test_status_posted_when_stages_post_confirmed(self):
+    def test_status_posted_only_when_every_voucher_is_stamped_posted(self):
         batch = self._batch()
-        batch["stages"]["post"] = "confirmed"
-        st = coll_orchestrate.addv_batch_status(batch)
-        self.assertEqual(st["status"], "posted")
+        for b in ("B1", "B2"):
+            coll_orchestrate.clear_addv_review(batch, b, "sm1")
+        coll_orchestrate.approve_addv_vouchers(batch, ["B1", "B2"], "sup", "t")
+        self.assertFalse(coll_orchestrate.mark_addv_posted(batch, ["B1"], "dist", "t"))
+        self.assertEqual(coll_orchestrate.addv_batch_status(batch)["counts"]["posted"], 1)
+        self.assertTrue(coll_orchestrate.mark_addv_posted(batch, ["B2"], "dist", "t"))
+        self.assertEqual(coll_orchestrate.addv_batch_status(batch)["status"], "posted")
 
     def test_clear_addv_review_unknown_bill_no_raises(self):
         with self.assertRaises(ValueError):
@@ -1519,6 +1539,7 @@ class AddvBatchTestCase(OrchestrateTestCase):
         coll_orchestrate.raise_addv_flag(batch, "B1", "voucher_amount", "should be 150", "sm1",
                                          "2026-01-03T10:00:00", new={"amount": "150.00"})
         flag_id = batch["flags"][0]["id"]
+        coll_orchestrate.approve_addv_vouchers(batch, ["B1"], "sup", "t")
         coll_orchestrate.resolve_addv_flag(
             batch, flag_id,
             {"date": "2026-01-01", "amount": "150.00", "beat": "beat1", "salesman": "sm1"},
@@ -1536,6 +1557,7 @@ class AddvBatchTestCase(OrchestrateTestCase):
         coll_orchestrate.raise_addv_flag(batch, "B1", "installment_add", "missed one", "sm1",
                                          "2026-01-03T10:00:00", new={"date": "2026-01-10", "amount": "30.00"})
         flag_id = batch["flags"][0]["id"]
+        coll_orchestrate.approve_addv_vouchers(batch, ["B1"], "sup", "t")
         coll_orchestrate.resolve_addv_flag(
             batch, flag_id,
             {"date": "2026-01-01", "amount": "100.00", "beat": "beat1", "salesman": "sm1"},
@@ -1552,6 +1574,7 @@ class AddvBatchTestCase(OrchestrateTestCase):
         batch = self._batch()
         coll_orchestrate.raise_addv_flag(batch, "B1", "amendment", "check totals", "sm1", "t")
         flag_id = batch["flags"][0]["id"]
+        coll_orchestrate.approve_addv_vouchers(batch, ["B1"], "sup", "t")
         with self.assertRaises(ValueError):
             coll_orchestrate.resolve_addv_flag(
                 batch, flag_id,
@@ -1568,6 +1591,7 @@ class AddvBatchTestCase(OrchestrateTestCase):
         batch = self._batch()
         coll_orchestrate.raise_addv_flag(batch, "B1", "amendment", "", "sm1", "t")
         flag_id = batch["flags"][0]["id"]
+        coll_orchestrate.approve_addv_vouchers(batch, ["B1"], "sup", "t")
         coll_orchestrate.resolve_addv_flag(
             batch, flag_id, {"date": "2026-01-01", "amount": "100.00", "beat": "beat1", "salesman": "sm1"},
             None, "dist", "t",
@@ -1583,6 +1607,186 @@ class AddvBatchTestCase(OrchestrateTestCase):
         batch["vouchers"][1]["salesman"] = "sm2"
         mine = coll_orchestrate.addv_vouchers_for_salesman(batch, "sm1")
         self.assertEqual([v["bill_no"] for v in mine], ["B1"])
+
+    # ---- scoping, approval and per-voucher posting -----------------------
+
+    def _two_salesmen(self):
+        batch = self._batch()
+        batch["vouchers"][1]["salesman"] = "sm2"
+        return batch
+
+    def test_status_can_be_scoped_to_one_salesmans_vouchers(self):
+        batch = self._two_salesmen()
+        coll_orchestrate.clear_addv_review(batch, "B1", "sm1")
+        full = coll_orchestrate.addv_batch_status(batch)
+        mine = coll_orchestrate.addv_batch_status(batch, salesman="sm1")
+        theirs = coll_orchestrate.addv_batch_status(batch, salesman="sm2")
+        self.assertEqual((full["total"], mine["total"], theirs["total"]), (2, 1, 1))
+        self.assertEqual((mine["reviewed"], theirs["reviewed"]), (1, 0))
+        self.assertEqual(mine["counts"]["awaiting_approval"], 1)
+        self.assertEqual(theirs["counts"]["pending_review"], 1)
+        self.assertEqual(coll_orchestrate.addv_batch_status(batch, salesman="nobody")["total"], 0)
+
+    def test_open_flag_count_is_scoped_too(self):
+        batch = self._two_salesmen()
+        coll_orchestrate.raise_addv_flag(batch, "B2", "amendment", "x", "sm2", "t")
+        self.assertEqual(coll_orchestrate.addv_batch_status(batch, salesman="sm1")["open_flags"], 0)
+        self.assertEqual(coll_orchestrate.addv_batch_status(batch, salesman="sm2")["open_flags"], 1)
+
+    def test_supervisor_sees_reviewed_and_flagged_vouchers_without_waiting_for_the_rest(self):
+        batch = self._batch()
+        coll_orchestrate.clear_addv_review(batch, "B1", "sm1")   # B2 still pending
+        self.assertEqual([v["bill_no"] for v in coll_orchestrate.addv_pending_approval(batch)], ["B1"])
+        coll_orchestrate.raise_addv_flag(batch, "B2", "amendment", "x", "sm1", "t")
+        self.assertEqual([v["bill_no"] for v in coll_orchestrate.addv_pending_approval(batch)], ["B1", "B2"])
+
+    def test_cannot_approve_a_voucher_the_salesman_has_not_reviewed(self):
+        batch = self._batch()
+        with self.assertRaises(ValueError):
+            coll_orchestrate.approve_addv_vouchers(batch, ["B1"], "sup", "t")
+        self.assertNotIn("approved_at", batch["vouchers"][0])
+
+    def test_approve_is_all_or_nothing_and_idempotent(self):
+        batch = self._batch()
+        coll_orchestrate.clear_addv_review(batch, "B1", "sm1")   # B2 pending
+        with self.assertRaises(ValueError):
+            coll_orchestrate.approve_addv_vouchers(batch, ["B1", "B2"], "sup", "t")
+        self.assertNotIn("approved_at", batch["vouchers"][0])    # nothing partially applied
+        self.assertEqual(coll_orchestrate.approve_addv_vouchers(batch, ["B1"], "sup", "t1"), ["B1"])
+        self.assertEqual(coll_orchestrate.approve_addv_vouchers(batch, ["B1"], "other", "t2"), [])
+        self.assertEqual((batch["vouchers"][0]["approved_by"], batch["vouchers"][0]["approved_at"]),
+                         ("sup", "t1"))
+
+    def test_approve_unknown_or_posted_voucher_raises(self):
+        batch = self._batch()
+        with self.assertRaises(ValueError):
+            coll_orchestrate.approve_addv_vouchers(batch, ["NOPE"], "sup", "t")
+        coll_orchestrate.clear_addv_review(batch, "B1", "sm1")
+        coll_orchestrate.approve_addv_vouchers(batch, ["B1"], "sup", "t")
+        coll_orchestrate.mark_addv_posted(batch, ["B1"], "dist", "t")
+        with self.assertRaises(ValueError):
+            coll_orchestrate.approve_addv_vouchers(batch, ["B1"], "sup", "t")
+
+    def test_review_is_closed_once_approved(self):
+        batch = self._batch()
+        coll_orchestrate.clear_addv_review(batch, "B1", "sm1")
+        coll_orchestrate.approve_addv_vouchers(batch, ["B1"], "sup", "t")
+        with self.assertRaises(ValueError):
+            coll_orchestrate.clear_addv_review(batch, "B1", "sm1")
+        with self.assertRaises(ValueError):
+            coll_orchestrate.raise_addv_flag(batch, "B1", "amendment", "x", "sm1", "t")
+        self.assertEqual(batch.get("flags", []), [])
+
+    def test_a_flag_cannot_be_resolved_before_the_supervisor_approves(self):
+        batch = self._batch()
+        coll_orchestrate.raise_addv_flag(batch, "B1", "amendment", "x", "sm1", "t")
+        with self.assertRaises(ValueError) as ctx:
+            coll_orchestrate.resolve_addv_flag(
+                batch, batch["flags"][0]["id"],
+                {"date": "2026-01-01", "amount": "100.00", "beat": "beat1", "salesman": "sm1"},
+                None, "dist", "t")
+        self.assertIn("approve", str(ctx.exception))
+        self.assertEqual(batch["flags"][0]["status"], "open")
+        self.assertEqual(coll_orchestrate.addv_open_flags_awaiting_distributor(batch), [])
+        coll_orchestrate.approve_addv_vouchers(batch, ["B1"], "sup", "t")
+        self.assertEqual(len(coll_orchestrate.addv_open_flags_awaiting_distributor(batch)), 1)
+
+    def test_only_approved_clean_vouchers_and_their_installments_are_ready_to_post(self):
+        batch = self._batch()
+        for b in ("B1", "B2"):
+            coll_orchestrate.clear_addv_review(batch, b, "sm1")
+        coll_orchestrate.approve_addv_vouchers(batch, ["B1"], "sup", "t")   # B2 unapproved
+        vouchers, installments = coll_orchestrate.addv_ready_to_post(batch)
+        self.assertEqual([v["bill_no"] for v in vouchers], ["B1"])
+        self.assertEqual([i["bill_no"] for i in installments], ["B1"])
+        coll_orchestrate.mark_addv_posted(batch, ["B1"], "dist", "t")
+        self.assertEqual(coll_orchestrate.addv_ready_to_post(batch), ([], []))
+
+    def test_posted_vouchers_drop_out_of_the_salesmans_queue(self):
+        batch = self._batch()
+        coll_orchestrate.clear_addv_review(batch, "B1", "sm1")
+        coll_orchestrate.approve_addv_vouchers(batch, ["B1"], "sup", "t")
+        coll_orchestrate.mark_addv_posted(batch, ["B1"], "dist", "t")
+        self.assertEqual([v["bill_no"] for v in coll_orchestrate.addv_vouchers_for_salesman(batch, "sm1")],
+                         ["B2"])
+
+    # ---- supervisor: raise / edit / withdraw issues before approving ------
+
+    def test_supervisor_can_raise_an_issue_on_a_voucher_the_salesman_passed(self):
+        batch = self._batch()
+        coll_orchestrate.clear_addv_review(batch, "B1", "sm1")
+        coll_orchestrate.raise_addv_flag_as_approver(
+            batch, "B1", "installment_add", "physical voucher shows another payment", "sup",
+            "t", new={"date": "2026-01-10", "amount": "30.00"})
+        flag = batch["flags"][0]
+        self.assertEqual((flag["raised_by"], flag["status"], flag["bill_no"]), ("sup", "open", "B1"))
+        self.assertEqual(batch["vouchers"][0]["review_status"], "flagged")
+        self.assertEqual(coll_orchestrate.addv_voucher_stage(batch["vouchers"][0], batch["flags"]),
+                         "awaiting_approval")
+
+    def test_supervisor_cannot_raise_on_pending_or_approved_vouchers(self):
+        batch = self._batch()
+        with self.assertRaises(ValueError):                       # salesman hasn't reviewed it
+            coll_orchestrate.raise_addv_flag_as_approver(batch, "B1", "amendment", "x", "sup", "t")
+        coll_orchestrate.clear_addv_review(batch, "B1", "sm1")
+        coll_orchestrate.approve_addv_vouchers(batch, ["B1"], "sup", "t")
+        with self.assertRaises(ValueError):                       # already approved
+            coll_orchestrate.raise_addv_flag_as_approver(batch, "B1", "amendment", "x", "sup", "t")
+        with self.assertRaises(ValueError):
+            coll_orchestrate.raise_addv_flag_as_approver(batch, "B2", "bogus", "x", "sup", "t")
+
+    def test_supervisor_can_correct_an_existing_issue(self):
+        batch = self._batch()
+        coll_orchestrate.raise_addv_flag(batch, "B1", "voucher_amount", "wrong", "sm1", "t1",
+                                         new={"amount": "150.00"})
+        fid = batch["flags"][0]["id"]
+        coll_orchestrate.edit_addv_flag(batch, fid, "installment_delete", "it was the installment",
+                                        "sup", "t2", target={"date": "2026-01-05", "amount": "40.00"})
+        flag = batch["flags"][0]
+        self.assertEqual((flag["kind"], flag["note"], flag["new"]), ("installment_delete",
+                                                                     "it was the installment", None))
+        self.assertEqual((flag["raised_by"], flag["edited_by"], flag["edited_at"]), ("sm1", "sup", "t2"))
+        self.assertEqual(flag["status"], "open")
+
+    def test_withdrawing_the_last_issue_returns_the_voucher_to_reviewed(self):
+        batch = self._batch()
+        coll_orchestrate.raise_addv_flag(batch, "B1", "amendment", "a", "sm1", "t")
+        coll_orchestrate.raise_addv_flag_as_approver(batch, "B1", "amendment", "b", "sup", "t")
+        f1, f2 = (f["id"] for f in batch["flags"])
+        coll_orchestrate.withdraw_addv_flag(batch, f1, "sup", "t2", "voucher is fine")
+        self.assertEqual(batch["vouchers"][0]["review_status"], "flagged")   # f2 still open
+        coll_orchestrate.withdraw_addv_flag(batch, f2, "sup", "t3")
+        self.assertEqual(batch["vouchers"][0]["review_status"], "reviewed")
+        self.assertEqual(batch["flags"][0]["status"], "withdrawn")
+        self.assertEqual(batch["flags"][0]["resolution_note"], "voucher is fine")
+        self.assertEqual(coll_orchestrate.addv_batch_status(batch)["open_flags"], 0)
+
+    def test_edit_and_withdraw_are_refused_once_approved_or_when_not_open(self):
+        batch = self._batch()
+        coll_orchestrate.raise_addv_flag(batch, "B1", "amendment", "a", "sm1", "t")
+        fid = batch["flags"][0]["id"]
+        coll_orchestrate.approve_addv_vouchers(batch, ["B1"], "sup", "t")
+        with self.assertRaises(ValueError):
+            coll_orchestrate.edit_addv_flag(batch, fid, "amendment", "z", "sup", "t")
+        with self.assertRaises(ValueError):
+            coll_orchestrate.withdraw_addv_flag(batch, fid, "sup", "t")
+        self.assertEqual(batch["flags"][0]["status"], "open")
+        with self.assertRaises(ValueError):
+            coll_orchestrate.withdraw_addv_flag(batch, 999, "sup", "t")
+        batch2 = self._batch()
+        coll_orchestrate.raise_addv_flag(batch2, "B1", "amendment", "a", "sm1", "t")
+        coll_orchestrate.withdraw_addv_flag(batch2, batch2["flags"][0]["id"], "sup", "t")
+        with self.assertRaises(ValueError):                       # no longer open
+            coll_orchestrate.withdraw_addv_flag(batch2, batch2["flags"][0]["id"], "sup", "t")
+
+    def test_supervisor_issue_reaches_the_distributor_only_after_approval(self):
+        batch = self._batch()
+        coll_orchestrate.clear_addv_review(batch, "B1", "sm1")
+        coll_orchestrate.raise_addv_flag_as_approver(batch, "B1", "amendment", "x", "sup", "t")
+        self.assertEqual(coll_orchestrate.addv_open_flags_awaiting_distributor(batch), [])
+        coll_orchestrate.approve_addv_vouchers(batch, ["B1"], "sup", "t")
+        self.assertEqual(len(coll_orchestrate.addv_open_flags_awaiting_distributor(batch)), 1)
+        self.assertEqual(coll_orchestrate.addv_ready_to_post(batch), ([], []))
 
     def test_reject_addv_batch_deletes_file(self):
         path = self._write_staging_json("addv20260101_090000-dist.json", self._batch())

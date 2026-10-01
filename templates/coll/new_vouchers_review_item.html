@@ -2,28 +2,13 @@
 {% block title %}Review Voucher — CollMgm{% endblock %}
 {% block content %}
 <h2 class="page-heading">Review Voucher</h2>
-<p class="meta-line"><strong>Bill No:</strong> <span class="mono">{{ voucher.bill_no }}</span>
-  &nbsp;|&nbsp; <strong>Date:</strong> {{ voucher.date }}
-  &nbsp;|&nbsp; <strong>Amount:</strong> <span class="mono">{{ voucher.amount }}</span>
-  &nbsp;|&nbsp; <strong>Balance:</strong> <span class="mono">{{ voucher.balance }}</span></p>
+{% from "_vcard.html" import vcard %}
+{{ vcard(voucher.bill_no, "full", date=voucher.date, amount=voucher.amount, paid=paid, balance=voucher.balance,
+         beat=voucher.beat, ninst=installments|length, insts=installments, open=True) }}
 
 {% if error %}<p class="alert alert-error">{{ error }}</p>{% endif %}
 
-{% if installments %}
-<div class="table-wrapper">
-<table class="data-table card-table">
-  <thead><tr><th>Date</th><th class="num">Amount</th></tr></thead>
-  <tbody>
-    {% for inst in installments %}
-    <tr><td>{{ inst.date }}</td><td class="num mono">{{ inst.amount }}</td></tr>
-    {% endfor %}
-  </tbody>
-</table>
-</div>
-{% else %}
-<p class="muted">No installments recorded for this voucher yet.</p>
-{% endif %}
-
+{% if stage in ("pending_review", "awaiting_approval") %}
 <form method="post" action="/coll/new-vouchers/{{ stem }}/review/{{ voucher.bill_no | urlencode }}" class="card">
   <input type="hidden" name="action" value="clear">
   <button type="submit" class="btn btn-primary">Looks Good — Nothing Wrong</button>
@@ -83,6 +68,9 @@
     <a class="btn btn-secondary" href="/coll/new-vouchers/{{ stem }}/review">Back</a>
   </div>
 </form>
+{% else %}
+<p class="alert alert-warn">This voucher has been approved by the supervisor, so review is closed. Any raised issue now goes to the distributor.</p>
+{% endif %}
 
 {% if flags %}
 <h3 class="group-heading">Issues raised for this voucher</h3>
@@ -91,7 +79,7 @@
   <li class="report-item">
     <span class="report-label">
       {{ kinds.get(f.kind, f.kind) }}
-      <span class="badge badge-{{ 'ok' if f.status == 'resolved' else 'warn' }}">{{ f.status }}</span>
+      <span class="badge badge-{{ 'warn' if f.status == 'open' else 'ok' if f.status == 'resolved' else 'muted' }}">{{ f.status }}</span>
     </span>
     <span class="report-meta">{{ f.raised_by }} &middot; {{ f.raised_at[:10] }}{% if f.note %} &middot; {{ f.note }}{% endif %}</span>
   </li>
@@ -99,6 +87,7 @@
 </ul>
 {% endif %}
 
+{% if stage in ("pending_review", "awaiting_approval") %}
 <script>
 (function () {
   var radios = document.querySelectorAll('input[name="kind"]');
@@ -116,4 +105,5 @@
   refresh();
 })();
 </script>
+{% endif %}
 {% endblock %}

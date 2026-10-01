@@ -2123,6 +2123,19 @@ class TestPaymentTypeAndChecks(StoreTestCase):
         self.assertIn(("distributor", "resolve_check"), pairs)
         self.assertNotIn(("salesman", "resolve_check"), pairs)
 
+    def test_supervisor_approve_new_vouchers_backfilled_for_existing_installs(self):
+        conn = coll_store.get_db()
+        try:
+            conn.execute("DELETE FROM permissions WHERE role = 'supervisor'"
+                         " AND action_key = 'approve_new_vouchers'")
+            conn.commit()
+        finally:
+            conn.close()
+        coll_store.init_db()
+        perms = coll_store.load_permissions()
+        self.assertIn("approve_new_vouchers", perms["supervisor"])
+        self.assertIn("approve_new_vouchers", perms["distributor"])
+        self.assertNotIn("approve_new_vouchers", perms.get("salesman", frozenset()))
 
 class TestSecretQuestion(StoreTestCase):
     """Distributor "Forgot password?" via a secret question/answer."""

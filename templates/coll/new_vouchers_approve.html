@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Approve New Vouchers — CollMgm{% endblock %}
+{% block content %}
+{% from "_vcard.html" import vcard %}
+<h2 class="page-heading">Approve New Vouchers</h2>
+<p class="muted vc-intro">Every voucher the salesman has reviewed or flagged is listed here — you don't have to wait for the rest of the batch.
+  Tap a bill number to see its installments and tally it against the physical voucher. Use <strong>Issues</strong> to raise
+  something the salesman missed, or to correct or withdraw one he raised. Once approved, a voucher goes to the distributor
+  (to resolve any open issue, then post).
+  {% if counts.pending_review %}{{ counts.pending_review }} voucher{{ "s" if counts.pending_review != 1 }} still waiting for salesman review.{% endif %}
+  {% if counts.awaiting_resolution or counts.ready_to_post or counts.posted %}
+  Already approved: {{ counts.awaiting_resolution + counts.ready_to_post }}{% if counts.posted %} &middot; posted: {{ counts.posted }}{% endif %}.
+  {% endif %}</p>
+
+{% if error %}<p class="alert alert-error">{{ error }}</p>{% endif %}
+
+{% if not vouchers %}
+  <p class="empty-state">Nothing is waiting for your approval.</p>
+  <a class="btn btn-secondary" href="/coll/new-vouchers">Back</a>
+{% else %}
+<form method="post" action="/coll/new-vouchers/{{ stem }}/approve">
+  <label class="vc-selectall"><input type="checkbox" id="select-all"> Select all {{ vouchers|length }} vouchers</label>
+
+  <div class="vc-list">
+  {% for v in vouchers %}
+  {% set insts = installments_by_bill.get(v.bill_no, []) %}
+  {% set flags = open_by_bill.get(v.bill_no, []) %}
+  {% set paid = paid_by_bill.get(v.bill_no, 0) %}
+  {% set lead %}<input type="checkbox" name="bill_no" value="{{ v.bill_no }}" class="pick vc-check" aria-label="Approve {{ v.bill_no }}">{% endset %}
+  {% set badges %}{% if flags %}<span class="badge badge-warn">flagged</span>{% else %}<span class="badge badge-ok">looks good</span>{% endif %}{% endset %}
+  {% set note %}{% for f in flags %}<div><b>{{ kinds.get(f.kind, f.kind) }}</b>{% if f.note %}{{ f.note }}{% endif %}</div>{% endfor %}{% endset %}
+  {% set actions %}<a class="btn btn-sm btn-secondary" href="/coll/new-vouchers/{{ stem }}/approve/{{ v.bill_no | urlencode }}">Issues{% if flags %} ({{ flags|length }}){% endif %}</a>{% endset %}
+  {{ vcard(v.bill_no, "full", date=v.date, amount=v.amount, paid=paid, balance=v.balance, beat=v.beat, salesman=v.salesman,
+           ninst=insts|length, insts=insts, lead=lead, badges=badges, note=note if flags, actions=actions,
+           cls="vc--flagged" if flags) }}
+  {% endfor %}
+  </div>
+
+  <div class="action-row action-row--sticky">
+    <button type="submit" name="action" value="approve_selected" class="btn btn-primary">Approve Selected</button>
+    <button type="submit" name="action" value="approve_all" class="btn btn-secondary"
+            onclick="return confirm('Approve all {{ vouchers|length }} listed voucher(s)?')">Approve All ({{ vouchers|length }})</button>
+    <a class="btn btn-secondary" href="/coll/new-vouchers">Back</a>
+  </div>
+</form>
+
+<script>
+(function () {
+  var all = document.getElementById("select-all");
+  var picks = document.querySelectorAll(".pick");
+  function mark(p) { p.closest(".vc").classList.toggle("is-selected", p.checked); }
+  Array.prototype.forEach.call(picks, function (p) { p.addEventListener("change", function () { mark(p); }); });
+  if (all) {
+    all.addEventListener("change", function () {
+      Array.prototype.forEach.call(picks, function (p) { p.checked = all.checked; mark(p); });
+    });
+  }
+})();
+</script>
+{% endif %}
+{% endblock %}

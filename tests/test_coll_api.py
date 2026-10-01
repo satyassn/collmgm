@@ -11,6 +11,7 @@ Run:  python -m unittest discover -s tests -v
 """
 
 import json
+import os
 import re
 import socket
 import sys
@@ -1026,6 +1027,115 @@ class PwaAssetTests(unittest.TestCase):
         for name in refs:
             self.assertTrue((self.STATIC / name).is_file(),
                             f"sw.js references missing file: /static/{name}")
+
+
+class VoucherCardTests(ApiTestCase):
+    """The one voucher card (templates/_vcard.html) replaces the per-screen tables:
+    minimal on the pending reports, full on the voucher page / search."""
+
+    def setUp(self):
+        super().setUp()
+        self._add_user("smA", "salesman", "pwA")
+        self._add_beat("beatA", "smA")
+        conn = coll_store.get_db()
+        try:
+            conn.execute(
+                "INSERT INTO vouchers (bill_no, date, amount, balance, beat, salesman, created_by, created_at)"
+                " VALUES ('100', '2026-01-01', '100.00', '60.00', 'beatA', 'smA', 'test', 't')")
+            conn.execute(
+                "INSERT INTO installments (bill_no, date, amount, salesman, created_by, created_at)"
+                " VALUES ('100', '2026-02-01', '40.00', 'smA', 'test', 't')")
+            conn.commit()
+        finally:
+            conn.close()
+        self.sm = self._login("smA", "pwA")
+
+    def test_reports_use_the_minimal_card_with_amt_paid_bal(self):
+        for path in ("/reports/age", "/reports/amount", "/reports/beat/beatA", "/reports/salesman/smA"):
+            status, body = self._get(self.sm, path)
+            self.assertEqual(status, 200, path)
+            self.assertIn("vc--min", body, path)
+            self.assertIn("<small>Amt</small><b>100.00</b>", body, path)
+            self.assertIn("<small>Paid</small><b>40.00</b>", body, path)
+            self.assertIn(">60.00</b>", body, path)
+            self.assertNotIn("card-table", body, path)
+
+    def test_report_cards_fetch_installments_lazily_from_master_data(self):
+        status, body = self._get(self.sm, "/reports/age")
+        self.assertIn('data-src="/voucher/100"', body)
+        self.assertIn("data-vc-toggle", body)
+        self.assertNotIn("2026-02-01", body)   # installments are NOT inlined on report lists
+
+    def test_grouped_reports_drop_the_column_the_heading_already_says(self):
+        status, body = self._get(self.sm, "/reports/beat/beatA")
+        self.assertNotIn("<span>beatA</span>", body)
+        self.assertNotIn("<span>smA</span>", body)
+
+    def test_voucher_page_uses_the_full_card_with_installments_open(self):
+        status, body = self._get(self.sm, "/voucher/100")
+        self.assertIn("vc--full", body)
+        self.assertIn("<small>Amount</small><b>100.00</b>", body)
+        self.assertIn("<small>Paid</small><b>40.00</b>", body)
+        self.assertIn("<small>Balance</small><b>60.00</b>", body)
+        self.assertIn("2026-02-01", body)      # installments shown, panel not hidden
+        self.assertNotIn('class="vc-ext" hidden', body)
+
+    def test_search_result_uses_the_same_card(self):
+        status, body = self._get(self.sm, "/reports/search?q=100")
+        self.assertIn("vc--full", body)
+        self.assertIn("<small>Paid</small><b>40.00</b>", body)
+
+    def test_service_page_loads_the_card_script(self):
+        status, body = self._get(self.sm, "/reports/age")
+        self.assertIn(f"/static/voucher_card.js?v={coll_api._asset_version()}", body)
+
+
+class AssetVersioningTests(ApiTestCase):
+    """A changed style.css/JS must be a NEW URL: the service worker caches by
+    full URL, so an un-versioned link let returning browsers keep rendering new
+    HTML with the OLD stylesheet (cards appeared completely unstyled)."""
+
+    def _fake_static(self, files):
+        root = self.tmp / "site"
+        static = root / "static"
+        static.mkdir(parents=True, exist_ok=True)
+        for name, mtime in files.items():
+            f = static / name
+            f.write_text("x", encoding="utf-8")
+            os.utime(f, (mtime, mtime))
+        return root
+
+    def test_version_is_newest_css_or_js_mtime_ignoring_sw(self):
+        root = self._fake_static({"style.css": 1000, "a.js": 2000, "sw.js": 9999, "icon.png": 8000})
+        with patch.object(coll_api, "ROOT_DIR", root):
+            self.assertEqual(coll_api._asset_version(), "2000")
+
+    def test_version_changes_when_the_stylesheet_changes(self):
+        root = self._fake_static({"style.css": 1000, "a.js": 500})
+        with patch.object(coll_api, "ROOT_DIR", root):
+            before = coll_api._asset_version()
+            os.utime(root / "static" / "style.css", (3000, 3000))
+            self.assertNotEqual(coll_api._asset_version(), before)
+
+    def test_version_falls_back_when_static_is_unreadable(self):
+        with patch.object(coll_api, "ROOT_DIR", self.tmp / "nowhere"):
+            self.assertEqual(coll_api._asset_version(), "0")
+
+    def test_pages_link_versioned_assets(self):
+        for path in ("/login", "/register"):
+            status, body = self._get(self._client(), path)
+            self.assertRegex(body, r'/static/style\.css\?v=\d+', path)
+        self._add_user("dist", "distributor", "pwD")
+        status, body = self._get(self._login("dist", "pwD"), "/menu")
+        v = coll_api._asset_version()
+        self.assertIn(f"/static/style.css?v={v}", body)
+        self.assertIn(f"/static/voucher_detail.js?v={v}", body)
+        self.assertNotIn('href="/static/style.css"', body)
+
+    def test_versioned_static_urls_still_resolve(self):
+        status, body = self._get(self._client(), f"/static/style.css?v={coll_api._asset_version()}")
+        self.assertEqual(status, 200)
+        self.assertIn(".menu-card", body)
 
 
 # ---------------------------------------------------------------------------
@@ -2378,6 +2488,464 @@ class TestManageUsersAndProfile(ApiTestCase):
 # ---------------------------------------------------------------------------
 # Manage Beats — permission gating + full HTTP lifecycle
 # ---------------------------------------------------------------------------
+
+class TestNewVoucherBatchesPipeline(ApiTestCase):
+    """Onboarding pipeline: salesman review -> supervisor approves (per
+    voucher, never waiting on the rest) -> distributor resolves flags and posts
+    (per voucher). Salesmen only ever see their own vouchers."""
+
+    STEM = "addv20260101_090000-dist"
+
+    def setUp(self):
+        super().setUp()
+        self._add_user("dist", "distributor", "pwD")
+        self._add_user("sup", "supervisor", "pwS")
+        self._add_user("smA", "salesman", "pwA")
+        self._add_user("smB", "salesman", "pwB")
+        self._add_user("smC", "salesman", "pwC")
+        self._add_beat("beatA", "smA")
+        self._add_beat("beatB", "smB")
+        rows = [("A1", "smA", "beatA"), ("A2", "smA", "beatA"), ("B1", "smB", "beatB")]
+        self.path = self.tmp / "staging" / f"{self.STEM}.json"
+        self.path.write_text(json.dumps({
+            "type": "add_vouchers", "mode": "batch", "created_by": "dist",
+            "created_at": "2026-01-01T09:00:00", "stage": "added",
+            "stages": {"add": "done", "confirm": "", "post": ""},
+            "vouchers": [{"bill_no": b, "date": "2026-01-01", "amount": "100.00", "balance": "100.00",
+                          "beat": beat, "salesman": sm, "created_by": "dist",
+                          "created_at": "2026-01-01T09:00:00"} for b, sm, beat in rows],
+            "installments": [], "flags": [],
+        }), encoding="utf-8")
+
+    def _data(self):
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def _voucher(self, bill_no):
+        return next(v for v in self._data()["vouchers"] if v["bill_no"] == bill_no)
+
+    def _review(self, opener, bill_no, action="clear", **extra):
+        data = {"action": action}
+        data.update(extra)
+        return self._post(opener, f"/coll/new-vouchers/{self.STEM}/review/{bill_no}", data)
+
+    def _approve(self, opener, *bills, action="approve_selected"):
+        data = [("action", action)] + [("bill_no", b) for b in bills]
+        return self._post(opener, f"/coll/new-vouchers/{self.STEM}/approve", data)
+
+    def _master(self, bill_no):
+        conn = coll_store.get_db()
+        try:
+            row = conn.execute("SELECT * FROM vouchers WHERE bill_no = ?", (bill_no,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    # ---- salesman scoping --------------------------------------------------
+
+    def test_salesman_hub_counts_only_their_own_vouchers(self):
+        status, body = self._get(self._login("smA", "pwA"), "/coll/new-vouchers")
+        self.assertIn("2 vouchers", body)
+        self.assertNotIn("3 vouchers", body)
+        self.assertIn("2 pending review", body)
+        self.assertIn("only the vouchers assigned to you", body)
+        status, body = self._get(self._login("smB", "pwB"), "/coll/new-vouchers")
+        self.assertIn("1 voucher", body)
+        self.assertNotIn("3 voucher", body)
+
+    def test_salesman_without_vouchers_in_a_batch_does_not_see_it(self):
+        status, body = self._get(self._login("smC", "pwC"), "/coll/new-vouchers")
+        self.assertIn("No voucher batches in progress", body)
+        self.assertNotIn(self.STEM, body)
+
+    def test_supervisor_and_distributor_see_the_whole_batch(self):
+        for name, pw in (("sup", "pwS"), ("dist", "pwD")):
+            status, body = self._get(self._login(name, pw), "/coll/new-vouchers")
+            self.assertIn("3 vouchers", body, name)
+
+    def test_salesman_cannot_read_or_change_someone_elses_voucher(self):
+        smA = self._login("smA", "pwA")
+        status, body = self._get(smA, f"/coll/new-vouchers/{self.STEM}/review/B1")
+        self.assertIn("Voucher not found in this batch", body)
+        status, body = self._review(smA, "B1")
+        self.assertIn("Voucher not found in this batch", body)
+        status, body = self._review(smA, "B1", action="raise", kind="amendment", note="x")
+        self.assertIn("Voucher not found in this batch", body)
+        req = urllib.request.Request(self.base + f"/coll/new-vouchers/{self.STEM}/review/B1/clear",
+                                     data=b"", method="POST")
+        try:
+            smA.open(req, timeout=5)
+            self.fail("expected 404")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 404)
+        self.assertEqual(self._voucher("B1").get("review_status", "pending"), "pending")
+        self.assertEqual(self._data()["flags"], [])
+
+    def test_review_list_only_lists_own_vouchers(self):
+        status, body = self._get(self._login("smA", "pwA"), f"/coll/new-vouchers/{self.STEM}/review")
+        self.assertIn("A1", body)
+        self.assertIn("A2", body)
+        self.assertNotIn(">B1<", body)
+
+    # ---- supervisor approval ------------------------------------------------
+
+    def test_supervisor_can_approve_a_reviewed_voucher_while_others_are_still_pending(self):
+        self._review(self._login("smA", "pwA"), "A1")          # everything else pending
+        sup = self._login("sup", "pwS")
+        status, body = self._get(sup, "/coll/new-vouchers")
+        self.assertIn("Approve (1)", body)
+        status, body = self._get(sup, f"/coll/new-vouchers/{self.STEM}/approve")
+        self.assertIn("A1", body)
+        self.assertNotIn(">A2<", body)
+        self.assertIn("2 vouchers still waiting for salesman review", body)
+        status, body = self._approve(sup, "A1")
+        self.assertIn("Approved 1 voucher", body)
+        self.assertEqual(self._voucher("A1")["approved_by"], "sup")
+
+    def test_flagged_vouchers_are_approvable_and_show_the_issue(self):
+        smA = self._login("smA", "pwA")
+        self._review(smA, "A1", action="raise", kind="amendment", note="amount looks wrong")
+        status, body = self._get(self._login("sup", "pwS"), f"/coll/new-vouchers/{self.STEM}/approve")
+        self.assertIn("A1", body)
+        self.assertIn("amount looks wrong", body)
+
+    def test_approve_all_approves_every_reviewed_or_flagged_voucher(self):
+        smA = self._login("smA", "pwA")
+        self._review(smA, "A1")
+        self._review(smA, "A2", action="raise", kind="amendment", note="x")
+        sup = self._login("sup", "pwS")
+        self._approve(sup, action="approve_all")
+        self.assertTrue(self._voucher("A1")["approved_at"])
+        self.assertTrue(self._voucher("A2")["approved_at"])
+        self.assertNotIn("approved_at", self._voucher("B1"))
+
+    def test_pending_voucher_cannot_be_approved(self):
+        status, body = self._approve(self._login("sup", "pwS"), "A1")
+        self.assertIn("been reviewed by the salesman yet", body)
+        self.assertNotIn("approved_at", self._voucher("A1"))
+
+    def test_approve_with_nothing_selected_is_an_error(self):
+        self._review(self._login("smA", "pwA"), "A1")
+        status, body = self._approve(self._login("sup", "pwS"))
+        self.assertIn("Select at least one voucher", body)
+
+    def test_only_supervisor_and_distributor_can_approve(self):
+        self._review(self._login("smA", "pwA"), "A1")
+        smA = self._login("smA", "pwA")
+        status, body = self._get(smA, f"/coll/new-vouchers/{self.STEM}/approve")
+        self.assertIn("have permission for this action", body)
+        status, body = self._approve(smA, "A1")
+        self.assertIn("have permission for this action", body)
+        self.assertNotIn("approved_at", self._voucher("A1"))
+        status, body = self._get(self._login("dist", "pwD"), f"/coll/new-vouchers/{self.STEM}/approve")
+        self.assertIn("Approve New Vouchers", body)
+
+    def test_review_closes_after_approval(self):
+        smA = self._login("smA", "pwA")
+        self._review(smA, "A1")
+        self._approve(self._login("sup", "pwS"), "A1")
+        status, body = self._review(smA, "A1", action="raise", kind="amendment", note="late")
+        self.assertIn("already approved", body)
+        self.assertEqual(self._data()["flags"], [])
+        status, body = self._get(smA, f"/coll/new-vouchers/{self.STEM}/review")
+        self.assertIn("approved", body)
+
+    # ---- distributor: resolve + per-voucher post ---------------------------
+
+    def test_distributor_only_sees_issues_on_approved_vouchers(self):
+        smA = self._login("smA", "pwA")
+        self._review(smA, "A1", action="raise", kind="amendment", note="fix me")
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, f"/coll/new-vouchers/{self.STEM}/resolve")
+        self.assertIn("No issues are ready for you", body)
+        self.assertIn("1 more issue will appear here", body)
+        status, body = self._get(dist, f"/coll/new-vouchers/{self.STEM}/resolve/1")
+        self.assertIn("supervisor must approve", body)
+        self._approve(self._login("sup", "pwS"), "A1")
+        status, body = self._get(dist, f"/coll/new-vouchers/{self.STEM}/resolve")
+        self.assertIn("A1", body)
+        self.assertIn("Resolve", body)
+
+    def test_posting_is_per_voucher_and_leaves_the_rest_staged(self):
+        smA = self._login("smA", "pwA")
+        self._review(smA, "A1")
+        self._review(smA, "A2", action="raise", kind="amendment", note="hold")
+        sup = self._login("sup", "pwS")
+        self._approve(sup, "A1", "A2")
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, "/coll/new-vouchers")
+        self.assertIn("Post (1)", body)          # A2 is approved but has an open flag
+        self.assertIn("Resolve (1)", body)
+        status, body = self._post(dist, f"/coll/new-vouchers/{self.STEM}/post", {"action": "post"})
+        self.assertIn("Posted. 1 voucher", body)
+        self.assertIsNotNone(self._master("A1"))
+        self.assertIsNone(self._master("A2"))     # flagged, unresolved: not posted
+        self.assertIsNone(self._master("B1"))     # never reviewed: not posted
+        self.assertTrue(self.path.exists())       # batch stays, with the rest in it
+        self.assertTrue(self._voucher("A1")["posted_at"])
+        # Posted vouchers no longer count or get re-posted.
+        status, body = self._post(dist, f"/coll/new-vouchers/{self.STEM}/post", {"action": "post"})
+        self.assertIn("Nothing is ready to post", body)
+
+    def test_batch_is_archived_when_its_last_voucher_posts(self):
+        smA = self._login("smA", "pwA")
+        smB = self._login("smB", "pwB")
+        for op, bills in ((smA, ("A1", "A2")), (smB, ("B1",))):
+            for b in bills:
+                self._review(op, b)
+        self._approve(self._login("sup", "pwS"), action="approve_all")
+        dist = self._login("dist", "pwD")
+        self._post(dist, f"/coll/new-vouchers/{self.STEM}/post", {"action": "post"})
+        self.assertFalse(self.path.exists())
+        self.assertTrue((self.tmp / "archive" / f"{self.STEM}.json").exists())
+        for b in ("A1", "A2", "B1"):
+            self.assertIsNotNone(self._master(b), b)
+
+    def test_resolved_flag_then_post_uses_the_corrected_amount(self):
+        smA = self._login("smA", "pwA")
+        self._review(smA, "A1", action="raise", kind="voucher_amount", new_amount="150.00", note="ledger says 150")
+        self._approve(self._login("sup", "pwS"), "A1")
+        dist = self._login("dist", "pwD")
+        self._post(dist, f"/coll/new-vouchers/{self.STEM}/resolve/1", [
+            ("voucher_date", "2026-01-01"), ("voucher_amount", "150.00"),
+            ("voucher_beat", "beatA"), ("voucher_salesman", "smA")])
+        self._post(dist, f"/coll/new-vouchers/{self.STEM}/post", {"action": "post"})
+        self.assertEqual(self._master("A1")["amount"], "150.00")
+        self.assertEqual(self._master("A1")["balance"], "150.00")
+
+    # ---- supervisor: tally against the physical voucher, raise/edit issues --
+
+    def _add_installment(self, bill_no, date, amount):
+        data = self._data()
+        data["installments"].append({"bill_no": bill_no, "date": date, "amount": amount,
+                                     "salesman": "smA", "created_by": "dist", "created_at": "t"})
+        v = next(x for x in data["vouchers"] if x["bill_no"] == bill_no)
+        paid = sum(float(i["amount"]) for i in data["installments"] if i["bill_no"] == bill_no)
+        v["balance"] = "%.2f" % (float(v["amount"]) - paid)
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+
+    def _item(self, opener, bill_no, **form):
+        return self._post(opener, f"/coll/new-vouchers/{self.STEM}/approve/{bill_no}", form)
+
+    def test_approve_list_shows_voucher_and_installment_details(self):
+        self._add_installment("A1", "2026-01-05", "40.00")
+        self._add_installment("A1", "2026-01-09", "25.00")
+        self._review(self._login("smA", "pwA"), "A1")
+        status, body = self._get(self._login("sup", "pwS"), f"/coll/new-vouchers/{self.STEM}/approve")
+        self.assertIn("2026-01-05", body)
+        self.assertIn("40.00", body)
+        self.assertIn("2026-01-09", body)
+        self.assertIn("25.00", body)
+        self.assertIn("65.00", body)          # paid total
+        self.assertIn("35.00", body)          # balance = 100 - 65
+        self.assertIn("data-vc-toggle", body)
+
+    def test_approve_list_says_when_there_are_no_installments(self):
+        self._review(self._login("smA", "pwA"), "A1")
+        status, body = self._get(self._login("sup", "pwS"), f"/coll/new-vouchers/{self.STEM}/approve")
+        self.assertIn("No installments recorded for this voucher", body)
+
+    def test_supervisor_issue_page_shows_installments(self):
+        self._add_installment("A1", "2026-01-05", "40.00")
+        self._review(self._login("smA", "pwA"), "A1")
+        status, body = self._get(self._login("sup", "pwS"), f"/coll/new-vouchers/{self.STEM}/approve/A1")
+        self.assertIn("Voucher Issues", body)
+        self.assertIn("2026-01-05", body)
+        self.assertIn("Raise an issue the salesman missed", body)
+
+    def test_supervisor_raises_an_issue_the_salesman_missed(self):
+        self._review(self._login("smA", "pwA"), "A1")                # salesman: looks good
+        sup = self._login("sup", "pwS")
+        status, body = self._item(sup, "A1", action="raise", kind="voucher_amount",
+                                  new_amount="120.00", note="physical voucher says 120")
+        self.assertIn("Issue raised", body)
+        flag = self._data()["flags"][0]
+        self.assertEqual((flag["raised_by"], flag["kind"], flag["new"]), ("sup", "voucher_amount",
+                                                                          {"amount": "120.00"}))
+        self.assertEqual(self._voucher("A1")["review_status"], "flagged")
+        # It stays with the supervisor until approved, then goes to the distributor.
+        dist = self._login("dist", "pwD")
+        status, body = self._get(dist, f"/coll/new-vouchers/{self.STEM}/resolve")
+        self.assertIn("No issues are ready for you", body)
+        self._approve(sup, "A1")
+        status, body = self._get(dist, f"/coll/new-vouchers/{self.STEM}/resolve")
+        self.assertIn("A1", body)
+        status, body = self._get(dist, "/coll/new-vouchers")
+        self.assertIn("Resolve (1)", body)
+        self.assertNotIn("Post (", body)
+
+    def test_supervisor_edits_an_issue_the_salesman_raised(self):
+        self._add_installment("A1", "2026-01-05", "40.00")
+        self._review(self._login("smA", "pwA"), "A1", action="raise", kind="voucher_amount",
+                     new_amount="150.00", note="amount wrong")
+        sup = self._login("sup", "pwS")
+        status, body = self._get(sup, f"/coll/new-vouchers/{self.STEM}/approve/A1?edit=1")
+        self.assertIn("Edit issue", body)
+        self.assertIn('value="150.00"', body)
+        self.assertIn("amount wrong", body)
+        status, body = self._item(sup, "A1", action="edit_flag", flag_id="1", kind="installment_delete",
+                                  installment_index="0", note="it is the installment, not the amount")
+        self.assertIn("Issue updated", body)
+        flag = self._data()["flags"][0]
+        self.assertEqual(flag["kind"], "installment_delete")
+        self.assertEqual(flag["target"], {"date": "2026-01-05", "amount": "40.00"})
+        self.assertEqual((flag["raised_by"], flag["edited_by"]), ("smA", "sup"))
+
+    def test_supervisor_withdraws_an_issue(self):
+        self._review(self._login("smA", "pwA"), "A1", action="raise", kind="amendment", note="hmm")
+        sup = self._login("sup", "pwS")
+        status, body = self._item(sup, "A1", action="withdraw", flag_id="1")
+        self.assertIn("Issue withdrawn", body)
+        self.assertEqual(self._data()["flags"][0]["status"], "withdrawn")
+        self.assertEqual(self._voucher("A1")["review_status"], "reviewed")
+        # Nothing is left for the distributor; once approved it is simply ready to post.
+        self._approve(sup, "A1")
+        status, body = self._get(self._login("dist", "pwD"), "/coll/new-vouchers")
+        self.assertIn("Post (1)", body)
+        self.assertNotIn("Resolve (", body)
+
+    def test_invalid_issue_input_is_rejected_without_changes(self):
+        self._review(self._login("smA", "pwA"), "A1")
+        sup = self._login("sup", "pwS")
+        status, body = self._item(sup, "A1", action="raise", kind="voucher_amount", new_amount="abc")
+        self.assertIn("Enter a valid voucher amount", body)
+        status, body = self._item(sup, "A1", action="raise", kind="", note="x")
+        self.assertIn("Choose what kind of issue", body)
+        status, body = self._item(sup, "A1", action="raise", kind="installment_delete")
+        self.assertIn("Pick the installment", body)
+        self.assertEqual(self._data()["flags"], [])
+
+    def test_issue_page_is_closed_for_pending_and_approved_vouchers(self):
+        sup = self._login("sup", "pwS")
+        status, body = self._get(sup, f"/coll/new-vouchers/{self.STEM}/approve/A1")
+        self.assertIn("hasn&#39;t reviewed this voucher yet", body)
+        self._review(self._login("smA", "pwA"), "A1")
+        self._approve(sup, "A1")
+        status, body = self._get(sup, f"/coll/new-vouchers/{self.STEM}/approve/A1")
+        self.assertIn("already approved", body)
+        status, body = self._item(sup, "A1", action="raise", kind="amendment", note="late")
+        self.assertIn("already approved", body)
+        self.assertEqual(self._data()["flags"], [])
+
+    def test_flag_actions_must_target_a_flag_on_that_voucher(self):
+        smA = self._login("smA", "pwA")
+        self._review(smA, "A1", action="raise", kind="amendment", note="one")
+        self._review(smA, "A2", action="raise", kind="amendment", note="two")
+        sup = self._login("sup", "pwS")
+        status, body = self._item(sup, "A1", action="withdraw", flag_id="2")   # flag 2 is A2's
+        self.assertIn("wasn&#39;t found on this voucher", body)
+        self.assertEqual([f["status"] for f in self._data()["flags"]], ["open", "open"])
+
+    def test_salesman_cannot_use_the_supervisor_issue_page(self):
+        smA = self._login("smA", "pwA")
+        self._review(smA, "A1")
+        status, body = self._get(smA, f"/coll/new-vouchers/{self.STEM}/approve/A1")
+        self.assertIn("have permission for this action", body)
+        status, body = self._item(smA, "A1", action="raise", kind="amendment", note="x")
+        self.assertIn("have permission for this action", body)
+        self.assertEqual(self._data()["flags"], [])
+
+    def test_menu_tile_is_offered_to_supervisors(self):
+        status, body = self._get(self._login("sup", "pwS"), "/menu")
+        self.assertIn("New Voucher Batches", body)
+
+    def test_concurrent_reviews_by_different_salesmen_do_not_lose_updates(self):
+        # Every mutating route rewrites the one shared batch file; without the
+        # lock, two salesmen clicking at once could drop each other's change.
+        data = self._data()
+        for i in range(12):
+            for sm, beat in (("smA", "beatA"), ("smB", "beatB")):
+                data["vouchers"].append({
+                    "bill_no": f"{sm}-X{i}", "date": "2026-01-01", "amount": "10.00", "balance": "10.00",
+                    "beat": beat, "salesman": sm, "created_by": "dist", "created_at": "t"})
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+        errors = []
+
+        def work(name, pw, prefix):
+            op = self._login(name, pw)
+            for i in range(12):
+                req = urllib.request.Request(
+                    self.base + f"/coll/new-vouchers/{self.STEM}/review/{prefix}-X{i}/clear",
+                    data=b"", method="POST")
+                try:
+                    op.open(req, timeout=10)
+                except Exception as e:      # pragma: no cover - only on failure
+                    errors.append(e)
+
+        threads = [threading.Thread(target=work, args=a)
+                   for a in (("smA", "pwA", "smA"), ("smB", "pwB", "smB"))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        reviewed = [v["bill_no"] for v in self._data()["vouchers"]
+                    if v.get("review_status") == "reviewed"]
+        self.assertEqual(len(reviewed), 24)
+
+
+class TestFreshInstallNoSalesmenOrBeats(ApiTestCase):
+    """Right after /register the DB has a distributor and nothing else —
+    load_salesmen()/load_beats() raise ValueError on empty tables, which used
+    to surface as a bare 500 on the screens the distributor needs first."""
+
+    def setUp(self):
+        super().setUp()
+        self._add_user("dist", "distributor", "distpass1")
+        self.dist = self._login("dist", "distpass1")
+
+    def test_new_beat_form_explains_the_missing_prerequisite(self):
+        status, body = self._get(self.dist, "/manage/beats/new")
+        self.assertEqual(status, 200)
+        self.assertIn("Add a salesman in <a href=\"/manage/users\">Manage Users</a> first", body)
+        self.assertIn("disabled", body)
+
+    def test_create_beat_without_any_salesman_is_a_form_error_not_a_500(self):
+        status, body = self._post(self.dist, "/manage/beats/new", {"name": "beatX", "salesman": "nobody"})
+        self.assertEqual(status, 200)
+        self.assertIn("alert-error", body)
+        self.assertIn("Add a salesman in <a href=\"/manage/users\">Manage Users</a> first", body)
+        self.assertEqual(coll_store.load_beats_raw(), [])
+
+    def test_edit_beat_form_renders_when_its_salesman_list_is_empty(self):
+        conn = coll_store.get_db()
+        try:
+            conn.execute("INSERT INTO beats (name, salesman) VALUES ('beatX', '')")
+            conn.commit()
+        finally:
+            conn.close()
+        status, body = self._get(self.dist, "/manage/beats/beatX/edit")
+        self.assertEqual(status, 200)
+        self.assertIn("Add a salesman in <a href=\"/manage/users\">Manage Users</a> first", body)
+
+    def test_no_menu_screen_returns_a_500_on_an_empty_install(self):
+        paths = ["/menu", "/profile", "/manage/users", "/manage/users/new", "/manage/beats",
+                 "/manage/beats/new", "/coll/start", "/coll/approve-start", "/coll/submit",
+                 "/coll/approve-submit", "/coll/post", "/coll/print", "/coll/corrections",
+                 "/coll/amend", "/coll/amend-request", "/coll/amend-requests", "/coll/checks",
+                 "/coll/import-vouchers", "/coll/new-vouchers", "/reports", "/reports/salesman",
+                 "/reports/beat", "/reports/age", "/reports/amount"]
+        for path in paths:
+            status, body = self._get(self.dist, path)
+            self.assertLess(status, 500, f"{path} -> {status}")
+
+    def test_import_vouchers_says_what_to_set_up_first(self):
+        boundary = "----x"
+        csv_body = "bill_no,date,amount,beat,salesman\nB1,2026-01-01,100,beatA,smA\n"
+        payload = (f"--{boundary}\r\n"
+                   'Content-Disposition: form-data; name="vouchers_file"; filename="v.csv"\r\n'
+                   "Content-Type: text/csv\r\n\r\n"
+                   f"{csv_body}\r\n--{boundary}--\r\n").encode()
+        req = urllib.request.Request(self.base + "/coll/import-vouchers", data=payload, method="POST",
+                                     headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        try:
+            resp = self.dist.open(req, timeout=5)
+            status, body = resp.status, resp.read().decode()
+        except urllib.error.HTTPError as e:
+            status, body = e.code, e.read().decode()
+        self.assertEqual(status, 200)
+        self.assertIn("Manage Beats", body)
+        self.assertIn("Manage Users", body)
+
 
 class TestManageBeats(ApiTestCase):
     def setUp(self):

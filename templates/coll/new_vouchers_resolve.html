@@ -3,8 +3,11 @@
 {% block content %}
 <h2 class="page-heading">Resolve Raised Issues</h2>
 
+{% if waiting_approval %}
+  <p class="muted">{{ waiting_approval }} more issue{{ "s" if waiting_approval != 1 }} will appear here once the supervisor approves the voucher{{ "s" if waiting_approval != 1 }}.</p>
+{% endif %}
 {% if not flags %}
-  <p class="empty-state">No open issues in this batch.</p>
+  <p class="empty-state">No issues are ready for you in this batch.</p>
 {% else %}
   <ul class="report-list">
     {% for f in flags %}
