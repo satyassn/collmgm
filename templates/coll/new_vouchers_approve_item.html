@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %}Voucher Issues — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Voucher Issues</h2>
+{% from "_vcard.html" import vcard %}
+{{ vcard(voucher.bill_no, "full", date=voucher.date, amount=voucher.amount, paid=paid, balance=voucher.balance,
+         beat=voucher.beat, salesman=voucher.salesman, ninst=installments|length, insts=installments, open=True) }}
+
+{% if error %}<p class="alert alert-error">{{ error }}</p>{% endif %}
+
+<h3 class="group-heading">Issues on this voucher</h3>
+{% if flags %}
+<ul class="report-list">
+  {% for f in flags %}
+  <li class="report-item">
+    <span class="report-label">
+      {{ kinds.get(f.kind, f.kind) }}
+      <span class="badge badge-{{ 'warn' if f.status == 'open' else 'ok' if f.status == 'resolved' else 'muted' }}">{{ f.status }}</span>
+    </span>
+    <span class="report-meta">{{ f.raised_by }} &middot; {{ f.raised_at[:10] }}{% if f.edited_by %} &middot; edited by {{ f.edited_by }}{% endif %}{% if f.note %} &middot; {{ f.note }}{% endif %}</span>
+    {% if f.status == "open" %}
+    <a class="btn btn-sm btn-secondary" href="/coll/new-vouchers/{{ stem }}/approve/{{ voucher.bill_no | urlencode }}?edit={{ f.id }}">Edit</a>
+    <form method="post" action="/coll/new-vouchers/{{ stem }}/approve/{{ voucher.bill_no | urlencode }}">
+      <input type="hidden" name="action" value="withdraw">
+      <input type="hidden" name="flag_id" value="{{ f.id }}">
+      <button type="submit" class="btn btn-sm btn-secondary"
+              onclick="return confirm('Withdraw this issue? Use this when the physical voucher shows the data is correct.')">Withdraw</button>
+    </form>
+    {% endif %}
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<p class="muted">No issues raised yet.</p>
+{% endif %}
+
+<h3 class="group-heading">{{ "Edit issue" if editing else "Raise an issue the salesman missed" }}</h3>
+<form method="post" action="/coll/new-vouchers/{{ stem }}/approve/{{ voucher.bill_no | urlencode }}" class="card correction-form">
+  <input type="hidden" name="action" value="{{ 'edit_flag' if editing else 'raise' }}">
+  {% if editing %}<input type="hidden" name="flag_id" value="{{ editing.id }}">{% endif %}
+
+  <fieldset class="kind-choice">
+    <legend>What is wrong?</legend>
+    {% for k, label in kinds.items() %}
+    <label class="kind-option"><input type="radio" name="kind" value="{{ k }}" required
+        {{ 'checked' if prefill and prefill.kind == k }}> {{ label }}</label>
+    {% endfor %}
+  </fieldset>
+
+  <div class="field-group" data-kinds="installment_amount installment_delete" hidden>
+    <p class="group-heading">Which installment?</p>
+    {% if installments %}
+    <div class="table-wrapper">
+    <table class="data-table card-table">
+      <thead><tr><th></th><th>Date</th><th class="num">Amount</th></tr></thead>
+      <tbody>
+        {% for inst in installments %}
+        <tr>
+          <td><input type="radio" name="installment_index" value="{{ loop.index0 }}"
+                     {{ 'checked' if prefill and prefill.installment_index == (loop.index0 | string) }}
+                     aria-label="Installment {{ inst.date }} {{ inst.amount }}"></td>
+          <td>{{ inst.date }}</td>
+          <td class="num mono">{{ inst.amount }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    </div>
+    {% else %}
+    <p class="muted">This voucher has no installments recorded.</p>
+    {% endif %}
+  </div>
+
+  <div class="field-group" data-kinds="installment_amount installment_add voucher_amount" hidden>
+    <label class="field-label">Corrected / new amount
+      <input type="text" name="new_amount" inputmode="decimal" class="mono" autocomplete="off"
+             value="{{ prefill.new_amount if prefill else '' }}">
+    </label>
+  </div>
+
+  <div class="field-group" data-kinds="installment_add" hidden>
+    <label class="field-label">Installment date
+      <input type="date" name="new_date" value="{{ prefill.new_date if prefill else '' }}">
+    </label>
+  </div>
+
+  <label class="field-label">Note (what does the physical voucher show?)
+    <textarea name="note" rows="2" maxlength="500">{{ prefill.note if prefill else '' }}</textarea>
+  </label>
+
+  <div class="action-row">
+    <button type="submit" class="btn btn-primary">{{ "Save Issue" if editing else "Raise Issue" }}</button>
+    {% if editing %}<a class="btn btn-secondary" href="/coll/new-vouchers/{{ stem }}/approve/{{ voucher.bill_no | urlencode }}">Cancel Edit</a>{% endif %}
+    <a class="btn btn-secondary" href="/coll/new-vouchers/{{ stem }}/approve">Back to Approvals</a>
+  </div>
+</form>
+
+<script>
+(function () {
+  var radios = document.querySelectorAll('input[name="kind"]');
+  var groups = document.querySelectorAll(".field-group");
+  function refresh() {
+    var picked = document.querySelector('input[name="kind"]:checked');
+    var kind = picked ? picked.value : "";
+    Array.prototype.forEach.call(groups, function (g) {
+      g.hidden = g.dataset.kinds.split(" ").indexOf(kind) === -1;
+    });
+  }
+  Array.prototype.forEach.call(radios, function (r) {
+    r.addEventListener("change", refresh);
+  });
+  refresh();
+})();
+</script>
+{% endblock %}

@@ -131,14 +131,14 @@
       <p class="menu-help-text" id="help-import-vouchers" hidden>Bring a batch of existing vouchers, and any payments already made on them, into the system from a CSV file.</p>
     </div>
   {% endif %}
-  {% if "import_vouchers" in perms or "raise_correction" in perms or "amend_voucher" in perms or "post_new_vouchers" in perms %}
+  {% if "import_vouchers" in perms or "raise_correction" in perms or "approve_new_vouchers" in perms or "amend_voucher" in perms or "post_new_vouchers" in perms %}
     <div class="menu-card-wrap">
       <a class="menu-card" href="/coll/new-vouchers">
         <span class="menu-icon">&#128230;</span>
         <span>New Voucher Batches</span>
       </a>
       <button type="button" class="menu-help-toggle" aria-expanded="false" aria-controls="help-new-vouchers" aria-label="What does this do?">?</button>
-      <p class="menu-help-text" id="help-new-vouchers" hidden>Review an imported batch, resolve any raised issues, and post it into the system.</p>
+      <p class="menu-help-text" id="help-new-vouchers" hidden>Imported vouchers move one by one: the salesman reviews his own, the supervisor approves them, then the distributor resolves any raised issue and posts.</p>
     </div>
   {% endif %}
   <div class="menu-card-wrap">

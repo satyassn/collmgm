@@ -1,5 +1,5 @@
 /* CollMgm service worker — offline shell cache */
-const CACHE = "collmgm-v2";
+const CACHE = "collmgm-v3";
 const SHELL = ["/static/style.css", "/static/manifest.json"];
 
 self.addEventListener("install", e => {
@@ -16,8 +16,10 @@ self.addEventListener("activate", e =>
 );
 
 /* Static assets: stale-while-revalidate — serve from cache for speed, but
- * refresh the cache from the network in the background so an updated
- * style.css/JS reaches installed clients on their next page load. */
+ * refresh the cache from the network in the background. Pages link assets as
+ * style.css?v=<mtime> (see base.html), so a changed file is a NEW URL and
+ * is a cache miss — it can never be served stale; the old-URL copies of the
+ * same file are pruned below so the cache doesn't grow with every deploy. */
 self.addEventListener("fetch", e => {
   const url = new URL(e.request.url);
   if (url.pathname.startsWith("/static/")) {
@@ -26,7 +28,13 @@ self.addEventListener("fetch", e => {
         cache.match(e.request).then(cached => {
           const fresh = fetch(e.request)
             .then(resp => {
-              if (resp.ok) cache.put(e.request, resp.clone());
+              if (resp.ok) {
+                cache.put(e.request, resp.clone());
+                cache.keys().then(keys => keys.forEach(k => {
+                  const u = new URL(k.url);
+                  if (u.pathname === url.pathname && u.search !== url.search) cache.delete(k);
+                }));
+              }
               return resp;
             })
             .catch(() => cached);

@@ -1,40 +1,23 @@
 {% extends "base.html" %}
 {% block title %}Collection List Preview — CollMgm{% endblock %}
 {% block content %}
+{% from "_vcard.html" import vcard %}
 <h2 class="page-heading">Collection List Preview</h2>
 <p class="meta-line"><strong>Beat:</strong> {{ beat }} &nbsp;|&nbsp; <strong>Salesman:</strong> {{ salesman }}</p>
 
-<table class="data-table stack-table">
-  <thead>
-    <tr>
-      <th>Bill No</th>
-      <th>Voucher Date</th>
-      <th class="num">Amount</th>
-      <th class="num">Total Paid</th>
-      <th class="num">Balance</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for v in vouchers %}
-    <tr class="{% if v.salesman_mismatch %}row-correction{% endif %}">
-      <td class="mono">
-        <a class="voucher-link" href="/voucher/{{ v.bill_no | urlencode }}">{{ v.bill_no }}</a>
-        {% if v.salesman_mismatch %}<span class="badge badge-warn">Different salesman</span>{% endif %}
-      </td>
-      <td>{{ v.voucher_date }}</td>
-      <td class="num mono" data-label="Amt">{{ v.amount }}</td>
-      <td class="num mono" data-label="Total">{{ v.total_paid }}</td>
-      <td class="num mono" data-label="Bal">{{ v.balance }}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-  <tfoot>
-    <tr>
-      <td colspan="4"><strong>Total ({{ vouchers|length }} vouchers)</strong></td>
-      <td class="num mono"><strong>{{ total_balance }}</strong></td>
-    </tr>
-  </tfoot>
-</table>
+<div class="summary-box">
+  <span>{{ vouchers|length }} voucher{{ "s" if vouchers|length != 1 }}</span>
+  <span class="summary-total">Total balance: <strong>{{ total_balance }}</strong></span>
+</div>
+
+<div class="vc-list">
+{% for v in vouchers %}
+  {% set badges %}{% if v.salesman_mismatch %}<span class="badge badge-warn">Different salesman</span>{% endif %}{% endset %}
+  {{ vcard(v.bill_no, "std", date=v.voucher_date, amount=v.amount, paid=v.total_paid, balance=v.balance,
+           badges=badges, href="/voucher/" ~ (v.bill_no | urlencode),
+           cls="vc--mismatch" if v.salesman_mismatch) }}
+{% endfor %}
+</div>
 
 <form method="post" action="/coll/start/confirm" class="action-row action-row--sticky">
   <input type="hidden" name="report_stem" value="{{ report_stem }}">

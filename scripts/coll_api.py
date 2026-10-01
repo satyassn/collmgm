@@ -7,6 +7,7 @@ Run via:  run_server.bat
 """
 
 import csv
+import functools
 import io
 import json
 import re
@@ -43,8 +44,11 @@ from coll_orchestrate import (
     raise_amendment_request, resolve_amendment_request,
     resolve_check,
     ADDV_FLAG_KINDS,
-    addv_batch_status, addv_vouchers_for_salesman,
+    ADDV_STAGES, addv_batch_status, addv_vouchers_for_salesman, addv_voucher_stage,
+    addv_pending_approval, approve_addv_vouchers, addv_ready_to_post, mark_addv_posted,
+    addv_open_flags_awaiting_distributor,
     clear_addv_review, raise_addv_flag, resolve_addv_flag, reject_addv_batch,
+    raise_addv_flag_as_approver, edit_addv_flag, withdraw_addv_flag,
 )
 from coll_store import (
     STAGING_DIR,
@@ -150,6 +154,20 @@ _RESET_LOCK_TIERS = (15 * 60, 60 * 60, 24 * 60 * 60)  # seconds; last tier repea
 _reset_state = {"failures": 0, "locks": 0, "locked_until": 0.0}
 _reset_state_lock = threading.Lock()
 
+# Onboarding batches are ONE json file edited by several people (each salesman
+# reviewing, the supervisor approving, the distributor resolving/posting). Every
+# mutating route is a read-modify-write, so serialise them or concurrent saves
+# silently drop each other's changes. Process-local, like _verify_lock.
+_addv_lock = threading.Lock()
+
+
+def _addv_serialized(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _addv_lock:
+            return fn(*args, **kwargs)
+    return wrapper
+
 
 def _reset_locked_minutes():
     """Whole minutes (>=1) left on the reset lockout, or 0 when not locked."""
@@ -213,6 +231,18 @@ def _redirect_ok(url: str, msg: str):
     return _r(f"{url}{sep}ok={quote(msg)}")
 
 
+def _asset_version() -> str:
+    """Cache-busting token for /static CSS/JS: the newest mtime among them. Any
+    edit yields a new ?v= URL, which the service worker (cache keyed by full
+    URL) must fetch from the network — a stale stylesheet can't be served."""
+    try:
+        return str(max(int(p.stat().st_mtime)
+                       for p in (ROOT_DIR / "static").iterdir()
+                       if p.suffix in (".css", ".js") and p.name != "sw.js"))
+    except (OSError, ValueError):
+        return "0"
+
+
 def _tmpl(name: str, request: Request, **ctx):
     """Render a template, auto-injecting `nav_perms` (the rendering user's
     permission set) whenever a `user` is in context and the caller hasn't
@@ -224,7 +254,26 @@ def _tmpl(name: str, request: Request, **ctx):
             ctx["nav_perms"] = load_permissions().get(user.role, frozenset())
         except FileNotFoundError:
             ctx["nav_perms"] = frozenset()
+    ctx.setdefault("asset_v", _asset_version())
     return templates.TemplateResponse(request=request, name=name, context=ctx)
+
+
+def _salesmen_or_empty():
+    """load_salesmen() raises ValueError when the table has none — which is the
+    normal state right after /register. Screens that exist to ADD the first
+    beats/salesmen must render with an empty list instead of a 500."""
+    try:
+        return load_salesmen()
+    except ValueError:
+        return []
+
+
+def _voucher_paid(voucher):
+    """amount - balance as a 2dp string for the voucher card's Paid figure ("" if unparseable)."""
+    try:
+        return str((Decimal(voucher["amount"]) - Decimal(voucher["balance"])).quantize(Decimal("0.01")))
+    except (InvalidOperation, ValueError, KeyError):
+        return ""
 
 
 def _enrich_vouchers(vouchers):
@@ -1236,7 +1285,7 @@ def voucher_detail(request: Request, bill_no: str, fragment: int = 0,
     template = "_voucher_inline.html" if fragment else "voucher.html"
     return _tmpl(template, request, user=user,
                  voucher=voucher, installments=installments, is_completed=is_completed,
-                 correct_from=correct_from, can_raise=can_raise,
+                 paid=_voucher_paid(voucher), correct_from=correct_from, can_raise=can_raise,
                  can_request_amend=can_request_amend)
 
 
@@ -2111,8 +2160,12 @@ async def coll_import_vouchers_submit(request: Request,
         if missing_i:
             return form_error(f"Installments CSV missing required columns: {', '.join(sorted(missing_i))}")
 
-    beats = load_beats(user)
-    salesmen = load_salesmen()
+    try:
+        beats = load_beats(user)
+        salesmen = load_salesmen()
+    except ValueError as e:
+        return form_error(f"{e} Set up beats and salesmen first (Manage Beats / Manage Users), "
+                          "then import.")
     existing_bill_nos = load_all_existing_bill_nos() | load_addv_staged_bill_nos()
     now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -2145,32 +2198,65 @@ async def coll_import_vouchers_submit(request: Request,
     return _redirect_ok("/coll/new-vouchers", f"Imported {len(vouchers)} voucher(s) for review.")
 
 
-_ADDV_STATUS_LABELS = {
-    "pending_review": ("Pending Review", "warn"),
-    "awaiting_resolution": ("Awaiting Resolution", "warn"),
-    "ready_to_post": ("Ready to Post", "ok"),
+_ADDV_STAGE_BADGES = {
+    "pending_review": ("Pending review", "muted"),
+    "awaiting_approval": ("Awaiting approval", "warn"),
+    "awaiting_resolution": ("Awaiting resolution", "warn"),
+    "ready_to_post": ("Ready to post", "ok"),
     "posted": ("Posted", "muted"),
 }
 
 
+def _addv_own_voucher_or_error(request, user, data, bill_no):
+    """(voucher, None) — or (None, error page) when a salesman reaches for a
+    voucher assigned to someone else. Same ownership rule the rest of the app
+    applies to salesmen (see coll_submit_edit)."""
+    voucher = next((v for v in data.get("vouchers", []) if v.get("bill_no") == bill_no), None)
+    if voucher is None or (user.role == "salesman" and voucher.get("salesman") != user.name):
+        return None, _tmpl("error.html", request, user=user,
+                           message="Voucher not found in this batch.")
+    return voucher, None
+
+
 @app.get("/coll/new-vouchers", response_class=HTMLResponse)
 def coll_new_vouchers_hub(request: Request):
-    user, err = _require_any(request, ("import_vouchers", "raise_correction",
+    user, err = _require_any(request, ("import_vouchers", "raise_correction", "approve_new_vouchers",
                                        "amend_voucher", "post_new_vouchers"))
     if err:
         return err
     perms = load_permissions().get(user.role, frozenset())
+    # A salesman only ever sees — and is only ever counted against — the
+    # vouchers assigned to them; every other role sees whole batches.
+    scope = user.name if user.role == "salesman" else None
     batches = []
     for path, data in load_addv_batches():
-        st = addv_batch_status(data)
-        label, badge = _ADDV_STATUS_LABELS[st["status"]]
+        st = addv_batch_status(data, salesman=scope)
+        if scope is not None and st["total"] == 0:
+            continue
+        counts = st["counts"]
+        stem = path.stem
+        actions = []
+        mine = addv_vouchers_for_salesman(data, user.name)
+        if "raise_correction" in perms and mine:
+            waiting = sum(1 for v in mine if v.get("review_status", "pending") == "pending")
+            actions.append((f"Review ({waiting} pending)" if waiting else "View mine",
+                            f"/coll/new-vouchers/{stem}/review", "primary" if waiting else "secondary"))
+        if "approve_new_vouchers" in perms and counts["awaiting_approval"]:
+            actions.append((f"Approve ({counts['awaiting_approval']})",
+                            f"/coll/new-vouchers/{stem}/approve", "primary"))
+        open_flags = len(addv_open_flags_awaiting_distributor(data)) if "amend_voucher" in perms else 0
+        if open_flags:
+            actions.append((f"Resolve ({open_flags})", f"/coll/new-vouchers/{stem}/resolve", "primary"))
+        if "post_new_vouchers" in perms and counts["ready_to_post"]:
+            actions.append((f"Post ({counts['ready_to_post']})",
+                            f"/coll/new-vouchers/{stem}/post", "primary"))
         batches.append({
-            "stem": path.stem, "data": data, "status": st["status"],
-            "label": label, "badge": badge,
-            "total": st["total"], "reviewed": st["reviewed"], "open_flags": st["open_flags"],
+            "stem": stem, "data": data, "total": st["total"], "actions": actions,
+            "stages": [(_ADDV_STAGE_BADGES[s][0], _ADDV_STAGE_BADGES[s][1], counts[s])
+                       for s in ADDV_STAGES if counts[s]],
         })
     return _tmpl("coll/new_vouchers.html", request, user=user, batches=batches,
-                 can_reject="post_new_vouchers" in perms)
+                 can_reject="post_new_vouchers" in perms, scoped=scope is not None)
 
 
 @app.post("/coll/new-vouchers/{stem}/reject", response_class=HTMLResponse)
@@ -2199,19 +2285,78 @@ def coll_new_vouchers_review_list(request: Request, stem: str):
     installments_by_bill = {}
     for inst in data.get("installments", []):
         installments_by_bill.setdefault(inst.get("bill_no"), []).append(inst)
+    flags = data.get("flags", [])
+    stage_by_bill = {v["bill_no"]: addv_voucher_stage(v, flags) for v in mine}
+    paid_by_bill = {v["bill_no"]: _addv_paid(installments_by_bill.get(v["bill_no"], []))
+                    for v in mine}
     return _tmpl("coll/new_vouchers_review.html", request, user=user,
-                 stem=stem, vouchers=mine, installments_by_bill=installments_by_bill)
+                 stem=stem, vouchers=mine, installments_by_bill=installments_by_bill,
+                 paid_by_bill=paid_by_bill, stage_by_bill=stage_by_bill)
+
+
+def _addv_paid(installments):
+    """Total of a staged voucher's installments, always 2dp (so an unpaid voucher
+    shows 0.00, not 0)."""
+    return sum((parse_decimal(i.get("amount")) for i in installments),
+               Decimal("0.00")).quantize(Decimal("0.01"))
+
+
+def _parse_addv_flag_form(kind, installments, installment_index, new_amount, new_date):
+    """Validate the raise/edit-issue form for one staged voucher (shared by the
+    salesman's review and the supervisor's approval pages).
+    Returns (target, new, error) - error is a message or None."""
+    target = new = None
+    if kind in ("installment_amount", "installment_delete"):
+        if not installment_index.isdigit() or int(installment_index) >= len(installments):
+            return None, None, "Pick the installment this issue applies to."
+        inst = installments[int(installment_index)]
+        target = {"date": inst["date"], "amount": inst["amount"]}
+        if kind == "installment_amount":
+            amount = _valid_amount(new_amount)
+            if amount is None:
+                return None, None, "Enter a valid corrected amount (positive, max 2 decimals)."
+            new = {"amount": amount}
+    elif kind == "installment_add":
+        amount = _valid_amount(new_amount)
+        if amount is None:
+            return None, None, "Enter a valid installment amount (positive, max 2 decimals)."
+        date = _valid_past_date(new_date)
+        if date is None:
+            return None, None, "Enter a valid installment date (YYYY-MM-DD, not in the future)."
+        new = {"date": date, "amount": amount}
+    elif kind == "voucher_amount":
+        amount = _valid_amount(new_amount)
+        if amount is None:
+            return None, None, "Enter a valid voucher amount (positive, max 2 decimals)."
+        new = {"amount": amount}
+    return target, new, None
+
+
+def _addv_flag_prefill(flag, installments):
+    """Form values that reproduce an existing flag, for the supervisor's edit."""
+    idx = ""
+    target = flag.get("target")
+    if target:
+        for i, inst in enumerate(installments):
+            if inst.get("date") == target.get("date") and inst.get("amount") == target.get("amount"):
+                idx = str(i)
+                break
+    new = flag.get("new") or {}
+    return {"kind": flag.get("kind", ""), "note": flag.get("note", ""), "installment_index": idx,
+            "new_amount": new.get("amount", ""), "new_date": new.get("date", "")}
 
 
 def _render_addv_review_item(request, user, stem, data, bill_no, error=None):
-    voucher = next((v for v in data.get("vouchers", []) if v.get("bill_no") == bill_no), None)
-    if voucher is None:
-        return _tmpl("error.html", request, user=user, message="Voucher not found in this batch.")
+    voucher, err = _addv_own_voucher_or_error(request, user, data, bill_no)
+    if err:
+        return err
     installments = [i for i in data.get("installments", []) if i.get("bill_no") == bill_no]
     my_flags = [f for f in data.get("flags", []) if f.get("bill_no") == bill_no]
     return _tmpl("coll/new_vouchers_review_item.html", request, user=user,
                  stem=stem, voucher=voucher, installments=installments,
-                 kinds=ADDV_FLAG_KINDS, flags=my_flags, error=error)
+                 paid=_addv_paid(installments),
+                 kinds=ADDV_FLAG_KINDS, flags=my_flags, error=error,
+                 stage=addv_voucher_stage(voucher, data.get("flags", [])))
 
 
 @app.get("/coll/new-vouchers/{stem}/review/{bill_no}", response_class=HTMLResponse)
@@ -2226,6 +2371,7 @@ def coll_new_vouchers_review_item(request: Request, stem: str, bill_no: str):
 
 
 @app.post("/coll/new-vouchers/{stem}/review/{bill_no}", response_class=HTMLResponse)
+@_addv_serialized
 def coll_new_vouchers_review_submit(request: Request, stem: str, bill_no: str,
                                     action: str = Form(default="clear"),
                                     kind: str = Form(default=""),
@@ -2239,6 +2385,9 @@ def coll_new_vouchers_review_submit(request: Request, stem: str, bill_no: str,
     json_path, data = _load_addv_report(stem)
     if json_path is None:
         return _tmpl("error.html", request, user=user, message="Batch not found.")
+    _, own_err = _addv_own_voucher_or_error(request, user, data, bill_no)
+    if own_err:
+        return own_err
 
     def item_error(msg):
         return _render_addv_review_item(request, user, stem, data, bill_no, error=msg)
@@ -2257,30 +2406,10 @@ def coll_new_vouchers_review_submit(request: Request, stem: str, bill_no: str,
         return item_error("Choose what kind of issue to raise.")
 
     installments = [i for i in data.get("installments", []) if i.get("bill_no") == bill_no]
-    target = new = None
-    if kind in ("installment_amount", "installment_delete"):
-        if not installment_index.isdigit() or int(installment_index) >= len(installments):
-            return item_error("Pick the installment this issue applies to.")
-        inst = installments[int(installment_index)]
-        target = {"date": inst["date"], "amount": inst["amount"]}
-        if kind == "installment_amount":
-            amount = _valid_amount(new_amount)
-            if amount is None:
-                return item_error("Enter a valid corrected amount (positive, max 2 decimals).")
-            new = {"amount": amount}
-    elif kind == "installment_add":
-        amount = _valid_amount(new_amount)
-        if amount is None:
-            return item_error("Enter a valid installment amount (positive, max 2 decimals).")
-        date = _valid_past_date(new_date)
-        if date is None:
-            return item_error("Enter a valid installment date (YYYY-MM-DD, not in the future).")
-        new = {"date": date, "amount": amount}
-    elif kind == "voucher_amount":
-        amount = _valid_amount(new_amount)
-        if amount is None:
-            return item_error("Enter a valid voucher amount (positive, max 2 decimals).")
-        new = {"amount": amount}
+    target, new, form_err = _parse_addv_flag_form(kind, installments, installment_index,
+                                                  new_amount, new_date)
+    if form_err:
+        return item_error(form_err)
 
     try:
         raise_addv_flag(data, bill_no, kind, note, user.name, now_str, target=target, new=new)
@@ -2291,6 +2420,7 @@ def coll_new_vouchers_review_submit(request: Request, stem: str, bill_no: str,
 
 
 @app.post("/coll/new-vouchers/{stem}/review/{bill_no}/clear")
+@_addv_serialized
 def coll_new_vouchers_review_clear_ajax(request: Request, stem: str, bill_no: str):
     """JSON sibling of the "clear" branch above, called by the review-list
     page script so ticking off vouchers doesn't reload the page (and lose
@@ -2306,6 +2436,9 @@ def coll_new_vouchers_review_clear_ajax(request: Request, stem: str, bill_no: st
         return JSONResponse({"ok": False, "error": "perms"}, status_code=403)
     json_path, data = _load_addv_report(stem)
     if json_path is None:
+        return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
+    voucher = next((v for v in data.get("vouchers", []) if v.get("bill_no") == bill_no), None)
+    if voucher is None or (user.role == "salesman" and voucher.get("salesman") != user.name):
         return JSONResponse({"ok": False, "error": "not_found"}, status_code=404)
     try:
         clear_addv_review(data, bill_no, user.name)
@@ -2325,9 +2458,10 @@ def coll_new_vouchers_resolve_list(request: Request, stem: str):
     json_path, data = _load_addv_report(stem)
     if json_path is None:
         return _tmpl("error.html", request, user=user, message="Batch not found.")
-    open_flags = [f for f in data.get("flags", []) if f.get("status") == "open"]
+    open_flags = addv_open_flags_awaiting_distributor(data)
+    waiting = sum(1 for f in data.get("flags", []) if f.get("status") == "open") - len(open_flags)
     return _tmpl("coll/new_vouchers_resolve.html", request, user=user,
-                 stem=stem, flags=open_flags, kinds=ADDV_FLAG_KINDS)
+                 stem=stem, flags=open_flags, kinds=ADDV_FLAG_KINDS, waiting_approval=waiting)
 
 
 def _render_addv_resolve_item(request, user, stem, data, flag_id, error=None):
@@ -2335,11 +2469,15 @@ def _render_addv_resolve_item(request, user, stem, data, flag_id, error=None):
     if flag is None:
         return _tmpl("error.html", request, user=user, message="Flag not found in this batch.")
     voucher = next((v for v in data.get("vouchers", []) if v.get("bill_no") == flag["bill_no"]), None)
+    if voucher is None or voucher.get("posted_at") or not voucher.get("approved_at"):
+        return _tmpl("error.html", request, user=user,
+                     message="This issue isn't ready for you yet - the supervisor must approve "
+                             "the voucher first (or it has already been posted).")
     installments = [i for i in data.get("installments", []) if i.get("bill_no") == flag["bill_no"]]
     return _tmpl("coll/new_vouchers_resolve_item.html", request, user=user,
                  stem=stem, flag=flag, kind_label=ADDV_FLAG_KINDS.get(flag["kind"], flag["kind"]),
                  voucher=voucher, installments=installments,
-                 beats=load_beats_raw(), salesmen=load_salesmen(), error=error)
+                 beats=load_beats_raw(), salesmen=_salesmen_or_empty(), error=error)
 
 
 @app.get("/coll/new-vouchers/{stem}/resolve/{flag_id}", response_class=HTMLResponse)
@@ -2354,6 +2492,7 @@ def coll_new_vouchers_resolve_item(request: Request, stem: str, flag_id: int):
 
 
 @app.post("/coll/new-vouchers/{stem}/resolve/{flag_id}", response_class=HTMLResponse)
+@_addv_serialized
 def coll_new_vouchers_resolve_submit(request: Request, stem: str, flag_id: int,
                                      voucher_date: str = Form(default=""),
                                      voucher_amount: str = Form(default=""),
@@ -2404,7 +2543,167 @@ def coll_new_vouchers_resolve_submit(request: Request, stem: str, flag_id: int,
     return _r(f"/coll/new-vouchers/{stem}/resolve")
 
 
-# --- Post New Vouchers -------------------------------------------------------
+# --- Supervisor approval ---------------------------------------------------
+
+def _render_addv_approve(request, user, stem, data, error=None):
+    pending = sorted(addv_pending_approval(data), key=lambda v: bill_no_sort_key(v["bill_no"]))
+    installments_by_bill = {}
+    for inst in data.get("installments", []):
+        installments_by_bill.setdefault(inst.get("bill_no"), []).append(inst)
+    open_by_bill = {}
+    for f in data.get("flags", []):
+        if f.get("status") == "open":
+            open_by_bill.setdefault(f.get("bill_no"), []).append(f)
+    st = addv_batch_status(data)
+    paid_by_bill = {v["bill_no"]: _addv_paid(installments_by_bill.get(v["bill_no"], []))
+                    for v in pending}
+    return _tmpl("coll/new_vouchers_approve.html", request, user=user, stem=stem,
+                 vouchers=pending, installments_by_bill=installments_by_bill, paid_by_bill=paid_by_bill,
+                 open_by_bill=open_by_bill, kinds=ADDV_FLAG_KINDS, counts=st["counts"], error=error)
+
+
+@app.get("/coll/new-vouchers/{stem}/approve", response_class=HTMLResponse)
+def coll_new_vouchers_approve_list(request: Request, stem: str):
+    user, err = _require(request, "approve_new_vouchers")
+    if err:
+        return err
+    json_path, data = _load_addv_report(stem)
+    if json_path is None:
+        return _tmpl("error.html", request, user=user, message="Batch not found.")
+    return _render_addv_approve(request, user, stem, data)
+
+
+@app.post("/coll/new-vouchers/{stem}/approve", response_class=HTMLResponse)
+@_addv_serialized
+def coll_new_vouchers_approve_submit(request: Request, stem: str,
+                                     action: str = Form(default=""),
+                                     bill_no: List[str] = Form(default=[])):
+    user, err = _require(request, "approve_new_vouchers")
+    if err:
+        return err
+    json_path, data = _load_addv_report(stem)
+    if json_path is None:
+        return _tmpl("error.html", request, user=user, message="Batch not found.")
+    if action == "approve_all":
+        bills = [v["bill_no"] for v in addv_pending_approval(data)]
+    elif action == "approve_selected":
+        bills = list(bill_no)
+    else:
+        return _r(f"/coll/new-vouchers/{stem}/approve")
+    if not bills:
+        return _render_addv_approve(request, user, stem, data,
+                                    error="Select at least one voucher to approve.")
+    now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        approved = approve_addv_vouchers(data, bills, user.name, now_str)
+    except ValueError as e:
+        return _render_addv_approve(request, user, stem, data, error=str(e))
+    save_report_json(json_path, data)
+    msg = f"Approved {len(approved)} voucher(s)."
+    if addv_pending_approval(data):
+        return _redirect_ok(f"/coll/new-vouchers/{stem}/approve", msg)
+    return _redirect_ok("/coll/new-vouchers", msg)
+
+
+def _render_addv_approve_item(request, user, stem, data, bill_no, error=None, editing=None):
+    voucher = next((v for v in data.get("vouchers", []) if v.get("bill_no") == bill_no), None)
+    if voucher is None:
+        return _tmpl("error.html", request, user=user, message="Voucher not found in this batch.")
+    stage = addv_voucher_stage(voucher, data.get("flags", []))
+    if stage == "pending_review":
+        return _tmpl("error.html", request, user=user,
+                     message="The salesman hasn't reviewed this voucher yet.")
+    if stage != "awaiting_approval":
+        return _tmpl("error.html", request, user=user,
+                     message="This voucher is already approved, so it can no longer be changed here.")
+    installments = [i for i in data.get("installments", []) if i.get("bill_no") == bill_no]
+    flags = [f for f in data.get("flags", []) if f.get("bill_no") == bill_no]
+    prefill = _addv_flag_prefill(editing, installments) if editing else None
+    paid = sum(parse_decimal(i.get("amount")) for i in installments)
+    return _tmpl("coll/new_vouchers_approve_item.html", request, user=user, stem=stem,
+                 voucher=voucher, installments=installments, flags=flags, paid=paid,
+                 kinds=ADDV_FLAG_KINDS, editing=editing, prefill=prefill, error=error)
+
+
+@app.get("/coll/new-vouchers/{stem}/approve/{bill_no}", response_class=HTMLResponse)
+def coll_new_vouchers_approve_item(request: Request, stem: str, bill_no: str,
+                                   edit: str = Query(default="")):
+    user, err = _require(request, "approve_new_vouchers")
+    if err:
+        return err
+    json_path, data = _load_addv_report(stem)
+    if json_path is None:
+        return _tmpl("error.html", request, user=user, message="Batch not found.")
+    editing = None
+    if edit.isdigit():
+        editing = next((f for f in data.get("flags", [])
+                        if f.get("id") == int(edit) and f.get("bill_no") == bill_no
+                        and f.get("status") == "open"), None)
+    return _render_addv_approve_item(request, user, stem, data, bill_no, editing=editing)
+
+
+@app.post("/coll/new-vouchers/{stem}/approve/{bill_no}", response_class=HTMLResponse)
+@_addv_serialized
+def coll_new_vouchers_approve_item_submit(request: Request, stem: str, bill_no: str,
+                                          action: str = Form(default=""),
+                                          flag_id: str = Form(default=""),
+                                          kind: str = Form(default=""),
+                                          installment_index: str = Form(default=""),
+                                          new_amount: str = Form(default=""),
+                                          new_date: str = Form(default=""),
+                                          note: str = Form(default="")):
+    """Supervisor's tally against the physical voucher: raise an issue the
+    salesman missed, correct an existing one, or withdraw it. Data fixes stay
+    with the distributor (resolve), after approval."""
+    user, err = _require(request, "approve_new_vouchers")
+    if err:
+        return err
+    json_path, data = _load_addv_report(stem)
+    if json_path is None:
+        return _tmpl("error.html", request, user=user, message="Batch not found.")
+    if action not in ("raise", "edit_flag", "withdraw"):
+        return _r(f"/coll/new-vouchers/{stem}/approve/{bill_no}")
+
+    flag = None
+    if action in ("edit_flag", "withdraw"):
+        flag = next((f for f in data.get("flags", [])
+                     if str(f.get("id")) == flag_id.strip() and f.get("bill_no") == bill_no), None)
+        if flag is None:
+            return _render_addv_approve_item(request, user, stem, data, bill_no,
+                                             error="That issue wasn't found on this voucher.")
+
+    def item_error(msg):
+        return _render_addv_approve_item(request, user, stem, data, bill_no, error=msg,
+                                         editing=flag if action == "edit_flag" else None)
+
+    now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        if action == "withdraw":
+            withdraw_addv_flag(data, flag["id"], user.name, now_str, note)
+            msg = "Issue withdrawn."
+        else:
+            if kind not in ADDV_FLAG_KINDS:
+                return item_error("Choose what kind of issue this is.")
+            installments = [i for i in data.get("installments", []) if i.get("bill_no") == bill_no]
+            target, new, form_err = _parse_addv_flag_form(kind, installments, installment_index,
+                                                          new_amount, new_date)
+            if form_err:
+                return item_error(form_err)
+            if action == "raise":
+                raise_addv_flag_as_approver(data, bill_no, kind, note, user.name, now_str,
+                                            target=target, new=new)
+                msg = "Issue raised."
+            else:
+                edit_addv_flag(data, flag["id"], kind, note, user.name, now_str,
+                               target=target, new=new)
+                msg = "Issue updated."
+    except ValueError as e:
+        return item_error(str(e))
+    save_report_json(json_path, data)
+    return _redirect_ok(f"/coll/new-vouchers/{stem}/approve/{bill_no}", msg)
+
+
+# --- Post New Vouchers (per voucher) -----------------------------------------
 
 @app.get("/coll/new-vouchers/{stem}/post", response_class=HTMLResponse)
 def coll_new_vouchers_post_review(request: Request, stem: str):
@@ -2415,15 +2714,22 @@ def coll_new_vouchers_post_review(request: Request, stem: str):
     if json_path is None:
         return _tmpl("error.html", request, user=user, message="Batch not found.")
     st = addv_batch_status(data)
-    vouchers = sorted(data.get("vouchers", []), key=lambda v: bill_no_sort_key(v["bill_no"]))
-    total_amount = sum(parse_decimal(v.get("amount")) for v in vouchers)
-    total_installments = sum(parse_decimal(i.get("amount")) for i in data.get("installments", []))
+    ready, ready_installments = addv_ready_to_post(data)
+    ready = sorted(ready, key=lambda v: bill_no_sort_key(v["bill_no"]))
+    total_amount = sum(parse_decimal(v.get("amount")) for v in ready)
+    total_installments = sum(parse_decimal(i.get("amount")) for i in ready_installments)
+    installments_by_bill = {}
+    for i in ready_installments:
+        installments_by_bill.setdefault(i["bill_no"], []).append(i)
+    paid_by_bill = {b: _addv_paid(ins) for b, ins in installments_by_bill.items()}
     return _tmpl("coll/new_vouchers_post.html", request, user=user,
-                 stem=stem, data=data, vouchers=vouchers, status=st,
+                 stem=stem, data=data, vouchers=ready, counts=st["counts"], total=st["total"],
+                 installments_by_bill=installments_by_bill, paid_by_bill=paid_by_bill,
                  total_amount=total_amount, total_installments=total_installments)
 
 
 @app.post("/coll/new-vouchers/{stem}/post", response_class=HTMLResponse)
+@_addv_serialized
 def coll_new_vouchers_post_action(request: Request, stem: str, action: str = Form(default="")):
     user, err = _require(request, "post_new_vouchers")
     if err:
@@ -2433,22 +2739,25 @@ def coll_new_vouchers_post_action(request: Request, stem: str, action: str = For
     json_path, data = _load_addv_report(stem)
     if json_path is None:
         return _tmpl("error.html", request, user=user, message="Batch not found.")
-    st = addv_batch_status(data)
-    if st["status"] != "ready_to_post":
+    vouchers, installments = addv_ready_to_post(data)
+    if not vouchers:
         return _tmpl("error.html", request, user=user,
-                     message="This batch isn't ready to post yet — every voucher must be "
-                             "reviewed and every raised issue resolved first.")
+                     message="Nothing is ready to post - vouchers must be approved by the "
+                             "supervisor and have no open issue first.")
 
-    vouchers = data.get("vouchers", [])
-    installments = data.get("installments", [])
+    # Only what is ready goes to master data; everything else stays staged and
+    # keeps moving through the pipeline independently.
     write_new_vouchers(vouchers)
     write_new_installments(installments)
-
-    data["stages"]["confirm"] = "confirmed"
-    data["stages"]["post"] = "confirmed"
-    data["stage"] = "finalized"
+    now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    all_posted = mark_addv_posted(data, [v["bill_no"] for v in vouchers], user.name, now_str)
+    if all_posted:
+        data["stages"]["confirm"] = "confirmed"
+        data["stages"]["post"] = "confirmed"
+        data["stage"] = "finalized"
     save_report_json(json_path, data)
-    archive_files([json_path])
+    if all_posted:
+        archive_files([json_path])
 
     return _redirect_ok("/coll/new-vouchers",
                         f"Posted. {len(vouchers)} voucher(s), {len(installments)} installment(s) written.")
@@ -2575,7 +2884,7 @@ def manage_beats_new_form(request: Request):
     if err:
         return err
     return _tmpl("manage/beat_form.html", request, user=user, mode="create",
-                 salesmen=load_salesmen(), target=None, error=None)
+                 salesmen=_salesmen_or_empty(), target=None, error=None)
 
 
 @app.post("/manage/beats/new", response_class=HTMLResponse)
@@ -2589,7 +2898,7 @@ def manage_beats_new_submit(request: Request,
         create_beat(name.strip(), salesman)
     except ValueError as e:
         return _tmpl("manage/beat_form.html", request, user=user, mode="create",
-                     salesmen=load_salesmen(), target={"name": name, "salesman": salesman}, error=str(e))
+                     salesmen=_salesmen_or_empty(), target={"name": name, "salesman": salesman}, error=str(e))
     return _redirect_ok("/manage/beats", f"Beat '{name.strip()}' created.")
 
 
@@ -2602,7 +2911,7 @@ def manage_beats_edit_form(request: Request, name: str):
     if target is None:
         return _tmpl("error.html", request, user=user, message=f"Beat '{name}' not found.")
     return _tmpl("manage/beat_form.html", request, user=user, mode="edit",
-                 salesmen=load_salesmen(), target=target, error=None)
+                 salesmen=_salesmen_or_empty(), target=target, error=None)
 
 
 @app.post("/manage/beats/{name}/edit", response_class=HTMLResponse)
@@ -2615,7 +2924,7 @@ def manage_beats_edit_submit(request: Request, name: str, salesman: str = Form(d
     except ValueError as e:
         target = {"name": name, "salesman": salesman}
         return _tmpl("manage/beat_form.html", request, user=user, mode="edit",
-                     salesmen=load_salesmen(), target=target, error=str(e))
+                     salesmen=_salesmen_or_empty(), target=target, error=str(e))
     return _redirect_ok("/manage/beats", f"Beat '{name}' updated.")
 
 
@@ -2785,4 +3094,5 @@ def reports_search(request: Request, q: str = ""):
         result = search_voucher(q.strip())
         if result is None:
             error = f"No voucher found for: {q.strip()}"
-    return _tmpl("reports/search.html", request, user=user, q=q, result=result, error=error)
+    paid = _voucher_paid(result[0]) if result else ""
+    return _tmpl("reports/search.html", request, user=user, q=q, result=result, error=error, paid=paid)

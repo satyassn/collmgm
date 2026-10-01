@@ -103,5 +103,20 @@ class TestValidateAddvBatch(unittest.TestCase):
         self.assertTrue(any("in the future" in e for e in errors))
 
 
+class TestReportRow(unittest.TestCase):
+    """Pending-voucher reports carry amount + paid so the minimal card can show Amt / Paid / Bal."""
+
+    def test_paid_is_amount_minus_balance(self):
+        row = coll_data._report_row(
+            {"bill_no": " B1 ", "date": "2026-01-01", "amount": "100.00", "beat": "b", "salesman": "s"},
+            Decimal("60.00"))
+        self.assertEqual((row["bill_no"], row["amount"], row["paid"], row["balance"]),
+                         ("B1", "100.00", "40.00", "60.00"))
+
+    def test_unparseable_amount_blanks_amount_and_paid_only(self):
+        row = coll_data._report_row({"bill_no": "B1", "amount": "oops"}, Decimal("60.00"))
+        self.assertEqual((row["amount"], row["paid"], row["balance"]), ("", "", "60.00"))
+
+
 if __name__ == "__main__":
     unittest.main()

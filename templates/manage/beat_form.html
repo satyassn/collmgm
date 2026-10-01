@@ -17,8 +17,11 @@
     {% endif %}
   </label>
 
+  {% if not salesmen %}
+  <p class="alert alert-warn">Add a salesman in <a href="/manage/users">Manage Users</a> first — every beat needs a salesman assigned.</p>
+  {% endif %}
   <label class="field-label">Salesman
-    <select name="salesman" required>
+    <select name="salesman" required {% if not salesmen %}disabled{% endif %}>
       <option value="" disabled {% if not target %}selected{% endif %}>Select a salesman</option>
       {% for s in salesmen %}
       <option value="{{ s }}" {% if target and target.salesman == s %}selected{% endif %}>{{ s }}</option>
@@ -27,7 +30,7 @@
   </label>
 
   <div class="action-row">
-    <button type="submit" class="btn btn-primary">{{ 'Create Beat' if mode == 'create' else 'Save' }}</button>
+    <button type="submit" class="btn btn-primary" {% if not salesmen %}disabled{% endif %}>{{ 'Create Beat' if mode == 'create' else 'Save' }}</button>
     <a class="btn btn-secondary" href="/manage/beats">Cancel</a>
   </div>
 </form>

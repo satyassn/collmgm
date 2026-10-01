@@ -1,60 +1,45 @@
 {% extends "base.html" %}
 {% block title %}Post New Vouchers — CollMgm{% endblock %}
 {% block content %}
+{% from "_vcard.html" import vcard %}
 <h2 class="page-heading">Post New Vouchers</h2>
 <p class="meta-line">{{ data.get("mode","?") }} &middot; by {{ data.get("created_by","") }} &middot; {{ data.get("created_at","")[:10] }}</p>
 
-{% if status.status != "ready_to_post" %}
-<p class="alert alert-warn">
-  Not ready to post — {{ status.reviewed }}/{{ status.total }} voucher(s) reviewed,
-  {{ status.open_flags }} open issue(s).
+<p class="muted">
+  Vouchers are posted as soon as they are approved and have no open issue — the rest stay staged.
+  {% set waiting = counts.pending_review + counts.awaiting_approval + counts.awaiting_resolution %}
+  {% if waiting %}Still in progress: {{ waiting }} of {{ total }}
+    ({{ counts.pending_review }} awaiting review, {{ counts.awaiting_approval }} awaiting approval, {{ counts.awaiting_resolution }} awaiting resolution).{% endif %}
+  {% if counts.posted %} Already posted: {{ counts.posted }}.{% endif %}
 </p>
+
+{% if not vouchers %}
+<p class="empty-state">Nothing is ready to post yet.</p>
 <a class="btn btn-secondary" href="/coll/new-vouchers">Back</a>
 {% else %}
 
 <div class="summary-box">
-  <span>{{ vouchers|length }} voucher(s)</span>
+  <span>{{ vouchers|length }} voucher(s) ready</span>
   <span class="summary-total">Total: <strong>{{ total_amount }}</strong></span>
 </div>
 <div class="summary-box">
   <span>Installments total: <strong>{{ total_installments }}</strong></span>
 </div>
 
-<table class="data-table stack-table">
-  <thead>
-    <tr>
-      <th>Bill No</th>
-      <th>Date</th>
-      <th class="num">Amount</th>
-      <th class="num">Balance</th>
-      <th>Beat</th>
-      <th>Salesman</th>
-    </tr>
-  </thead>
-  <tbody>
-    {% for v in vouchers %}
-    <tr>
-      <td class="mono">{{ v.bill_no }}</td>
-      <td>{{ v.date }}</td>
-      <td class="num mono">{{ v.amount }}</td>
-      <td class="num mono">{{ v.balance }}</td>
-      <td>{{ v.beat }}</td>
-      <td>{{ v.salesman }}</td>
-    </tr>
-    {% endfor %}
-  </tbody>
-  <tfoot>
-    <tr>
-      <td colspan="2"><strong>Total</strong></td>
-      <td class="num mono"><strong>{{ total_amount }}</strong></td>
-      <td colspan="3"></td>
-    </tr>
-  </tfoot>
-</table>
+<div class="vc-list">
+{% for v in vouchers %}
+  {% set insts = installments_by_bill.get(v.bill_no, []) %}
+  {% set paid = paid_by_bill.get(v.bill_no, "0.00") %}
+  {% set badges %}<span class="badge badge-ok">approved</span>{% endset %}
+  {% set extra %}<span class="vc-lab">Approved by</span> {{ v.get("approved_by","") }}{% endset %}
+  {{ vcard(v.bill_no, "std", date=v.date, amount=v.amount, paid=paid, balance=v.balance, beat=v.beat,
+           salesman=v.salesman, ninst=insts|length, insts=insts, badges=badges, extra=extra) }}
+{% endfor %}
+</div>
 
 <form method="post" action="/coll/new-vouchers/{{ stem }}/post" class="action-row action-row--sticky">
   <button type="submit" name="action" value="post" class="btn btn-primary"
-          onclick="return confirm('Post these new vouchers to master data? This cannot be undone.')">Post</button>
+          onclick="return confirm('Post these {{ vouchers|length }} voucher(s) to master data? This cannot be undone.')">Post {{ vouchers|length }} Voucher{{ "s" if vouchers|length != 1 }}</button>
   <a class="btn btn-secondary" href="/coll/new-vouchers">Back</a>
 </form>
 {% endif %}

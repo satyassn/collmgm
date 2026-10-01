@@ -1,0 +1,91 @@
+{# The one voucher card, used wherever a voucher is listed.
+
+   Three densities (level=):
+     "min"  bill + beat/salesman/date on the left, Amt / Paid / Bal stacked on the right
+     "std"  head (bill + badges), Amount / Paid / Balance strip, labelled meta line
+     "full" same as std; used where someone decides about the voucher (checkbox, note, actions)
+   Every value is optional: pass None to hide it (e.g. reports carry no salesman filter).
+
+   Slots (pre-rendered HTML, i.e. `{% set x %}...{% endset %}` blocks):
+     lead     before the bill number (selection checkbox)
+     badges   right of the bill number
+     extra    a highlighted line under the meta (payment taken, paid-by, ...)
+     note     amber issue box
+     actions  button row
+   Installments live in a panel INSIDE the card frame, so opening it extends the card:
+     insts=[...]  rendered inline (staged vouchers, data already on the page)
+     href=...     fetched on first open from href?fragment=1 (live master data)
+   inst_salesman=True adds each installment's salesman (live master data only).
+   open=True starts the panel expanded (single-voucher pages; inline insts only).
+   With neither, the bill number is plain text. static/voucher_card.js does the toggling. #}
+
+{% macro _zero(x) %}{{ "is-zero" if x is not none and x != "" and (x|float(-1)) == 0 else "" }}{% endmacro %}
+
+{% macro vcard(bill, level="std", date=None, amount=None, paid=None, balance=None, beat=None,
+               salesman=None, ninst=None, insts=None, href=None, lead=None, badges=None,
+               extra=None, note=None, actions=None, cls="", attrs=None, open=False, inst_salesman=False) %}
+{% set toggle = insts is not none or href %}
+<article class="vc vc--{{ level }}{{ " " ~ cls if cls }}"{% if attrs %} {{ attrs|xmlattr }}{% endif %}>
+  <div class="vc-body">
+    {% if level == "min" %}
+    <div class="vc-line">
+      <div class="vc-id">
+        <div class="vc-head">
+          {{ lead if lead }}
+          {% if toggle %}<a class="vc-bill" href="{{ href or '#' }}" data-vc-toggle aria-expanded="{{ 'true' if open else 'false' }}">{{ bill }}</a>
+          {% else %}<span class="vc-bill vc-bill--plain">{{ bill }}</span>{% endif %}
+        </div>
+        <div class="vc-meta">
+          {% if beat %}<span>{{ beat }}</span>{% endif %}
+          {% if salesman %}<span>{{ salesman }}</span>{% endif %}
+          {% if date %}<span>{{ date }}</span>{% endif %}
+          {% if badges %}<span class="vc-badges">{{ badges }}</span>{% endif %}
+        </div>
+      </div>
+      <div class="vc-figs">
+        {% if amount not in (none, "") %}<small>Amt</small><b>{{ amount }}</b>{% endif %}
+        {% if paid not in (none, "") %}<small>Paid</small><b>{{ paid }}</b>{% endif %}
+        {% if balance not in (none, "") %}<small class="is-bal {{ _zero(balance) }}">Bal</small><b class="is-bal {{ _zero(balance) }}">{{ balance }}</b>{% endif %}
+      </div>
+    </div>
+    {% else %}
+    <div class="vc-head">
+      {{ lead if lead }}
+      {% if toggle %}<a class="vc-bill" href="{{ href or '#' }}" data-vc-toggle aria-expanded="{{ 'true' if open else 'false' }}">{{ bill }}</a>
+      {% else %}<span class="vc-bill vc-bill--plain">{{ bill }}</span>{% endif %}
+      {% if badges %}<span class="vc-badges">{{ badges }}</span>{% endif %}
+    </div>
+    <div class="vc-stats">
+      <div><small>Amount</small><b>{{ amount if amount not in (none, "") else "—" }}</b></div>
+      <div><small>Paid</small><b>{{ paid if paid not in (none, "") else "—" }}</b>{% if ninst %}<i>{{ ninst }} installment{{ "s" if ninst != 1 }}</i>{% endif %}</div>
+      <div class="is-bal {{ _zero(balance) }}"><small>Balance</small><b>{{ balance if balance not in (none, "") else "—" }}</b></div>
+    </div>
+    {% if date or beat or salesman %}
+    <div class="vc-meta">
+      {% if date %}<span><small>Date</small>{{ date }}</span>{% endif %}
+      {% if beat %}<span><small>Beat</small>{{ beat }}</span>{% endif %}
+      {% if salesman %}<span><small>Salesman</small>{{ salesman }}</span>{% endif %}
+    </div>
+    {% endif %}
+    {% endif %}
+    {% if extra %}<div class="vc-extra">{{ extra }}</div>{% endif %}
+    {% if note %}<div class="vc-note">{{ note }}</div>{% endif %}
+    {% if actions %}<div class="vc-actions">{{ actions }}</div>{% endif %}
+  </div>
+  {% if insts is not none %}
+  <div class="vc-ext"{{ "" if open else " hidden" }}>
+    <h4>Installments</h4>
+    {% if insts %}
+      {% for inst in insts %}
+      <div class="vc-row"><span>{{ loop.index }}. &nbsp;{{ inst.date }}{% if inst_salesman and inst.salesman %} <span class="muted">&middot; {{ inst.salesman }}</span>{% endif %}</span><span class="mono">{{ inst.amount }}</span></div>
+      {% endfor %}
+      <div class="vc-row vc-row--total"><span>Total paid</span><span class="mono">{{ paid }}</span></div>
+    {% else %}
+      <p class="vc-empty">No installments recorded for this voucher.</p>
+    {% endif %}
+  </div>
+  {% elif href %}
+  <div class="vc-ext" hidden data-src="{{ href }}"><p class="vc-empty">Loading…</p></div>
+  {% endif %}
+</article>
+{% endmacro %}

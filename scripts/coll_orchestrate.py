@@ -1108,50 +1108,157 @@ ADDV_FLAG_KINDS = {
 }
 
 
-def addv_batch_status(batch_data):
-    """Derive a batch's overall onboarding status from its vouchers/flags —
-    never stored, always recomputed at render time (same "derive, don't
-    store" approach already used for correction-open/verification badges
-    elsewhere in the app).
+ADDV_STAGES = ("pending_review", "awaiting_approval", "awaiting_resolution",
+               "ready_to_post", "posted")
+
+
+def addv_voucher_stage(voucher, flags):
+    """Where ONE staged voucher is in the onboarding pipeline. Vouchers move
+    independently — nothing waits on the rest of the batch:
+
+    pending_review      salesman hasn't reviewed/flagged it yet
+    awaiting_approval   reviewed or flagged; supervisor may approve it now
+    awaiting_resolution approved, but has an open flag for the distributor
+    ready_to_post       approved with no open flag; distributor may post it
+    posted              written to master data
 
     A voucher missing `review_status` (e.g. staged by the pre-existing CLI
-    import, which knows nothing about this feature) counts as "pending", so
-    every addv batch — regardless of which path created it — is subject to
-    the same review gate.
+    import, which knows nothing about this feature) counts as pending, so
+    every addv batch — whichever path created it — goes through the same gate.
+    """
+    if voucher.get("posted_at"):
+        return "posted"
+    if voucher.get("review_status", "pending") == "pending":
+        return "pending_review"
+    if not voucher.get("approved_at"):
+        return "awaiting_approval"
+    bill_no = voucher.get("bill_no")
+    if any(f.get("bill_no") == bill_no and f.get("status") == "open" for f in flags):
+        return "awaiting_resolution"
+    return "ready_to_post"
 
-    Returns {"status": "pending_review"|"awaiting_resolution"|"ready_to_post"|"posted",
-             "total": n, "reviewed": n, "open_flags": n}.
+
+def addv_batch_status(batch_data, salesman=None):
+    """Derive a batch's onboarding state from its vouchers/flags — never
+    stored, always recomputed at render time (same "derive, don't store"
+    approach already used for correction-open/verification badges elsewhere).
+
+    salesman: when given, ONLY that salesman's vouchers are counted — a
+    salesman must not see (or be told the size of) the rest of the batch.
+
+    Returns {"status": <dominant stage>, "total": n, "reviewed": n,
+             "open_flags": n, "counts": {stage: n}}. `reviewed` is every
+    voucher past pending_review; `status` is the earliest stage that still
+    has vouchers ("posted" once everything in scope is posted).
     """
     vouchers = batch_data.get("vouchers", [])
+    if salesman is not None:
+        vouchers = [v for v in vouchers if v.get("salesman") == salesman]
     flags = batch_data.get("flags", [])
+    counts = {stage: 0 for stage in ADDV_STAGES}
+    for v in vouchers:
+        counts[addv_voucher_stage(v, flags)] += 1
+    bills = {v.get("bill_no") for v in vouchers}
+    open_flags = sum(1 for f in flags if f.get("status") == "open" and f.get("bill_no") in bills)
     total = len(vouchers)
-    reviewed = sum(1 for v in vouchers if v.get("review_status", "pending") != "pending")
-    open_flags = sum(1 for f in flags if f.get("status") == "open")
-
-    if batch_data.get("stages", {}).get("post") == "confirmed":
-        status = "posted"
-    elif reviewed < total:
-        status = "pending_review"
-    elif open_flags > 0:
-        status = "awaiting_resolution"
-    else:
-        status = "ready_to_post"
-
-    return {"status": status, "total": total, "reviewed": reviewed, "open_flags": open_flags}
+    status = next((s for s in ADDV_STAGES if counts[s]), "posted")
+    return {"status": status, "total": total, "reviewed": total - counts["pending_review"],
+            "open_flags": open_flags, "counts": counts}
 
 
 def addv_vouchers_for_salesman(batch_data, salesman):
-    """Vouchers in this batch assigned to one salesman, for their review queue."""
-    return [v for v in batch_data.get("vouchers", []) if v.get("salesman") == salesman]
+    """Vouchers in this batch assigned to one salesman, for their review queue
+    (already-posted ones are done and drop out)."""
+    return [v for v in batch_data.get("vouchers", [])
+            if v.get("salesman") == salesman and not v.get("posted_at")]
+
+
+def _addv_voucher(batch_data, bill_no):
+    voucher = next((v for v in batch_data.get("vouchers", []) if v.get("bill_no") == bill_no), None)
+    if voucher is None:
+        raise ValueError(f"voucher {bill_no} not found in batch")
+    return voucher
+
+
+def _require_reviewable(voucher):
+    """Review actions are closed once the supervisor approves (or it posts):
+    approving signed off on what the salesman said, so it can't change under it."""
+    if voucher.get("posted_at"):
+        raise ValueError(f"voucher {voucher['bill_no']} is already posted")
+    if voucher.get("approved_at"):
+        raise ValueError(f"voucher {voucher['bill_no']} is already approved — review is closed")
 
 
 def clear_addv_review(batch_data, bill_no, reviewed_by):
     """Salesman found nothing wrong with this voucher — mark it reviewed."""
-    voucher = next((v for v in batch_data.get("vouchers", []) if v.get("bill_no") == bill_no), None)
-    if voucher is None:
-        raise ValueError(f"voucher {bill_no} not found in batch")
+    voucher = _addv_voucher(batch_data, bill_no)
+    _require_reviewable(voucher)
     voucher["review_status"] = "reviewed"
     return batch_data
+
+
+def addv_pending_approval(batch_data):
+    """Vouchers the supervisor can approve right now: reviewed or flagged,
+    not yet approved or posted."""
+    flags = batch_data.get("flags", [])
+    return [v for v in batch_data.get("vouchers", [])
+            if addv_voucher_stage(v, flags) == "awaiting_approval"]
+
+
+def approve_addv_vouchers(batch_data, bill_nos, approved_by, now_str):
+    """Supervisor approves the given vouchers. Each must already be reviewed or
+    flagged by the salesman — a still-pending voucher can't be approved — but
+    a flagged one is approved as-is: its open flag goes on to the distributor.
+    Already-approved vouchers are ignored (idempotent). Raises ValueError,
+    changing nothing, if any bill_no is unknown, pending review, or posted.
+    Returns the list of bill_nos newly approved."""
+    flags = batch_data.get("flags", [])
+    targets = []
+    for bill_no in bill_nos:
+        voucher = _addv_voucher(batch_data, bill_no)
+        stage = addv_voucher_stage(voucher, flags)
+        if stage == "pending_review":
+            raise ValueError(f"voucher {bill_no} hasn't been reviewed by the salesman yet")
+        if stage == "posted":
+            raise ValueError(f"voucher {bill_no} is already posted")
+        if stage == "awaiting_approval":
+            targets.append(voucher)
+    for voucher in targets:
+        voucher["approved_by"] = approved_by
+        voucher["approved_at"] = now_str
+    return [v["bill_no"] for v in targets]
+
+
+def addv_ready_to_post(batch_data):
+    """(vouchers, installments) that can be posted now: approved, no open flag,
+    not posted."""
+    flags = batch_data.get("flags", [])
+    vouchers = [v for v in batch_data.get("vouchers", [])
+                if addv_voucher_stage(v, flags) == "ready_to_post"]
+    bills = {v["bill_no"] for v in vouchers}
+    installments = [i for i in batch_data.get("installments", []) if i.get("bill_no") in bills]
+    return vouchers, installments
+
+
+def mark_addv_posted(batch_data, bill_nos, posted_by, now_str):
+    """Stamp vouchers as written to master data (the caller has just done the
+    DB write). Returns True when EVERY voucher in the batch is now posted, i.e.
+    the batch can be finalized and archived."""
+    wanted = set(bill_nos)
+    for voucher in batch_data.get("vouchers", []):
+        if voucher.get("bill_no") in wanted:
+            voucher["posted_by"] = posted_by
+            voucher["posted_at"] = now_str
+    return all(v.get("posted_at") for v in batch_data.get("vouchers", []))
+
+
+def addv_open_flags_awaiting_distributor(batch_data):
+    """Open flags the distributor can act on: only those on APPROVED, unposted
+    vouchers — a flag on a voucher still awaiting the supervisor isn't theirs yet."""
+    approved = {v["bill_no"] for v in batch_data.get("vouchers", [])
+                if v.get("approved_at") and not v.get("posted_at")}
+    return [f for f in batch_data.get("flags", [])
+            if f.get("status") == "open" and f.get("bill_no") in approved]
 
 
 def raise_addv_flag(batch_data, bill_no, kind, note, raised_by, now_str, target=None, new=None):
@@ -1166,15 +1273,17 @@ def raise_addv_flag(batch_data, bill_no, kind, note, raised_by, now_str, target=
     """
     if kind not in ADDV_FLAG_KINDS:
         raise ValueError(f"unknown flag kind {kind!r}")
-    voucher = next((v for v in batch_data.get("vouchers", []) if v.get("bill_no") == bill_no), None)
-    if voucher is None:
-        raise ValueError(f"voucher {bill_no} not found in batch")
+    voucher = _addv_voucher(batch_data, bill_no)
+    _require_reviewable(voucher)
+    return _append_addv_flag(batch_data, voucher, kind, note, raised_by, now_str, target, new)
 
+
+def _append_addv_flag(batch_data, voucher, kind, note, raised_by, now_str, target, new):
     flags = batch_data.setdefault("flags", [])
     next_id = max((f["id"] for f in flags), default=0) + 1
     flags.append({
         "id": next_id,
-        "bill_no": bill_no,
+        "bill_no": voucher["bill_no"],
         "kind": kind,
         "target": target,
         "new": new,
@@ -1186,6 +1295,70 @@ def raise_addv_flag(batch_data, bill_no, kind, note, raised_by, now_str, target=
         "resolved_at": "",
     })
     voucher["review_status"] = "flagged"
+    return batch_data
+
+
+def _require_awaiting_approval(batch_data, bill_no):
+    """The supervisor's window on a voucher: reviewed/flagged by the salesman
+    and not yet approved. Once approved it belongs to the distributor."""
+    voucher = _addv_voucher(batch_data, bill_no)
+    stage = addv_voucher_stage(voucher, batch_data.get("flags", []))
+    if stage == "pending_review":
+        raise ValueError(f"voucher {bill_no} hasn't been reviewed by the salesman yet")
+    if stage != "awaiting_approval":
+        raise ValueError(f"voucher {bill_no} is already approved — it can no longer be changed here")
+    return voucher
+
+
+def raise_addv_flag_as_approver(batch_data, bill_no, kind, note, raised_by, now_str,
+                                target=None, new=None):
+    """Supervisor raises an issue the salesman missed (or didn't think to raise)
+    while tallying the voucher against the physical copy. Same flag as the
+    salesman's, but allowed on a voucher the salesman has already marked
+    reviewed — only until the supervisor approves it."""
+    if kind not in ADDV_FLAG_KINDS:
+        raise ValueError(f"unknown flag kind {kind!r}")
+    voucher = _require_awaiting_approval(batch_data, bill_no)
+    return _append_addv_flag(batch_data, voucher, kind, note, raised_by, now_str, target, new)
+
+
+def _open_flag_for_approver(batch_data, flag_id):
+    flag = next((f for f in batch_data.get("flags", []) if f.get("id") == flag_id), None)
+    if flag is None:
+        raise ValueError(f"flag {flag_id} not found")
+    if flag.get("status") != "open":
+        raise ValueError(f"flag {flag_id} is not open")
+    _require_awaiting_approval(batch_data, flag["bill_no"])
+    return flag
+
+
+def edit_addv_flag(batch_data, flag_id, kind, note, edited_by, now_str, target=None, new=None):
+    """Supervisor corrects an open issue (kind, proposed values or note) — e.g.
+    the salesman flagged the right voucher but the wrong installment. Only
+    before approval; afterwards the distributor owns it."""
+    if kind not in ADDV_FLAG_KINDS:
+        raise ValueError(f"unknown flag kind {kind!r}")
+    flag = _open_flag_for_approver(batch_data, flag_id)
+    flag.update(kind=kind, target=target, new=new, note=(note or "").strip(),
+                edited_by=edited_by, edited_at=now_str)
+    return batch_data
+
+
+def withdraw_addv_flag(batch_data, flag_id, withdrawn_by, now_str, note=""):
+    """Supervisor dismisses an open issue after checking the physical voucher.
+    The flag is kept (status 'withdrawn') as a record; if it was the voucher's
+    last open issue the voucher goes back to plain 'reviewed'."""
+    flag = _open_flag_for_approver(batch_data, flag_id)
+    flag["status"] = "withdrawn"
+    flag["resolved_by"] = withdrawn_by
+    flag["resolved_at"] = now_str
+    if note:
+        flag["resolution_note"] = note.strip()
+    voucher = _addv_voucher(batch_data, flag["bill_no"])
+    still_open = any(f.get("bill_no") == flag["bill_no"] and f.get("status") == "open"
+                     for f in batch_data.get("flags", []))
+    if not still_open and voucher.get("review_status") == "flagged":
+        voucher["review_status"] = "reviewed"
     return batch_data
 
 
@@ -1212,9 +1385,11 @@ def resolve_addv_flag(batch_data, flag_id, voucher_updates, installments, resolv
         raise ValueError(f"flag {flag_id} is not open")
 
     bill_no = flag["bill_no"]
-    voucher = next((v for v in batch_data.get("vouchers", []) if v.get("bill_no") == bill_no), None)
-    if voucher is None:
-        raise ValueError(f"voucher {bill_no} not found in batch")
+    voucher = _addv_voucher(batch_data, bill_no)
+    if voucher.get("posted_at"):
+        raise ValueError(f"voucher {bill_no} is already posted")
+    if not voucher.get("approved_at"):
+        raise ValueError(f"voucher {bill_no} is awaiting supervisor approval — approve it first")
 
     for key in ("date", "amount", "beat", "salesman"):
         if voucher_updates and key in voucher_updates:

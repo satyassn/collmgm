@@ -554,7 +554,7 @@ input.pay-input {
 }
 /* .report-item sets display:flex, which beats the [hidden] attribute's UA
    display:none (equal specificity, but author rules always win over UA
-   rules) — restore it so the install-toggle expand/collapse actually works. */
+   rules) — restore it so expand/collapse of hidden report rows works. */
 .report-item[hidden] { display: none; }
 .inline-installments { font-size: 0.85rem; }
 .inline-inst-row {
@@ -564,6 +564,152 @@ input.pay-input {
   border-bottom: 1px solid var(--gray-100);
 }
 .inline-inst-row:last-child { border-bottom: none; }
+
+/* ---- Voucher card (templates/_vcard.html) ----
+   ONE card for every voucher list, in three densities: .vc--min, .vc--std,
+   .vc--full. Label/value blocks instead of table cells, so nothing is clipped at
+   phone width; the installments panel (.vc-ext) sits inside the same frame, so
+   opening it extends the card instead of adding a box. The card measures its own
+   width (container query) so it needs no per-screen breakpoints. */
+.vc {
+  container-type: inline-size;
+  background: #fff;
+  border: 1px solid var(--gray-200);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  margin-bottom: 0.75rem;
+  overflow: hidden;
+}
+.vc-list { margin-bottom: 1rem; }
+.vc-intro { margin-bottom: 1rem; }
+.vc-selectall { display: flex; align-items: center; gap: 0.5rem; margin: 0 0 0.75rem; font-size: 0.9rem; cursor: pointer; }
+.vc-selectall input { width: 1.2rem; height: 1.2rem; }
+.vc.is-selected { border-color: var(--blue); box-shadow: 0 0 0 2px rgba(26,86,219,.18); }
+.vc--flagged, .vc--mismatch { border-color: #fcd34d; }
+.vc--paid { border-color: #6ee7b7; }
+.vc-body { padding: 0.8rem 1rem; display: grid; gap: 0.7rem; }
+.vc--min .vc-body { padding: 0.65rem 1rem; gap: 0.2rem; }
+
+.vc-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem 0.7rem; min-width: 0; }
+.vc-check { width: 1.4rem; height: 1.4rem; flex: none; }
+.vc-bill {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 2px 0;
+  cursor: pointer;
+  color: var(--blue);
+  font-family: var(--font-mono);
+  font-size: 1.02rem;
+  font-weight: 700;
+  text-align: left;
+  overflow-wrap: anywhere;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+.vc-bill--plain { color: var(--gray-800); text-decoration: none; cursor: default; }
+a.vc-bill[data-vc-toggle]::after { content: " \25BE"; font-size: 0.8em; }
+a.vc-bill[data-vc-toggle][aria-expanded="true"]::after { content: " \25B4"; }
+.vc-bill:focus-visible, .vc a:focus-visible, .vc button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+.vc-badges { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-left: auto; }
+.vc--min .vc-badges { margin-left: 0; }
+
+/* Amount / Paid / BALANCE: one bordered strip, so the balance can't be squeezed off the edge */
+.vc-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  background: var(--gray-200);
+  border: 1px solid var(--gray-200);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.vc-stats > div { background: var(--gray-50); padding: 0.45rem 0.5rem; min-width: 0; }
+.vc-stats small, .vc-meta small {
+  display: block;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--gray-600);
+}
+.vc-stats b { display: block; font-family: var(--font-mono); font-size: 0.9rem; font-weight: 600; overflow-wrap: anywhere; }
+.vc-stats i { font-style: normal; font-size: 0.72rem; color: var(--gray-600); }
+.vc-stats .is-bal { background: #eff4ff; }
+.vc-stats .is-bal b { font-weight: 700; color: var(--blue); }
+.vc-stats .is-bal.is-zero b { color: var(--green); }
+
+.vc-meta { display: flex; flex-wrap: wrap; gap: 0.1rem 1.1rem; font-size: 0.9rem; min-width: 0; }
+.vc-meta span { min-width: 0; overflow-wrap: anywhere; }
+.vc-meta small { display: inline; margin-right: 0.3rem; }
+.vc--min .vc-meta { font-size: 0.8rem; color: var(--gray-600); gap: 0 0.9rem; }
+
+.vc-extra { font-size: 0.9rem; overflow-wrap: anywhere; }
+.vc-lab { font-size: 0.68rem; text-transform: uppercase; letter-spacing: .06em; color: var(--gray-600); margin-right: 0.3rem; }
+.vc-extra .ret-detail { display: inline-block; }
+.vc--paid .vc-stats > div { background: #f0fdf4; }
+.vc-note {
+  background: #fef3c7;
+  border: 1px solid #fcd34d;
+  color: #92400e;
+  border-radius: var(--radius);
+  padding: 0.5rem 0.7rem;
+  font-size: 0.85rem;
+  overflow-wrap: anywhere;
+}
+.vc-note b { display: block; font-size: 0.68rem; text-transform: uppercase; letter-spacing: .06em; }
+.vc-note > div + div { margin-top: 0.35rem; }
+.vc-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+
+/* minimal: bill + meta left, Amt / Paid / Bal stacked right */
+.vc-line { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.75rem; }
+.vc-id { min-width: 0; flex: 1 1 auto; display: grid; gap: 0.1rem; }
+.vc-figs {
+  flex: none;
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 0 0.5rem;
+  align-items: baseline;
+  justify-items: end;
+  font-size: 0.85rem;
+}
+.vc-figs small { font-size: 0.62rem; text-transform: uppercase; letter-spacing: .06em; color: var(--gray-600); justify-self: start; }
+.vc-figs b { font-family: var(--font-mono); font-size: 0.85rem; font-weight: 600; }
+.vc-figs .is-bal { color: var(--blue); font-weight: 700; }
+.vc-figs b.is-bal { font-size: 0.98rem; }
+.vc-figs .is-zero { color: var(--green); }
+
+/* the extension: same frame, tinted, dashed seam */
+.vc-ext { border-top: 1px dashed var(--gray-400); background: var(--gray-50); padding: 0.6rem 1rem 0.8rem; }
+.vc-ext[hidden] { display: none; }
+.vc-ext h4 {
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--gray-600);
+  margin-bottom: 0.25rem;
+}
+.vc-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.28rem 0;
+  border-bottom: 1px solid var(--gray-200);
+  font-size: 0.9rem;
+}
+.vc-row:last-child { border-bottom: none; }
+.vc-row--total { font-weight: 700; border-top: 1px solid var(--gray-400); margin-top: 0.15rem; }
+.vc-empty { color: var(--gray-600); font-size: 0.88rem; }
+/* Live installments fetched from /voucher/{bill}?fragment=1 (_voucher_inline.html) */
+.vc-ext .inline-installments { font-size: 0.9rem; }
+.vc-ext .inline-inst-row { border-bottom-color: var(--gray-200); }
+
+@container (min-width: 520px) {
+  .vc-body { padding: 1rem 1.25rem; }
+  .vc--min .vc-body { padding: 0.75rem 1.25rem; }
+  .vc-stats b { font-size: 1.1rem; }
+  .vc-ext { padding-inline: 1.25rem; }
+}
 
 /* ---- Misc ---- */
 .step-label { font-size: 0.875rem; color: var(--gray-600); margin-bottom: 1rem; }

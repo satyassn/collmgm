@@ -241,6 +241,25 @@ def _load_submit_confirmed_reports():
 
 # --- Report query functions ---
 
+def _report_row(row, balance):
+    """Common voucher fields for the pending-voucher reports. `amount` and `paid`
+    (amount - balance) let the minimal voucher card show Amt / Paid / Bal."""
+    amount = row.get("amount", "").strip()
+    try:
+        paid = str(Decimal(amount) - balance)
+    except (ValueError, InvalidOperation):
+        amount, paid = "", ""
+    return {
+        "bill_no": row.get("bill_no", "").strip(),
+        "date": row.get("date", "").strip(),
+        "amount": amount,
+        "paid": paid,
+        "balance": str(balance),
+        "beat": row.get("beat", "").strip(),
+        "salesman": row.get("salesman", "").strip(),
+    }
+
+
 def query_pending_by_salesman(salesman, current_user=None):
     """Return dict[beat -> list[voucher_dict]] of pending vouchers for a salesman."""
     grouped = {}
@@ -254,11 +273,7 @@ def query_pending_by_salesman(salesman, current_user=None):
         if balance <= 0:
             continue
         beat = row.get("beat", "").strip()
-        grouped.setdefault(beat, []).append({
-            "bill_no": row.get("bill_no", "").strip(),
-            "date": row.get("date", "").strip(),
-            "balance": str(balance),
-        })
+        grouped.setdefault(beat, []).append(_report_row(row, balance))
     return grouped
 
 
@@ -275,11 +290,7 @@ def query_pending_by_beat(beat, current_user=None):
         if balance <= 0:
             continue
         salesman = row.get("salesman", "").strip()
-        grouped.setdefault(salesman, []).append({
-            "bill_no": row.get("bill_no", "").strip(),
-            "date": row.get("date", "").strip(),
-            "balance": str(balance),
-        })
+        grouped.setdefault(salesman, []).append(_report_row(row, balance))
     return grouped
 
 
@@ -302,14 +313,9 @@ def query_pending_by_age(limit, current_user=None):
             age = (today_date - datetime.strptime(date_str, "%Y-%m-%d").date()).days
         except ValueError:
             age = 0
-        pending.append({
-            "bill_no": row.get("bill_no", "").strip(),
-            "date": date_str,
-            "balance": str(balance),
-            "beat": row.get("beat", "").strip(),
-            "salesman": row.get("salesman", "").strip(),
-            "age": age,
-        })
+        entry = _report_row(row, balance)
+        entry["age"] = age
+        pending.append(entry)
     pending.sort(key=lambda v: v["date"])
     return pending[:limit], len(pending)
 
@@ -327,17 +333,13 @@ def query_pending_by_amount(limit, current_user=None):
             continue
         if balance <= 0:
             continue
-        pending.append({
-            "bill_no": row.get("bill_no", "").strip(),
-            "date": row.get("date", "").strip(),
-            "balance": balance,
-            "beat": row.get("beat", "").strip(),
-            "salesman": row.get("salesman", "").strip(),
-        })
-    pending.sort(key=lambda v: v["balance"], reverse=True)
+        entry = _report_row(row, balance)
+        entry["_sort"] = balance
+        pending.append(entry)
+    pending.sort(key=lambda v: v["_sort"], reverse=True)
     top = pending[:limit]
     for v in top:
-        v["balance"] = str(v["balance"])
+        del v["_sort"]
     return top, len(pending)
 
 
