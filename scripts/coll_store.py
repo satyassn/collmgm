@@ -2651,29 +2651,32 @@ def _build_html_column(report_data):
     total_bal = sum(parse_decimal(v.get("balance")) for v in vouchers)
     total_coll = sum(parse_decimal(v.get("payment")) for v in vouchers)
 
+    # Pre-printed "write here" guide for an empty Coll cell — a fraction
+    # slash, same convention as the customer's own current paper form.
+    coll_tick = '<span class="tick">&#8260;</span>'
     rows_html = "".join(
-        f"<tr><td>{v['bill_no'][-7:]}</td>"
-        f'<td class="sep">--</td>'
+        f'<tr><td class="bill">{v["bill_no"][-7:]}</td>'
         f'<td class="num">{v.get("balance", "")}</td>'
-        f'<td class="num">{v.get("payment", "") or ""}</td></tr>\n'
+        f'<td class="num coll">{v.get("payment") or coll_tick}</td></tr>\n'
         for v in sorted(vouchers, key=lambda v: bill_no_sort_key(v["bill_no"]))
     )
+    # Coll total is left blank until collections are actually entered and
+    # summed by hand — a printed "0.00" would look like a computed value.
     coll_str = str(total_coll) if total_coll > 0 else ""
 
     return (
-        f'<div class="col-heading">{heading}</div>\n'
+        f'<div class="col-heading"><span>{heading}</span><span class="cnt">#{total_vouchers}</span></div>\n'
         f"<table>\n"
-        f"<colgroup><col style=\"width:7ch\"><col style=\"width:2ch\"><col style=\"width:8ch\"><col></colgroup>\n"
+        f'<colgroup><col style="width:13mm"><col style="width:16mm"><col style="width:24mm"></colgroup>\n'
         f"<thead><tr>"
         f"<td>Bill No</td>"
-        f'<td class="sep"></td>'
         f'<td class="num">Balance</td>'
-        f'<td class="num">Coll</td>'
+        f'<td class="num coll">Coll</td>'
         f"</tr></thead>\n"
         f"<tbody>\n{rows_html}</tbody>\n"
         f"<tfoot><tr>"
-        f"<td colspan=\"3\">#{total_vouchers}&nbsp; Bal:{total_bal}</td>"
-        f'<td class="num">{coll_str}</td>'
+        f'<td colspan="2">Bal:{total_bal}</td>'
+        f'<td class="num coll">{coll_str}</td>'
         f"</tr></tfoot>\n"
         f"</table>"
     )
@@ -2704,62 +2707,72 @@ def build_print_collection_html(reports_data, auto_print=False):
   @page {{ margin: 10mm 8mm; }}
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{
-    font-family: 'Courier New', Courier, monospace;
+    font-family: -apple-system, 'Segoe UI', Arial, sans-serif;
     font-size: 11pt;
-    line-height: 1.05;
+    line-height: 1.25;
+    color: #14181f;
   }}
   .page-header {{
     display: flex;
     justify-content: space-between;
     font-weight: bold;
-    font-size: 12.5pt;
+    font-size: 13pt;
     border-bottom: 2px solid #000;
-    padding-bottom: 2px;
-    margin-bottom: 4px;
+    padding-bottom: 3px;
+    margin-bottom: 6px;
   }}
   .columns {{
     display: flex;
-    gap: 6px;
+    gap: 10px;
     align-items: flex-start;
   }}
   .col {{
     flex: 1;
     border-left: 1px solid #999;
-    padding-left: 4px;
+    padding-left: 8px;
   }}
   .col:first-child {{
     border-left: none;
     padding-left: 0;
   }}
   .col-heading {{
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
     font-weight: bold;
     font-size: 10.5pt;
-    white-space: nowrap;
-    overflow: hidden;
     border-bottom: 1px solid #000;
-    padding-bottom: 1px;
-    margin-bottom: 1px;
+    padding-bottom: 2px;
+    margin-bottom: 3px;
+  }}
+  .col-heading .cnt {{
+    font-weight: 600;
+    color: #5b6472;
+    font-size: 9.5pt;
   }}
   table {{
     width: 100%;
     border-collapse: collapse;
+    table-layout: fixed;
   }}
   thead td {{
     font-weight: bold;
     border-bottom: 1px solid #000;
-    padding: 0;
+    padding: 0 0 3px 0;
   }}
   tbody td {{
-    padding: 1pt 0;
+    padding: 4.5pt 0;
     white-space: nowrap;
   }}
   tfoot td {{
     font-weight: bold;
     border-top: 1px solid #000;
-    padding: 0;
+    padding: 4pt 0 0 0;
   }}
-  .num {{ text-align: right; }}
-  .sep {{ text-align: center; }}
+  .num {{ text-align: right; padding-right: 4px; }}
+  .bill {{ border-right: 1px solid #c7cbd1; padding-right: 4px; }}
+  .coll {{ border-left: 1px solid #c7cbd1; padding-left: 4px; }}
+  .tick {{ color: #aab1bb; font-weight: normal; }}
 </style>
 </head>
 <body>
