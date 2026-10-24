@@ -292,30 +292,49 @@ class TestCollStartGenerateCombinedList(ApiTestCase):
         self._add_voucher("300", "beatMixed", "smA")
         self._add_voucher("400", "beatMixed", "smB")
 
-    def test_combined_list_includes_all_salesmen_and_flags_mismatch(self):
+    def test_combined_list_blocked_and_flagged_when_salesman_mismatched(self):
+        # 400's salesman (smB) doesn't match beatMixed's assigned salesman
+        # (smA) — generation is blocked and an Amendment Request is
+        # auto-raised against it (see SalesmanMismatchGuardTests for the
+        # focused single-voucher version of this behavior).
         opener = self._login("dist", "pwD")
         status, body = self._post(opener, "/coll/start/generate", {"beat": "beatMixed"})
         self.assertEqual(status, 200)
+        self.assertNotIn('name="report_stem"', body)
+        self.assertIn("Check Amendment Requests", body)
+        open_reqs = [r for r in coll_store.load_amendment_requests() if r["status"] == "open"]
+        self.assertEqual([r["bill_no"] for r in open_reqs], ["400"])
+
+        self.assertEqual(list((self.tmp / "staging").glob("coll*.json")), [])
+
+    def test_combined_list_succeeds_when_every_voucher_matches_the_beat(self):
+        # A beat has exactly one assigned salesman, so a combined list that
+        # clears the mismatch guard necessarily has every voucher on that
+        # one salesman — "combined" still matters in that it aggregates
+        # every pending voucher for the beat in one list, not per salesman.
+        self._add_beat("beatClean", "smA")
+        self._add_voucher("301", "beatClean", "smA")
+        self._add_voucher("302", "beatClean", "smA")
+        opener = self._login("dist", "pwD")
+        status, body = self._post(opener, "/coll/start/generate", {"beat": "beatClean"})
+        self.assertEqual(status, 200)
         self.assertIn('name="report_stem"', body)
-        self.assertIn("300", body)
-        self.assertIn("400", body)
-        self.assertIn("Different salesman", body)
-        # No Amendment Request auto-raised — purely a review flag.
-        self.assertEqual(coll_store.load_amendment_requests(), [])
+        self.assertIn("301", body)
+        self.assertIn("302", body)
 
         paths = list((self.tmp / "staging").glob("coll*.json"))
         self.assertEqual(len(paths), 1)
         data = json.loads(paths[0].read_text(encoding="utf-8"))
         self.assertEqual(data["selection_type"], "beat")
-        self.assertEqual(data["selection"], ["beatMixed"])
-        self.assertEqual({v["bill_no"] for v in data["vouchers"]}, {"300", "400"})
+        self.assertEqual(data["selection"], ["beatClean"])
+        self.assertEqual({v["bill_no"] for v in data["vouchers"]}, {"301", "302"})
 
-    def test_salesman_generating_own_beat_sees_combined_list(self):
+    def test_salesman_generating_own_beat_is_blocked_by_mismatch(self):
         opener = self._login("smA", "pwA")
         status, body = self._post(opener, "/coll/start/generate", {"beat": "beatMixed"})
         self.assertEqual(status, 200)
-        self.assertIn("400", body)
-        self.assertIn("Different salesman", body)
+        self.assertIn("Check Amendment Requests", body)
+        self.assertNotIn('name="report_stem"', body)
 
 
 # ---------------------------------------------------------------------------
@@ -1563,10 +1582,13 @@ class TestAmendVoucher(ApiTestCase):
             conn.close()
         return {"voucher": v, "installments": insts}
 
-    def _post_amend(self, opener, bill_no, snapshot, voucher, installments, note=""):
+    def _post_amend(self, opener, bill_no, snapshot, voucher, installments, note="",
+                    new_bill_no=None):
         data = [("v_date", voucher["date"]), ("v_amount", voucher["amount"]),
                 ("v_beat", voucher["beat"]), ("v_salesman", voucher["salesman"]),
                 ("note", note), ("snapshot", json.dumps(snapshot))]
+        if new_bill_no is not None:
+            data.append(("v_bill_no", new_bill_no))
         for row in installments:
             token = str(row["id"]) if row.get("id") is not None else row["token"]
             data.append(("inst_row", token))
@@ -1661,6 +1683,122 @@ class TestAmendVoucher(ApiTestCase):
         amds = coll_store.load_amendments(bill_no="900")
         self.assertEqual(len(amds), 1)
         self.assertEqual(amds[0]["note"], "fixed")
+
+    # -- voucher-number rename --
+
+    def test_rename_happy_path_moves_master_data_and_history(self):
+        dist = self._login("dist", "pwD")
+        snap = self._snapshot("900")
+        voucher = {"date": "2026-01-01", "amount": "100.00", "beat": "beatA", "salesman": "smA"}
+        installments = [{"id": self.inst_id, "date": "2026-01-01",
+                         "amount": "20.00", "salesman": "smA"}]
+        status, body = self._post_amend(dist, "900", snap, voucher, installments,
+                                        note="typo fix", new_bill_no="901")
+        self.assertIn("renamed to", body)
+        self.assertIn("901", body)
+        self.assertIsNone(coll_store.load_vouchers_by_bill_nos(["900"]).get("900"))
+        self.assertIsNotNone(coll_store.load_vouchers_by_bill_nos(["901"]).get("901"))
+        conn = coll_store.get_db()
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM installments WHERE bill_no = '901'"
+                            ).fetchone()[0], 1)
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM installments WHERE bill_no = '900'"
+                            ).fetchone()[0], 0)
+        finally:
+            conn.close()
+        amds = coll_store.load_amendments(bill_no="901")
+        self.assertEqual(len(amds), 1)
+        self.assertEqual(amds[0]["old"]["voucher"]["bill_no"], "900")
+        self.assertEqual(amds[0]["new"]["voucher"]["bill_no"], "901")
+        self.assertEqual(coll_store.load_amendments(bill_no="900"), [])
+
+    def test_rename_to_existing_voucher_rejected(self):
+        self._seed_voucher("901", "beatA", "smA", amount="50.00", balance="50.00")
+        dist = self._login("dist", "pwD")
+        snap = self._snapshot("900")
+        voucher = {"date": "2026-01-01", "amount": "100.00", "beat": "beatA", "salesman": "smA"}
+        installments = [{"id": self.inst_id, "date": "2026-01-01",
+                         "amount": "20.00", "salesman": "smA"}]
+        status, body = self._post_amend(dist, "900", snap, voucher, installments,
+                                        new_bill_no="901")
+        self.assertIn("already exists", body)
+        self.assertIsNotNone(coll_store.load_vouchers_by_bill_nos(["900"]).get("900"))
+        self.assertEqual(coll_store.load_amendments(bill_no="900"), [])
+
+    def test_rename_to_existing_voucher_rejected_case_insensitively(self):
+        self._seed_voucher("G200", "beatA", "smA", amount="50.00", balance="50.00")
+        dist = self._login("dist", "pwD")
+        snap = self._snapshot("900")
+        voucher = {"date": "2026-01-01", "amount": "100.00", "beat": "beatA", "salesman": "smA"}
+        installments = [{"id": self.inst_id, "date": "2026-01-01",
+                         "amount": "20.00", "salesman": "smA"}]
+        status, body = self._post_amend(dist, "900", snap, voucher, installments,
+                                        new_bill_no="g200")
+        self.assertIn("already exists", body)
+        self.assertIsNotNone(coll_store.load_vouchers_by_bill_nos(["900"]).get("900"))
+
+    def test_rename_normalizes_to_uppercase(self):
+        dist = self._login("dist", "pwD")
+        snap = self._snapshot("900")
+        voucher = {"date": "2026-01-01", "amount": "100.00", "beat": "beatA", "salesman": "smA"}
+        installments = [{"id": self.inst_id, "date": "2026-01-01",
+                         "amount": "20.00", "salesman": "smA"}]
+        status, body = self._post_amend(dist, "900", snap, voucher, installments,
+                                        new_bill_no="g300")
+        self.assertIn("renamed to", body)
+        self.assertIn("G300", body)
+        self.assertIsNotNone(coll_store.load_vouchers_by_bill_nos(["G300"]).get("G300"))
+
+    def test_rename_invalid_characters_rejected(self):
+        dist = self._login("dist", "pwD")
+        snap = self._snapshot("900")
+        voucher = {"date": "2026-01-01", "amount": "100.00", "beat": "beatA", "salesman": "smA"}
+        installments = [{"id": self.inst_id, "date": "2026-01-01",
+                         "amount": "20.00", "salesman": "smA"}]
+        status, body = self._post_amend(dist, "900", snap, voucher, installments,
+                                        new_bill_no="bad no!")
+        self.assertIn("invalid characters", body)
+        self.assertIsNotNone(coll_store.load_vouchers_by_bill_nos(["900"]).get("900"))
+
+    def test_rename_same_number_is_not_treated_as_a_rename(self):
+        dist = self._login("dist", "pwD")
+        snap = self._snapshot("900")
+        voucher = {"date": "2026-01-01", "amount": "100.00", "beat": "beatA", "salesman": "smA"}
+        installments = [{"id": self.inst_id, "date": "2026-01-01",
+                         "amount": "20.00", "salesman": "smA"}]
+        status, body = self._post_amend(dist, "900", snap, voucher, installments,
+                                        new_bill_no="900")
+        self.assertIn("Amendment applied", body)
+        self.assertNotIn("renamed", body)
+
+    def test_rename_updates_staged_report_bill_no(self):
+        stem = "coll20260101-beat_salesman-beatA_smA"
+        report_path = self._write_staging_report(
+            stem, "beatA", "smA", start="confirmed", submit="",
+            vouchers=[{"bill_no": "900", "date": "2026-01-01", "balance": "80.00",
+                       "payment": "", "payment_date": "", "beat": "beatA", "salesman": "smA"}])
+        dist = self._login("dist", "pwD")
+        snap = self._snapshot("900")
+        voucher = {"date": "2026-01-01", "amount": "100.00", "beat": "beatA", "salesman": "smA"}
+        installments = [{"id": self.inst_id, "date": "2026-01-01",
+                         "amount": "20.00", "salesman": "smA"}]
+        self._post_amend(dist, "900", snap, voucher, installments, new_bill_no="901")
+        staged = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(staged["vouchers"][0]["bill_no"], "901")
+
+    def test_rename_auto_resolves_open_amendment_request_under_new_number(self):
+        req_id = coll_store.insert_amendment_request("900", "please check", "smA", "2026-01-01T00:00:00")
+        dist = self._login("dist", "pwD")
+        snap = self._snapshot("900")
+        voucher = {"date": "2026-01-01", "amount": "100.00", "beat": "beatA", "salesman": "smA"}
+        installments = [{"id": self.inst_id, "date": "2026-01-01",
+                         "amount": "20.00", "salesman": "smA"}]
+        self._post_amend(dist, "900", snap, voucher, installments, new_bill_no="901")
+        req = coll_store.load_amendment_request(req_id)
+        self.assertEqual(req["status"], "applied")
+        self.assertEqual(req["bill_no"], "901")
 
     def test_validation_failure_preserves_submitted_values(self):
         dist = self._login("dist", "pwD")
@@ -2922,7 +3060,7 @@ class TestFreshInstallNoSalesmenOrBeats(ApiTestCase):
                  "/manage/beats/new", "/coll/start", "/coll/approve-start", "/coll/submit",
                  "/coll/approve-submit", "/coll/post", "/coll/print", "/coll/corrections",
                  "/coll/amend", "/coll/amend-request", "/coll/amend-requests", "/coll/checks",
-                 "/coll/import-vouchers", "/coll/new-vouchers", "/reports", "/reports/salesman",
+                 "/coll/import-vouchers", "/coll/add-voucher", "/coll/new-vouchers", "/reports", "/reports/salesman",
                  "/reports/beat", "/reports/age", "/reports/amount"]
         for path in paths:
             status, body = self._get(self.dist, path)
@@ -2967,7 +3105,8 @@ class TestManageBeats(ApiTestCase):
 
     def test_create_beat_end_to_end(self):
         dist = self._login("dist", "distpass1")
-        status, body = self._post(dist, "/manage/beats/new", {"name": "beatX", "salesman": "sm1"})
+        status, body = self._post(dist, "/manage/beats/new", {
+            "name": "beatX", "salesman": "sm1", "cadence": "weekly", "cadence_day": "mon"})
         self.assertEqual(status, 200)
         status, body = self._get(dist, "/manage/beats")
         self.assertIn("beatX", body)
@@ -3442,6 +3581,178 @@ class TestForgotPassword(ApiTestCase):
         status, body = self._get(self._login("dist", "password1"), "/profile")
         self.assertIn("Secret Question", body)
         self.assertIn(self.Q, body)
+
+
+class TestAddVoucher(ApiTestCase):
+    """POST /coll/add-voucher — the manual one-at-a-time alternative to CSV
+    import. Reuses coll_data.validate_addv_batch verbatim, so most validation
+    rules are already covered by the CSV import tests; these focus on what's
+    specific to this route: beat-derived salesman (never trusting the
+    client's own value), the review-skip for a salesman's own voucher, and
+    restoring the posted payload on a failed submit."""
+
+    def setUp(self):
+        super().setUp()
+        self._add_user("sm1", "salesman", "smpass1")
+        self._add_user("sm2", "salesman", "smpass2")
+        self._add_user("sup1", "supervisor", "suppass1")
+        self._add_user("dist1", "distributor", "distpass1")
+        self._add_beat("beatA", "sm1")
+        self._add_beat("beatB", "sm2")
+
+    def _one_batch(self):
+        batches = coll_store.load_addv_batches()
+        self.assertEqual(len(batches), 1)
+        return batches[0][1]
+
+    def test_duplicate_bill_no_rejected_case_insensitively(self):
+        self._add_voucher("G100", "beatA", "sm1")
+        sm = self._login("sm1", "smpass1")
+        payload = json.dumps({"vouchers": [
+            {"bill_no": "g100", "date": "2026-01-01", "amount": "100.00", "beat": "beatA",
+             "installments": []},
+        ]})
+        status, body = self._post(sm, "/coll/add-voucher", {"payload": payload})
+        self.assertEqual(status, 200)
+        self.assertIn("already exists", body)
+        self.assertEqual(coll_store.load_addv_batches(), [])
+
+    def test_salesman_add_own_voucher_skips_review(self):
+        sm = self._login("sm1", "smpass1")
+        payload = json.dumps({"vouchers": [
+            {"bill_no": "V100", "date": "2026-01-01", "amount": "100.00", "beat": "beatA",
+             "installments": [{"date": "2026-01-02", "amount": "20.00"}]},
+        ]})
+        status, body = self._post(sm, "/coll/add-voucher", {"payload": payload})
+        self.assertEqual(status, 200)
+        data = self._one_batch()
+        v = data["vouchers"][0]
+        self.assertEqual(v["salesman"], "sm1")
+        self.assertEqual(v["review_status"], "reviewed")
+        self.assertEqual(coll_orchestrate.addv_voucher_stage(v, data["flags"]), "awaiting_approval")
+        self.assertEqual(len(data["installments"]), 1)
+
+    def test_salesman_cannot_add_voucher_on_beat_not_their_own(self):
+        sm = self._login("sm1", "smpass1")
+        payload = json.dumps({"vouchers": [
+            {"bill_no": "V200", "date": "2026-01-01", "amount": "50.00", "beat": "beatB",
+             "installments": []},
+        ]})
+        status, body = self._post(sm, "/coll/add-voucher", {"payload": payload})
+        self.assertEqual(status, 200)
+        self.assertIn("alert-error", body)
+        self.assertEqual(coll_store.load_addv_batches(), [])
+
+    def test_supervisor_add_voucher_derives_salesman_from_beat_ignoring_client_value(self):
+        sup = self._login("sup1", "suppass1")
+        payload = json.dumps({"vouchers": [
+            {"bill_no": "V300", "date": "2026-01-01", "amount": "75.00", "beat": "beatA",
+             "salesman": "someone-else-entirely", "installments": []},
+        ]})
+        status, body = self._post(sup, "/coll/add-voucher", {"payload": payload})
+        self.assertEqual(status, 200)
+        data = self._one_batch()
+        v = data["vouchers"][0]
+        self.assertEqual(v["salesman"], "sm1")
+        self.assertEqual(v["review_status"], "pending")
+
+    def test_duplicate_bill_no_against_master_data_is_rejected(self):
+        self._add_voucher("DUP1", "beatA", "sm1")
+        dist = self._login("dist1", "distpass1")
+        payload = json.dumps({"vouchers": [
+            {"bill_no": "DUP1", "date": "2026-01-01", "amount": "10.00", "beat": "beatA",
+             "installments": []},
+        ]})
+        status, body = self._post(dist, "/coll/add-voucher", {"payload": payload})
+        self.assertEqual(status, 200)
+        self.assertIn("alert-error", body)
+        self.assertIn("already exists", body)
+        self.assertEqual(coll_store.load_addv_batches(), [])
+
+    def test_duplicate_bill_no_against_already_staged_batch_is_rejected(self):
+        dist = self._login("dist1", "distpass1")
+        first = json.dumps({"vouchers": [
+            {"bill_no": "STG1", "date": "2026-01-01", "amount": "10.00", "beat": "beatA",
+             "installments": []},
+        ]})
+        status, body = self._post(dist, "/coll/add-voucher", {"payload": first})
+        self.assertEqual(status, 200)
+        self.assertEqual(len(coll_store.load_addv_batches()), 1)
+
+        second = json.dumps({"vouchers": [
+            {"bill_no": "STG1", "date": "2026-01-01", "amount": "5.00", "beat": "beatA",
+             "installments": []},
+        ]})
+        status, body = self._post(dist, "/coll/add-voucher", {"payload": second})
+        self.assertEqual(status, 200)
+        self.assertIn("alert-error", body)
+        self.assertEqual(len(coll_store.load_addv_batches()), 1)
+
+    def test_installments_exceeding_voucher_amount_rejected(self):
+        dist = self._login("dist1", "distpass1")
+        payload = json.dumps({"vouchers": [
+            {"bill_no": "V400", "date": "2026-01-01", "amount": "50.00", "beat": "beatA",
+             "installments": [{"date": "2026-01-02", "amount": "60.00"}]},
+        ]})
+        status, body = self._post(dist, "/coll/add-voucher", {"payload": payload})
+        self.assertEqual(status, 200)
+        self.assertIn("alert-error", body)
+        self.assertEqual(coll_store.load_addv_batches(), [])
+
+    def test_failed_submit_preserves_payload_for_client_side_restore(self):
+        import html
+        dist = self._login("dist1", "distpass1")
+        payload = json.dumps({"vouchers": [
+            {"bill_no": "", "date": "2026-01-01", "amount": "10.00", "beat": "beatA",
+             "installments": []},
+        ]})
+        status, body = self._post(dist, "/coll/add-voucher", {"payload": payload})
+        self.assertEqual(status, 200)
+        self.assertIn("alert-error", body)
+        m = re.search(r'id="payload-field" value="([^"]*)"', body)
+        self.assertIsNotNone(m)
+        restored = json.loads(html.unescape(m.group(1)))
+        self.assertEqual(restored["vouchers"][0]["amount"], "10.00")
+
+    def test_empty_voucher_list_is_a_form_error(self):
+        dist = self._login("dist1", "distpass1")
+        status, body = self._post(dist, "/coll/add-voucher", {"payload": json.dumps({"vouchers": []})})
+        self.assertEqual(status, 200)
+        self.assertIn("alert-error", body)
+        self.assertEqual(coll_store.load_addv_batches(), [])
+
+    def test_get_form_restricts_beats_for_salesman_but_not_supervisor(self):
+        sm = self._login("sm1", "smpass1")
+        status, body = self._get(sm, "/coll/add-voucher")
+        self.assertEqual(status, 200)
+        self.assertIn('value="beatA" data-salesman="sm1"', body)
+        self.assertNotIn('value="beatB"', body)
+
+        sup = self._login("sup1", "suppass1")
+        status, body = self._get(sup, "/coll/add-voucher")
+        self.assertEqual(status, 200)
+        self.assertIn('value="beatA" data-salesman="sm1"', body)
+        self.assertIn('value="beatB" data-salesman="sm2"', body)
+
+
+class TestSearchVoucherCaseInsensitive(ApiTestCase):
+    """search_voucher (coll_data.py) uppercases its query, so a casual
+    lowercase search still finds a voucher — exercised here via the web
+    search route, which every bill_no lookup route shares."""
+
+    def setUp(self):
+        super().setUp()
+        self._add_user("dist1", "distributor", "distpass1")
+        self._add_beat("beatA", "sm1")
+        self._add_user("sm1", "salesman", "smpass1")
+        self._add_voucher("G100", "beatA", "sm1")
+
+    def test_lowercase_query_finds_uppercase_voucher(self):
+        dist = self._login("dist1", "distpass1")
+        status, body = self._get(dist, "/reports/search?q=g100")
+        self.assertEqual(status, 200)
+        self.assertIn("G100", body)
+        self.assertNotIn("No voucher found", body)
 
 
 if __name__ == "__main__":

@@ -868,7 +868,6 @@ def prompt_pending_addv_choice(batches):
     Returns: (index, action) where action is "continue" | "new" | "back".
              index is None when action is "new" or "back".
     """
-    from decimal import Decimal
     print("\n" + "-" * 50)
     print("Pending Voucher Batches")
     print("-" * 50)

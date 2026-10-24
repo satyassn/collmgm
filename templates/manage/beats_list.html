@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Manage Beats — CollMgm{% endblock %}
 {% block content %}
+{% set week_label = {'1': '1st', '2': '2nd', '3': '3rd', '4': '4th'} %}
 <h2 class="page-heading">Manage Beats</h2>
 
 {% if not beats %}
@@ -10,7 +11,7 @@
     {% for b in beats %}
     <li class="report-item">
       <span class="report-label">{{ b.name }}</span>
-      <span class="report-meta">Salesman: {{ b.salesman }}</span>
+      <span class="report-meta">Salesman: {{ b.salesman }} · {{ b.cadence | capitalize }}{% if b.cadence_day %} ({{ b.cadence_day | capitalize }}{% if b.cadence == 'monthly' and b.cadence_week %}, {{ week_label[b.cadence_week] }} week{% endif %}){% endif %}</span>
       <a class="btn btn-sm btn-secondary" href="/manage/beats/{{ b.name | urlencode }}/edit">Edit</a>
       <form method="post" action="/manage/beats/{{ b.name | urlencode }}/delete" style="display:inline">
         <button type="submit" class="btn btn-sm btn-danger"

@@ -22,14 +22,14 @@ from coll_orchestrate import (
 from coll_store import (
     STAGING_DIR, PRINTS_DIR,
     ensure_staging_dir, ensure_prints_dir, save_report_json,
-    write_collection_text, write_print_collection_txt, write_print_collection_html,
+    write_collection_text, write_print_collection_html,
     sanitize_filename_component,
     _load_installments,
     archive_files, cancel_staging_report,
     read_finalize_checkpoint,
     verify_user, _load_pending_start_reports, _load_pending_submit_reports,
     read_csv_file, load_all_existing_bill_nos, load_addv_staged_bill_nos,
-    load_addv_pending_confirm, load_addv_pending_finalize,
+    load_addv_pending_confirm, load_addv_pending_finalize, load_beats_raw,
     write_new_vouchers, write_new_installments,
     bill_no_sort_key,
 )
@@ -858,6 +858,7 @@ def run_add_vouchers_inline(current_user):
     existing_bill_nos = load_all_existing_bill_nos() | (load_addv_staged_bill_nos() - resumed_bill_nos)
     valid_beats = set(beats)
     valid_salesmen = set(salesmen)
+    beat_salesman_map = {b["name"]: b["salesman"] for b in load_beats_raw()}
     session_bill_nos = set()
     now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
@@ -901,6 +902,7 @@ def run_add_vouchers_inline(current_user):
             fields["bill_no"], fields["date"], fields["amount_str"],
             session_beat, salesman,
             all_existing, valid_beats, valid_salesmen,
+            beat_salesman_map=beat_salesman_map,
         )
         if errs:
             for e in errs:
@@ -1066,11 +1068,13 @@ def run_import_vouchers(current_user):
 
     existing_bill_nos = load_all_existing_bill_nos() | load_addv_staged_bill_nos()
     now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    beat_salesman_map = {b["name"]: b["salesman"] for b in load_beats_raw()}
 
     print("\nValidating...")
     errors, vouchers, installments = validate_addv_batch(
         voucher_rows, inst_rows, existing_bill_nos,
         set(beats), set(salesmen), current_user.name, now_str,
+        beat_salesman_map=beat_salesman_map,
     )
 
     if errors:

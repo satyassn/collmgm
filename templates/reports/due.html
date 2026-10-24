@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Beats Due — CollMgm{% endblock %}
+{% block content %}
+{% set week_label = {'1': '1st', '2': '2nd', '3': '3rd', '4': '4th'} %}
+{% macro cadence_text(row) -%}
+  {{ row.cadence | capitalize }}{% if row.cadence_day %} · {{ row.cadence_day | capitalize }}{% if row.cadence == 'monthly' and row.cadence_week %} ({{ week_label[row.cadence_week] }}){% endif %}{% endif %}
+{%- endmacro %}
+{% macro due_table(rows, empty_text) -%}
+  {% if rows %}
+  <div class="due-scroll">
+  <table class="due-table">
+    <thead><tr><th>Beat</th><th>Salesman</th><th>Cadence</th><th>Due</th><th>Based on</th></tr></thead>
+    <tbody>
+    {% for r in rows %}
+      <tr>
+        <td>{{ r.beat }}{% if r.in_progress %} <span class="badge badge-info">list in progress</span>{% endif %}</td>
+        <td>{{ r.salesman }}</td>
+        <td>{{ cadence_text(r) }}</td>
+        <td class="num">{{ r.next_due.strftime('%d %b %Y') if r.next_due else '—' }}</td>
+        <td class="num">{{ r.anchor.strftime('%d %b %Y') if r.anchor else 'no history' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <p class="empty-state">{{ empty_text }}</p>
+  {% endif %}
+{%- endmacro %}
+<h2 class="page-heading">Beats Due</h2>
+<p class="report-meta">Showing beats due today, overdue, or due within the next {{ window }} day{{ '' if window == 1 else 's' }} (as of {{ today.strftime('%d %b %Y') }}).</p>
+
+<form method="get" action="/reports/due" class="due-window">
+  <label for="days">Look ahead</label>
+  <select id="days" name="days" onchange="this.form.submit()">
+    {% for n in range(1, max_window + 1) %}
+    <option value="{{ n }}" {% if n == window %}selected{% endif %}>{{ n }} day{{ '' if n == 1 else 's' }}</option>
+    {% endfor %}
+  </select>
+  <noscript><button type="submit" class="btn btn-sm btn-secondary">Update</button></noscript>
+</form>
+
+<h3 class="page-heading" style="font-size:1.1rem;">Overdue <span class="report-meta">({{ due.overdue | length }})</span></h3>
+{{ due_table(due.overdue, 'No overdue beats.') }}
+
+<h3 class="page-heading" style="font-size:1.1rem;">Due today <span class="report-meta">({{ due.due_today | length }})</span></h3>
+{{ due_table(due.due_today, 'No beats due today.') }}
+
+<h3 class="page-heading" style="font-size:1.1rem;">Due within {{ window }} day{{ '' if window == 1 else 's' }} <span class="report-meta">({{ due.upcoming | length }})</span></h3>
+{{ due_table(due.upcoming, 'No beats due in this window.') }}
+
+<h3 class="page-heading" style="font-size:1.1rem;">Needs setup <span class="report-meta">({{ due.needs_setup | length }})</span></h3>
+{% if due.needs_setup %}
+<p class="report-meta">These beats are missing a collection day, or (monthly beats) a week of the month. Set them in Manage Beats.</p>
+{{ due_table(due.needs_setup, '') }}
+{% else %}
+<p class="empty-state">Every beat has a schedule.</p>
+{% endif %}
+
+<div class="action-row">
+  <a class="btn btn-secondary" href="/reports/pipeline">Collection Pipeline</a>
+  <a class="btn btn-secondary" href="/reports">Back to Reports</a>
+</div>
+{% endblock %}

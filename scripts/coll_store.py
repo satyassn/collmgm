@@ -28,11 +28,6 @@ STAGING_DIR = ROOT_DIR / "staging"
 ARCHIVE_DIR = ROOT_DIR / "archive"
 PRINTS_DIR = ROOT_DIR / "prints"
 
-_PRINT_COL_WIDTH = 28
-_PRINT_COL_SEP = " | "
-_PRINT_PAGE_HEIGHT = 66
-_PRINT_FILE_HEADER_LINES = 3
-
 
 def parse_decimal(value, default=Decimal("0")):
     """Lenient Decimal parse for report/display totals.
@@ -284,6 +279,24 @@ _CHECKS_COLUMNS = ["id", "installment_id", "bill_no", "beat", "salesman", "bank"
 
 _SCHEMA += f"CREATE TABLE IF NOT EXISTS checks ({_CHECKS_BODY});\n"
 
+# Collection Health settings (added after schema v1, same "deliberately NOT
+# in _TABLE_DDL_V1" rationale as corrections/amendments/amendment_requests —
+# a purely additive table, so CREATE IF NOT EXISTS via init_db() covers fresh
+# and already-installed DBs alike with no version bump needed). Single-row,
+# global (not per-beat) config for the Collection Health report: how many
+# days a voucher is allowed before it's overdue, and how to interpret that
+# against each beat's cadence. No PK — the app controls every write and
+# _backfill_settings_row() guarantees exactly one row exists.
+_SETTINGS_BODY = """
+    credit_period_days INTEGER NOT NULL DEFAULT 30,
+    visit_method        TEXT NOT NULL DEFAULT 'accurate'
+                         CHECK (visit_method IN ('accurate', 'approximate')),
+    zero_visit_bucket    TEXT NOT NULL DEFAULT 'yellow'
+                         CHECK (zero_visit_bucket IN ('red', 'yellow'))
+"""
+
+_SCHEMA += f"CREATE TABLE IF NOT EXISTS settings ({_SETTINGS_BODY});\n"
+
 
 class MigrationError(ValueError):
     """Existing rows violate the new schema constraints; the migration
@@ -313,11 +326,20 @@ def init_db():
         _backfill_payment_type_columns(conn)
         _backfill_check_permissions(conn)
         _backfill_supervisor_approve_new_vouchers(conn)
+        _backfill_credit_period_permission(conn)
+        _backfill_setup_gaps_permission(conn)
+        _backfill_settings_row(conn)
         conn.commit()
         _migrate_corrections_kinds(conn)
         if conn.execute("PRAGMA user_version").fetchone()[0] < 1:
             _migrate_schema_v1(conn)
         _migrate_payment_type_returns(conn)
+        # After the v1 rebuild: that rebuild copies only the v1 beats columns,
+        # so cadence must be added once it has run or it would be dropped.
+        _backfill_beat_cadence(conn)
+        _backfill_beat_cadence_week(conn)
+        _backfill_rename_fortnightly_cadence(conn)
+        conn.commit()
     finally:
         conn.close()
 
@@ -467,11 +489,18 @@ def _migrate_payment_type_returns(conn):
         conn.execute("PRAGMA foreign_keys=ON")
 
 
+def _add_column_if_missing(conn, table, column, ddl):
+    """Add `column` to `table` via ALTER TABLE if it isn't already there —
+    shared by the additive-column backfills below. `ddl` is the column's type
+    and constraint clause, e.g. "TEXT NOT NULL DEFAULT ''"."""
+    cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
 def _backfill_beats_salesman(conn):
     """Add beats.salesman if missing, then fill it in from data/beats.csv by name."""
-    cols = [r["name"] for r in conn.execute("PRAGMA table_info(beats)").fetchall()]
-    if "salesman" not in cols:
-        conn.execute("ALTER TABLE beats ADD COLUMN salesman TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(conn, "beats", "salesman", "TEXT NOT NULL DEFAULT ''")
     beats_csv = DATA_DIR / "beats.csv"
     if not beats_csv.exists():
         return
@@ -489,23 +518,42 @@ def _backfill_beats_salesman(conn):
         pass
 
 
+def _backfill_beat_cadence(conn):
+    """Add beats.cadence / cadence_day / cadence_start if missing (additive).
+    Existing beats become weekly with no collection day, so the due list shows
+    them as needing setup until the distributor picks one."""
+    _add_column_if_missing(conn, "beats", "cadence", "TEXT NOT NULL DEFAULT 'weekly'")
+    _add_column_if_missing(conn, "beats", "cadence_day", "TEXT NOT NULL DEFAULT ''")
+    _add_column_if_missing(conn, "beats", "cadence_start", "TEXT NOT NULL DEFAULT ''")
+
+
+def _backfill_beat_cadence_week(conn):
+    """Add beats.cadence_week if missing (additive) — which week of the month
+    (1st-4th) a monthly beat's collection day falls on. Existing monthly beats
+    are left blank (same "needs setup" treatment as a brand-new beat) rather
+    than guessing a week from their old fixed-date schedule."""
+    _add_column_if_missing(conn, "beats", "cadence_week", "TEXT NOT NULL DEFAULT ''")
+
+
+def _backfill_rename_fortnightly_cadence(conn):
+    """One-time data migration: 'fortnightly' is renamed to 'biweekly' (same
+    every-14-days behavior, just a clearer word) — existing beats must be
+    updated in place, unlike a Python-only rename."""
+    conn.execute("UPDATE beats SET cadence = 'biweekly' WHERE cadence = 'fortnightly'")
+
+
 def _backfill_secret_question_columns(conn):
     """Add users.secret_question / users.secret_answer_hash if missing
     (additive, nullable — existing accounts simply have no question set)."""
-    cols = [r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
-    for col in ("secret_question", "secret_answer_hash"):
-        if col not in cols:
-            conn.execute(f"ALTER TABLE users ADD COLUMN {col} TEXT")
+    _add_column_if_missing(conn, "users", "secret_question", "TEXT")
+    _add_column_if_missing(conn, "users", "secret_answer_hash", "TEXT")
 
 
 def _backfill_must_change_password(conn):
     """Add users.must_change_password if missing (additive column; defaults
     to 0/false for every pre-existing row — no forced change is retroactively
     imposed on already-provisioned accounts)."""
-    cols = [r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
-    if "must_change_password" not in cols:
-        conn.execute(
-            "ALTER TABLE users ADD COLUMN must_change_password INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "users", "must_change_password", "INTEGER NOT NULL DEFAULT 0")
 
 
 def _backfill_permissions(conn):
@@ -597,13 +645,8 @@ def _backfill_payment_type_columns(conn):
     if missing (additive columns; existing rows default to 'cash'/'' — no
     historical payment is retroactively reclassified)."""
     for table in ("installments", "completed_installments"):
-        cols = [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
-        if "payment_type" not in cols:
-            conn.execute(
-                f"ALTER TABLE {table} ADD COLUMN payment_type TEXT NOT NULL DEFAULT 'cash'")
-        if "payment_ref" not in cols:
-            conn.execute(
-                f"ALTER TABLE {table} ADD COLUMN payment_ref TEXT NOT NULL DEFAULT ''")
+        _add_column_if_missing(conn, table, "payment_type", "TEXT NOT NULL DEFAULT 'cash'")
+        _add_column_if_missing(conn, table, "payment_ref", "TEXT NOT NULL DEFAULT ''")
 
 
 def _backfill_supervisor_approve_new_vouchers(conn):
@@ -625,6 +668,32 @@ def _backfill_check_permissions(conn):
         [("salesman", "view_checks"), ("supervisor", "view_checks"),
          ("distributor", "view_checks"), ("distributor", "resolve_check")],
     )
+
+
+def _backfill_credit_period_permission(conn):
+    """One-time additive grant of manage_credit_period for DBs seeded before
+    it existed. Distributor-only, same as manage_beats/manage_users."""
+    conn.execute(
+        "INSERT OR IGNORE INTO permissions (role, action_key) VALUES (?, ?)",
+        ("distributor", "manage_credit_period"))
+
+
+def _backfill_setup_gaps_permission(conn):
+    """One-time additive grant of view_setup_gaps for DBs seeded before it
+    existed. Distributor-only, same as manage_credit_period."""
+    conn.execute(
+        "INSERT OR IGNORE INTO permissions (role, action_key) VALUES (?, ?)",
+        ("distributor", "view_setup_gaps"))
+
+
+def _backfill_settings_row(conn):
+    """Seed the single settings row (credit_period_days/visit_method/
+    zero_visit_bucket) if the table is empty. Column defaults alone don't
+    help here — a table with zero rows has nothing for get_db() queries to
+    select, so an explicit INSERT is needed, unlike the beats/users additive
+    columns above which attach to rows that already exist."""
+    if conn.execute("SELECT COUNT(*) FROM settings").fetchone()[0] == 0:
+        conn.execute("INSERT INTO settings DEFAULT VALUES")
 
 
 def _migrate_corrections_kinds(conn):
@@ -1143,9 +1212,11 @@ def change_own_password(name, current_password, new_password, confirm_password):
 # Beat lifecycle management
 # ---------------------------------------------------------------------------
 
-def create_beat(name, salesman):
+def create_beat(name, salesman, cadence="weekly", cadence_day="", cadence_week="",
+                cadence_start=""):
     """Raises ValueError for an empty/invalid name, an unknown/non-salesman
-    assignee, or a duplicate beat name."""
+    assignee, or a duplicate beat name. Cadence values are validated by the
+    caller (coll_data.validate_cadence) before this is reached."""
     name = _validate_new_name(name, "beat")
     salesman = (salesman or "").strip()
     conn = get_db()
@@ -1158,7 +1229,10 @@ def create_beat(name, salesman):
                 raise ValueError(f"unknown salesman {salesman!r}")
             try:
                 conn.execute(
-                    "INSERT INTO beats (name, salesman) VALUES (?, ?)", (name, salesman)
+                    "INSERT INTO beats"
+                    " (name, salesman, cadence, cadence_day, cadence_week, cadence_start)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
+                    (name, salesman, cadence, cadence_day, cadence_week, cadence_start),
                 )
             except sqlite3.IntegrityError:
                 raise ValueError(f"beat {name!r} already exists")
@@ -1189,6 +1263,54 @@ def update_beat_salesman(name, salesman):
         conn.close()
 
 
+def update_beat_cadence(name, cadence, cadence_day, cadence_week, cadence_start):
+    """Set a beat's collection cadence. Values are validated by the caller.
+    Raises ValueError for an unknown beat."""
+    conn = get_db()
+    try:
+        with conn:
+            cur = conn.execute(
+                "UPDATE beats SET cadence = ?, cadence_day = ?, cadence_week = ?,"
+                " cadence_start = ? WHERE name = ?",
+                (cadence, cadence_day, cadence_week, cadence_start, name),
+            )
+            if cur.rowcount == 0:
+                raise ValueError(f"beat {name!r} not found")
+    finally:
+        conn.close()
+
+
+def get_collection_health_settings():
+    """Return the single Collection Health settings row as a dict
+    (credit_period_days, visit_method, last_visit_color)."""
+    conn = get_db()
+    try:
+        row = conn.execute(
+            # zero_visit_bucket is the physical column name (unchanged — only
+            # its meaning broadened, not its stored values); aliased here so
+            # every caller works with the clearer last_visit_color name.
+            "SELECT credit_period_days, visit_method, zero_visit_bucket AS last_visit_color"
+            " FROM settings LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    return dict(row)
+
+
+def update_collection_health_settings(credit_period_days, visit_method, last_visit_color):
+    """Save the Collection Health settings. Values are validated by the
+    caller (coll_data.validate_collection_health_settings) before this is
+    reached, same division of labor as update_beat_cadence."""
+    conn = get_db()
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE settings SET credit_period_days = ?, visit_method = ?,"
+                " zero_visit_bucket = ?",
+                (credit_period_days, visit_method, last_visit_color))
+    finally:
+        conn.close()
+
+
 _BEAT_REFERENCE_QUERIES = [
     ("vouchers.beat",           "SELECT 1 FROM vouchers WHERE beat = ? LIMIT 1"),
     ("completed_vouchers.beat", "SELECT 1 FROM completed_vouchers WHERE beat = ? LIMIT 1"),
@@ -1198,6 +1320,19 @@ _BEAT_REFERENCE_QUERIES = [
 def beat_is_referenced(conn, name):
     """True if `name` appears as a beat on any current or historical voucher."""
     return any(conn.execute(sql, (name,)).fetchone() for _, sql in _BEAT_REFERENCE_QUERIES)
+
+
+def beats_with_vouchers():
+    """Set of every beat name that appears on any current or historical
+    voucher. Bulk sibling of beat_is_referenced, for reports that need the
+    whole picture at once rather than one beat at a time."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT beat FROM vouchers UNION SELECT beat FROM completed_vouchers").fetchall()
+    finally:
+        conn.close()
+    return {r["beat"] for r in rows}
 
 
 def delete_beat(name):
@@ -1238,12 +1373,15 @@ def load_vouchers_raw():
 
 
 def load_beats_raw():
-    """Return list of beat dicts (name, salesman) from the beats table."""
+    """Return list of beat dicts (name, salesman, cadence, cadence_day,
+    cadence_week, cadence_start) from the beats table."""
     if not _db_path().exists():
         return []
     conn = get_db()
     try:
-        rows = conn.execute("SELECT name, salesman FROM beats ORDER BY name").fetchall()
+        rows = conn.execute(
+            "SELECT name, salesman, cadence, cadence_day, cadence_week, cadence_start"
+            " FROM beats ORDER BY name").fetchall()
     finally:
         conn.close()
     return [dict(r) for r in rows]
@@ -1843,7 +1981,8 @@ def _validate_amendment_amount(raw, label):
     return str(d.quantize(Decimal("0.01")))
 
 
-def apply_voucher_amendment(bill_no, snapshot, new_state, amended_by, note="", now=None):
+def apply_voucher_amendment(bill_no, snapshot, new_state, amended_by, note="", now=None,
+                            new_bill_no=None):
     """Apply a full-state edit of one voucher + its installments as ONE
     atomic transaction: re-check the load-time snapshot (AmendmentConflict on
     drift), validate every field, mutate, recompute the balance (ValueError +
@@ -1858,7 +1997,21 @@ def apply_voucher_amendment(bill_no, snapshot, new_state, amended_by, note="", n
     load_installments_for_bill docstring): present in new_state -> UPDATE;
     id None -> INSERT (created_by=amended_by); present in snapshot but absent
     from new_state -> DELETE. Voucher balance is never taken from new_state —
-    always recomputed. Returns the new amendment dict.
+    always recomputed. Returns the new amendment dict (its `bill_no` is the
+    NEW number when one was given).
+
+    new_bill_no: optional voucher-number change. Format and the friendly
+    duplicate check are the caller's job (coll_api pre-validates with
+    coll_data.BILL_NO_RE + load_all_existing_bill_nos, same "last-gate
+    backstop" split as _validate_amendment_amount); this function re-checks
+    uniqueness against current master data as its own backstop, then renames
+    bill_no everywhere it appears — vouchers, installments (the only
+    FK-enforced reference; defer_foreign_keys lets the parent+child rename
+    land in one transaction regardless of statement order), and the
+    audit-trail tables (corrections, amendments — including the row this
+    call is about to insert, amendment_requests, checks) — so the voucher's
+    full history stays attached and discoverable under its corrected number,
+    rather than being orphaned under the old one.
     """
     now = now or datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     conn = get_db()
@@ -1904,6 +2057,13 @@ def apply_voucher_amendment(bill_no, snapshot, new_state, amended_by, note="", n
                     "SELECT 1 FROM users WHERE name = ? AND role = 'salesman'",
                     (new_salesman,)).fetchone() is None:
                 raise ValueError(f"unknown salesman {new_salesman!r}")
+
+            renaming = bool(new_bill_no) and new_bill_no != bill_no
+            if renaming and conn.execute(
+                    "SELECT 1 FROM vouchers WHERE bill_no = ? UNION"
+                    " SELECT 1 FROM completed_vouchers WHERE bill_no = ?",
+                    (new_bill_no, new_bill_no)).fetchone() is not None:
+                raise ValueError(f"voucher {new_bill_no!r} already exists")
 
             validated_rows = []
             for r in (new_state.get("installments") or []):
@@ -1958,14 +2118,28 @@ def apply_voucher_amendment(bill_no, snapshot, new_state, amended_by, note="", n
             after_insts = [dict(r) for r in conn.execute(
                 "SELECT id, date, amount, salesman FROM installments WHERE bill_no = ?"
                 " ORDER BY id", (bill_no,))]
-            new_json = json.dumps({"voucher": dict(after_v), "installments": after_insts})
-            old_json = json.dumps(snapshot)
+            # bill_no is recorded in the before/after snapshot (unlike the other
+            # voucher fields, it isn't part of the drift-check above) purely so
+            # a rename is visible in this amendment's own history — once the
+            # sweep below moves every historical row onto new_bill_no, nothing
+            # else remembers what the voucher used to be called.
+            old_json = json.dumps({**snapshot,
+                                   "voucher": {**(snapshot.get("voucher") or {}), "bill_no": bill_no}})
+            new_json = json.dumps({"voucher": {**dict(after_v), "bill_no": new_bill_no or bill_no},
+                                   "installments": after_insts})
 
             cur = conn.execute(
                 "INSERT INTO amendments (bill_no, old_json, new_json, note,"
                 " amended_by, amended_at) VALUES (?, ?, ?, ?, ?, ?)",
                 (bill_no, old_json, new_json, note or "", amended_by, now))
             aid = cur.lastrowid
+
+            if renaming:
+                conn.execute("PRAGMA defer_foreign_keys = ON")
+                for table in ("vouchers", "installments", "corrections", "amendments",
+                             "amendment_requests", "checks"):
+                    conn.execute(f"UPDATE {table} SET bill_no = ? WHERE bill_no = ?",
+                                (new_bill_no, bill_no))
     finally:
         conn.close()
     return load_amendment(aid)
@@ -2359,13 +2533,13 @@ def write_collection_text(path, beats, salesmen, vouchers, stage=None, status=No
         raise ValueError("No vouchers available to write to text report.")
 
     date_str = datetime.now().strftime("%Y-%m-%d")
-    bill_width = max(len("bill_no"), max(len(v["bill_no"]) for v in vouchers))
+    bill_width = max(len("voucher_no"), max(len(v["bill_no"]) for v in vouchers))
     vdate_width = max(len("voucher_date"), max(len(v.get("voucher_date", "")) for v in vouchers))
     balance_width = max(len("balance"), max(len(v["balance"]) for v in vouchers))
     payment_width = max(len("collection"), max(len(v.get("payment", "")) for v in vouchers))
 
     header = (
-        f"{ 'bill_no':<{bill_width}}  "
+        f"{ 'voucher_no':<{bill_width}}  "
         f"{ 'voucher_date':<{vdate_width}}  "
         f"{ 'balance':>{balance_width}}  "
         f"{ 'collection':>{payment_width}}"
@@ -2403,7 +2577,6 @@ def write_collection_text(path, beats, salesmen, vouchers, stage=None, status=No
 
 
 def sanitize_filename_component(value):
-    import re
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", value.strip())
     return safe or "unknown"
 
@@ -2411,7 +2584,6 @@ def sanitize_filename_component(value):
 def acquire_beat_lock(beat_name):
     """Atomically claim a beat. Returns True if acquired, False if already locked."""
     ensure_staging_dir()
-    import re
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", beat_name.strip()) or "unknown"
     path = STAGING_DIR / f".beatlock-{safe}.lock"
     try:
@@ -2423,7 +2595,6 @@ def acquire_beat_lock(beat_name):
 
 def release_beat_lock(beat_name):
     """Release a previously acquired beat lock."""
-    import re
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", beat_name.strip()) or "unknown"
     path = STAGING_DIR / f".beatlock-{safe}.lock"
     path.unlink(missing_ok=True)
@@ -2564,80 +2735,6 @@ def archive_files(paths):
 # Print / HTML generation (unchanged)
 # ---------------------------------------------------------------------------
 
-def _build_print_column(report_data, bal_width, coll_width):
-    W = _PRINT_COL_WIDTH
-    sel_type = report_data.get("selection_type", "beat")
-    sel = report_data.get("selection", [])
-
-    if sel_type == "beat_salesman" and len(sel) >= 2:
-        sal_width = max(1, W - len(sel[0]) - 2)
-        heading = f"{sel[0]}  {sel[1]:>{sal_width}}"
-    elif sel_type == "beat":
-        heading = ",".join(sel)
-    else:
-        heading = ",".join(sel)
-
-    dash = "-" * W
-    col_hdr = f"{'Bill No':<7} {'Balance':>{bal_width}} {'Coll':>{coll_width}}"
-
-    vouchers = report_data.get("vouchers", [])
-    total_vouchers = len(vouchers)
-    total_bal = sum(parse_decimal(v.get("balance")) for v in vouchers)
-    summary = f"#:{total_vouchers}  Bal:{total_bal}"
-
-    lines = [
-        heading[:W].ljust(W),
-        col_hdr[:W].ljust(W),
-        dash,
-    ]
-    for v in sorted(vouchers, key=lambda v: bill_no_sort_key(v["bill_no"])):
-        bill = v["bill_no"][-7:]
-        bal = v.get("balance", "")
-        pay = v.get("payment", "") or ""
-        row = f"{bill:<7} {bal:>{bal_width}} {pay:>{coll_width}}"
-        lines.append(row[:W].ljust(W))
-    lines.append(summary[:W].ljust(W))
-    return lines
-
-
-def write_print_collection_txt(output_path, reports_data):
-    if not reports_data:
-        return
-
-    all_vouchers = [v for r in reports_data for v in r.get("vouchers", [])]
-    bal_width = max(
-        len("Balance"),
-        max((len(v.get("balance", "")) for v in all_vouchers), default=0),
-    )
-    coll_width = max(4, _PRINT_COL_WIDTH - 7 - 1 - bal_width - 1)
-
-    columns = [_build_print_column(r, bal_width, coll_width) for r in reports_data]
-    num_cols = len(columns)
-    max_rows = max(len(c) for c in columns)
-
-    for col in columns:
-        while len(col) < max_rows:
-            col.append(" " * _PRINT_COL_WIDTH)
-
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    full_width = _PRINT_COL_WIDTH * num_cols + len(_PRINT_COL_SEP) * (num_cols - 1)
-    eq_sep = "=" * full_width
-    title_line = f"{'COLLECTION LIST':<{full_width - 10}}{date_str:>10}"
-
-    output_lines = [eq_sep, title_line, eq_sep]
-    remaining = _PRINT_PAGE_HEIGHT - _PRINT_FILE_HEADER_LINES
-
-    for row_idx in range(max_rows):
-        if remaining <= 0:
-            output_lines.append("\f")
-            remaining = _PRINT_PAGE_HEIGHT
-        output_lines.append(_PRINT_COL_SEP.join(col[row_idx] for col in columns))
-        remaining -= 1
-
-    with output_path.open("w", encoding="utf-8") as f:
-        f.write("\n".join(output_lines) + "\n")
-
-
 def _build_html_column(report_data):
     sel_type = report_data.get("selection_type", "beat")
     sel = report_data.get("selection", [])
@@ -2667,17 +2764,16 @@ def _build_html_column(report_data):
     return (
         f'<div class="col-heading"><span>{heading}</span><span class="cnt">#{total_vouchers}</span></div>\n'
         f"<table>\n"
-        f'<colgroup><col style="width:13mm"><col style="width:16mm"><col style="width:24mm"></colgroup>\n'
+        f'<colgroup><col style="width:30%"><col style="width:32%"><col style="width:38%"></colgroup>\n'
         f"<thead><tr>"
-        f"<td>Bill No</td>"
+        f"<td>Voucher</td>"
         f'<td class="num">Balance</td>'
         f'<td class="num coll">Coll</td>'
         f"</tr></thead>\n"
-        f"<tbody>\n{rows_html}</tbody>\n"
-        f"<tfoot><tr>"
-        f'<td colspan="2">Bal:{total_bal}</td>'
-        f'<td class="num coll">{coll_str}</td>'
-        f"</tr></tfoot>\n"
+        f"<tbody>\n{rows_html}"
+        f'<tr class="tot"><td colspan="2">Bal:{total_bal}</td>'
+        f'<td class="num coll">{coll_str}</td></tr>\n'
+        f"</tbody>\n"
         f"</table>"
     )
 
@@ -2704,19 +2800,19 @@ def build_print_collection_html(reports_data, auto_print=False):
 <meta charset="utf-8">
 <title>Collection List {date_str}</title>
 <style>
-  @page {{ margin: 10mm 8mm; }}
+  @page {{ size: A4; margin: 2mm; }}
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{
     font-family: -apple-system, 'Segoe UI', Arial, sans-serif;
     font-size: 11pt;
-    line-height: 1.25;
+    line-height: 1.1;
     color: #14181f;
   }}
   .page-header {{
     display: flex;
     justify-content: space-between;
     font-weight: bold;
-    font-size: 13pt;
+    font-size: 14pt;
     border-bottom: 2px solid #000;
     padding-bottom: 3px;
     margin-bottom: 6px;
@@ -2740,7 +2836,7 @@ def build_print_collection_html(reports_data, auto_print=False):
     justify-content: space-between;
     align-items: baseline;
     font-weight: bold;
-    font-size: 10.5pt;
+    font-size: 12pt;
     border-bottom: 1px solid #000;
     padding-bottom: 2px;
     margin-bottom: 3px;
@@ -2748,26 +2844,31 @@ def build_print_collection_html(reports_data, auto_print=False):
   .col-heading .cnt {{
     font-weight: 600;
     color: #5b6472;
-    font-size: 9.5pt;
+    font-size: 11pt;
   }}
   table {{
     width: 100%;
     border-collapse: collapse;
     table-layout: fixed;
   }}
+  thead {{ display: table-header-group; }}
+  tr {{ break-inside: avoid; }}
+  tbody tr:nth-last-child(2) {{ break-after: avoid; }}
   thead td {{
     font-weight: bold;
     border-bottom: 1px solid #000;
     padding: 0 0 3px 0;
   }}
   tbody td {{
-    padding: 4.5pt 0;
+    padding: 4pt 0;
     white-space: nowrap;
   }}
-  tfoot td {{
+  /* Total is a body row, not a tfoot: browsers repeat tfoot on every page,
+     which would print the whole-column Bal on page 1 as well. */
+  .tot td {{
     font-weight: bold;
     border-top: 1px solid #000;
-    padding: 4pt 0 0 0;
+    padding: 3pt 0 0 0;
   }}
   .num {{ text-align: right; padding-right: 4px; }}
   .bill {{ border-right: 1px solid #c7cbd1; padding-right: 4px; }}
@@ -2811,6 +2912,34 @@ def read_csv_file(path):
         if not reader.fieldnames:
             raise ValueError(f"File appears empty or has no header: {path}")
         return list(reader.fieldnames), rows
+
+
+def _load_coll_report_files(folder):
+    """(path, data) pairs for collection-list JSON in `folder`. The
+    -installments.json sidecars share the coll* prefix but hold no
+    selection_type/stages, so they are skipped."""
+    if not folder.exists():
+        return []
+    result = []
+    for path in sorted(folder.glob("coll*.json")):
+        try:
+            with path.open(encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        if isinstance(data, dict) and "selection_type" in data and "stages" in data:
+            result.append((path, data))
+    return result
+
+
+def load_staged_coll_reports():
+    """(path, data) for every collection list still in staging/."""
+    return _load_coll_report_files(STAGING_DIR)
+
+
+def load_archived_coll_reports():
+    """(path, data) for every collection list moved to archive/ (posted)."""
+    return _load_coll_report_files(ARCHIVE_DIR)
 
 
 def load_addv_staged_bill_nos():

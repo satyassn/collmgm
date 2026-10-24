@@ -1,6 +1,6 @@
 ## Project overview
 
-`collmgm` is a Windows collection-management tool — CLI and a LAN-hosted mobile-responsive web app, both backed by the same SQLite-backed store. It handles the full field-collection workflow — generating voucher lists, salesman submission, supervisor approval, and distributor posting — with role-based access control.
+`collmgm` is a Windows collection-management tool: a LAN-hosted, mobile-responsive web app backed by SQLite. It handles the full field-collection workflow — generating voucher lists, salesman submission, supervisor approval, and distributor posting — with role-based access control. An original terminal CLI still exists in the repo but is deprecated and no longer installed by default (see `CLAUDE.md`).
 
 The web app additionally supports a physical-voucher verification workflow and a correction-request system on both supervisor approval screens (see `roadmap.md`).
 

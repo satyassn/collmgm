@@ -4,7 +4,7 @@
 {% from "_vcard.html" import vcard %}
 <h2 class="page-heading">Approve New Vouchers</h2>
 <p class="muted vc-intro">Every voucher the salesman has reviewed or flagged is listed here — you don't have to wait for the rest of the batch.
-  Tap a bill number to see its installments and tally it against the physical voucher. Use <strong>Issues</strong> to raise
+  Tap a voucher number to see its installments and tally it against the physical voucher. Use <strong>Issues</strong> to raise
   something the salesman missed, or to correct or withdraw one he raised. Once approved, a voucher goes to the distributor
   (to resolve any open issue, then post).
   {% if counts.pending_review %}{{ counts.pending_review }} voucher{{ "s" if counts.pending_review != 1 }} still waiting for salesman review.{% endif %}

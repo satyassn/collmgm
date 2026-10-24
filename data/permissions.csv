@@ -36,3 +36,5 @@ distributor,apply_correction
 distributor,amend_voucher
 distributor,view_checks
 distributor,resolve_check
+distributor,manage_credit_period
+distributor,view_setup_gaps

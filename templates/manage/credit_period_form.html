@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Credit Period — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Credit Period</h2>
+<p class="report-meta">These settings drive the Collection Health report.</p>
+
+{% if error %}<p class="alert alert-error">{{ error }}</p>{% endif %}
+
+<form method="post" action="/manage/credit-period" class="card">
+
+  <label class="field-label">Credit period (days)
+    <input type="number" name="credit_period_days" min="1" step="1"
+           value="{{ settings.credit_period_days }}" required>
+  </label>
+  <p class="report-meta">How many days a voucher is allowed before it's considered overdue.</p>
+
+  <label class="field-label">Visit counting method
+    <select name="visit_method">
+      <option value="accurate" {% if settings.visit_method == 'accurate' %}selected{% endif %}>Accurate schedule simulation</option>
+      <option value="approximate" {% if settings.visit_method == 'approximate' %}selected{% endif %}>Simple fixed-interval approximation</option>
+    </select>
+  </label>
+  <p class="report-meta">
+    <strong>Accurate schedule simulation</strong> walks each beat's actual visit calendar (the specific weekday for weekly and biweekly beats, weekday + week-of-month for monthly beats) to count how many visits will really happen before the credit period runs out. More precise, especially for beats with a specific collection day or an old last-visit date.<br>
+    <strong>Simple fixed-interval approximation</strong> treats a visit as happening every 7 / 14 / 30 days (weekly / biweekly / monthly) and divides the days left before the credit period expires by that interval. Simpler to reason about, but can be off by several days for beats with a specific visit day or irregular history.
+  </p>
+
+  <label class="field-label">Last-chance visit color
+    <select name="last_visit_color">
+      <option value="yellow" {% if settings.last_visit_color == 'yellow' %}selected{% endif %}>Yellow (default)</option>
+      <option value="red" {% if settings.last_visit_color == 'red' %}selected{% endif %}>Red</option>
+    </select>
+  </label>
+  <p class="report-meta">
+    Every open voucher is checked against how many scheduled beat visits remain before its credit period runs out. This setting decides how to color the <strong>one visit that is the last realistic chance to collect in time</strong> — and the rest of the coloring shifts to match:<br>
+    <strong>Yellow (default)</strong>: 2 or more visits remaining is Green, and both "exactly 1 visit remaining" (the last chance) and "no visit scheduled before the deadline at all" are shown as Yellow — a warning, not yet urgent. The voucher only turns Red once the credit period has actually run out with no payment.<br>
+    <strong>Red</strong>: 3 or more visits remaining is Green, exactly 2 is Yellow (one visit's warning <em>before</em> the last chance), and both "exactly 1 visit remaining" and "none scheduled" turn Red right away — don't wait for the deadline to actually pass.
+  </p>
+
+  <div class="action-row">
+    <button type="submit" class="btn btn-primary">Save</button>
+    <a class="btn btn-secondary" href="/menu">Back to Menu</a>
+  </div>
+</form>
+{% endblock %}

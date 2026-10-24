@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}Onboarding Pipeline — CollMgm{% endblock %}
+{% block content %}
+{% from "reports/_pipeline_macros.html" import age_text, stage_list %}
+{% macro onboarding_card(it) -%}
+  <div class="pipe-card{% if it.stale %} stale{% endif %}">
+    <div class="pipe-card-top">
+      <span class="pipe-card-name">{{ it.batch }}</span>
+      <span class="pipe-age">{{ age_text(it.age_days) }}</span>
+    </div>
+    <div class="pipe-meta">
+      <span>{{ it.salesmen | join(', ') or 'No salesman' }}</span>
+      <span>{{ it.bills }} voucher{{ '' if it.bills == 1 else 's' }}</span>
+      <span class="pipe-money">Bal {{ '{:,.2f}'.format(it.balance) }}</span>
+    </div>
+    {% if it.open_flags %}<span class="badge badge-warn">{{ it.open_flags }} open issue{{ '' if it.open_flags == 1 else 's' }}</span>{% endif %}
+  </div>
+{%- endmacro %}
+
+<h2 class="page-heading">Onboarding Pipeline</h2>
+<p class="report-meta">As of {{ today.strftime('%d %b %Y') }}. Vouchers imported at Import Vouchers, grouped by stage — one card per batch per stage, since vouchers in a batch move independently. Tap a stage to see what is waiting there. Amber cards have waited more than 2 days.</p>
+
+{% set ns = namespace(cards=0) %}
+{% for key, label in onboarding_stages %}
+  {% set ns.cards = ns.cards + (pipeline[key] | length) %}
+{% endfor %}
+<div class="card pipe-summary">
+  <div><strong>{{ ns.cards }}</strong> <span class="report-meta">batch stages with items waiting</span></div>
+</div>
+
+{{ stage_list(onboarding_stages, pipeline, onboarding_card) }}
+
+<div class="action-row">
+  <a class="btn btn-secondary" href="/reports">Back to Reports</a>
+  <a class="btn btn-secondary" href="/reports/pipeline">Collection Pipeline</a>
+  <a class="btn btn-secondary" href="/coll/new-vouchers">Onboarding Batches</a>
+</div>
+{% endblock %}

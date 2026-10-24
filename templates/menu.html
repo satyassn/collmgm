@@ -121,14 +121,14 @@
       <p class="menu-help-text" id="help-checks" hidden>Track checks received as payment — due soon, overdue, or bounced.</p>
     </div>
   {% endif %}
-  {% if "import_vouchers" in perms %}
+  {% if "add_vouchers" in perms %}
     <div class="menu-card-wrap">
-      <a class="menu-card" href="/coll/import-vouchers">
-        <span class="menu-icon">&#128228;</span>
-        <span>Import Vouchers</span>
+      <a class="menu-card" href="/coll/add-voucher">
+        <span class="menu-icon">&#128221;</span>
+        <span>Add New Voucher</span>
       </a>
-      <button type="button" class="menu-help-toggle" aria-expanded="false" aria-controls="help-import-vouchers" aria-label="What does this do?">?</button>
-      <p class="menu-help-text" id="help-import-vouchers" hidden>Bring a batch of existing vouchers, and any payments already made on them, into the system from a CSV file.</p>
+      <button type="button" class="menu-help-toggle" aria-expanded="false" aria-controls="help-add-voucher" aria-label="What does this do?">?</button>
+      <p class="menu-help-text" id="help-add-voucher" hidden>Enter an existing voucher and its installments by hand, one at a time, for review like any other onboarded voucher.</p>
     </div>
   {% endif %}
   {% if "import_vouchers" in perms or "raise_correction" in perms or "approve_new_vouchers" in perms or "amend_voucher" in perms or "post_new_vouchers" in perms %}

@@ -1,0 +1,267 @@
+{% extends "base.html" %}
+{% block title %}Add New Voucher — CollMgm{% endblock %}
+{% block content %}
+<h2 class="page-heading">Add New Voucher</h2>
+
+{% if error %}<p class="alert alert-error">{{ error }}</p>{% endif %}
+
+<div class="card">
+  <fieldset>
+    <legend class="group-heading">For This Batch</legend>
+    <div class="field-row">
+      <label class="field-label">Date
+        <input type="date" id="v-date" value="{{ today }}">
+      </label>
+      <label class="field-label">Beat
+        <select id="v-beat">
+          <option value="">— Select a beat —</option>
+          {% for b in beats %}
+          <option value="{{ b.name }}" data-salesman="{{ b.salesman }}">{{ b.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="field-label">Salesman
+        <input type="text" id="v-salesman" class="mono" readonly>
+      </label>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend class="group-heading">Voucher</legend>
+    <label class="field-label">Voucher
+      <input type="text" id="v-bill-no" autocomplete="off">
+    </label>
+    <label class="field-label">Amount
+      <input type="text" id="v-amount" inputmode="decimal" class="mono" autocomplete="off">
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend class="group-heading">Installments</legend>
+    <div class="table-wrapper">
+      <table class="data-table card-table" id="inst-table">
+        <thead><tr><th>Date</th><th class="num">Amount</th><th></th></tr></thead>
+        <tbody id="inst-tbody"></tbody>
+      </table>
+    </div>
+    <p class="vc-strip-empty" id="inst-empty">No installments added yet.</p>
+    <button type="button" class="btn btn-sm btn-secondary" id="add-inst-btn">Add Installment</button>
+  </fieldset>
+
+  <div class="summary-box">
+    <span>Balance for this voucher</span>
+    <span class="summary-total mono balance-preview" id="balance-preview">0.00</span>
+  </div>
+
+  <div class="action-row">
+    <button type="button" class="btn btn-primary" id="add-voucher-btn">Add Voucher to List</button>
+  </div>
+</div>
+
+<h3 class="group-heading">Vouchers Entered (<span id="voucher-count">0</span>)</h3>
+<div class="vc-strip" id="voucher-strip"></div>
+<p class="vc-strip-empty" id="strip-empty">No vouchers added yet.</p>
+
+<form method="post" action="/coll/add-voucher" class="action-row" id="submit-form">
+  <input type="hidden" name="payload" id="payload-field" value="{{ payload_json or '' }}">
+  <button type="submit" class="btn btn-primary" id="submit-all-btn" disabled>Submit All Vouchers</button>
+  <a class="btn btn-secondary" href="/menu">Cancel</a>
+</form>
+
+<script>
+(function () {
+  var beatSelect = document.getElementById("v-beat");
+  var salesmanField = document.getElementById("v-salesman");
+  var billNoField = document.getElementById("v-bill-no");
+  var dateField = document.getElementById("v-date");
+  var amountField = document.getElementById("v-amount");
+  var instTbody = document.getElementById("inst-tbody");
+  var instEmpty = document.getElementById("inst-empty");
+  var balancePreview = document.getElementById("balance-preview");
+  var addInstBtn = document.getElementById("add-inst-btn");
+  var addVoucherBtn = document.getElementById("add-voucher-btn");
+  var strip = document.getElementById("voucher-strip");
+  var stripEmpty = document.getElementById("strip-empty");
+  var countEl = document.getElementById("voucher-count");
+  var payloadField = document.getElementById("payload-field");
+  var submitBtn = document.getElementById("submit-all-btn");
+  var submitForm = document.getElementById("submit-form");
+
+  var currentInstallments = [];
+  var state = { vouchers: [] };
+
+  // Bill numbers already in the system (vouchers/completed_vouchers) or
+  // staged in any addv batch — the same set coll_data.validate_single_voucher
+  // checks against at final Submit (coll_api.coll_add_voucher_submit), handed
+  // to the page so "Add Voucher to List" can catch a duplicate immediately
+  // instead of only at the end. Grows as vouchers are added to this batch,
+  // shrinks as they're removed, so it stays accurate for the whole session.
+  var existingBillNos = new Set({{ existing_bill_nos_json | safe }});
+
+  // Restore whatever was entered before a failed submit — the server hands
+  // the same posted JSON straight back in this field's value.
+  try {
+    if (payloadField.value) {
+      var restored = JSON.parse(payloadField.value);
+      if (restored && Array.isArray(restored.vouchers)) state.vouchers = restored.vouchers;
+    }
+  } catch (e) { /* malformed restore — start empty, error banner already explains why */ }
+  state.vouchers.forEach(function (v) { existingBillNos.add(v.bill_no); });
+
+  function renderInstallments() {
+    instTbody.innerHTML = "";
+    instEmpty.hidden = currentInstallments.length > 0;
+    currentInstallments.forEach(function (inst, i) {
+      var tr = document.createElement("tr");
+      tr.innerHTML =
+        '<td data-label="Date"><input type="date" class="inst-date"></td>' +
+        '<td data-label="Amount"><input type="text" inputmode="decimal" class="mono inst-amount" autocomplete="off"></td>' +
+        '<td data-label=""><button type="button" class="btn btn-sm btn-secondary inst-remove">Remove</button></td>';
+      tr.querySelector(".inst-date").value = inst.date || "";
+      tr.querySelector(".inst-amount").value = inst.amount || "";
+      tr.querySelector(".inst-date").addEventListener("input", function (e) { inst.date = e.target.value; });
+      tr.querySelector(".inst-amount").addEventListener("input", function (e) { inst.amount = e.target.value; recalcBalance(); });
+      tr.querySelector(".inst-remove").addEventListener("click", function () {
+        currentInstallments.splice(i, 1);
+        renderInstallments();
+        recalcBalance();
+      });
+      instTbody.appendChild(tr);
+    });
+  }
+
+  function recalcBalance() {
+    var amt = parseFloat(amountField.value);
+    if (isNaN(amt)) amt = 0;
+    var total = currentInstallments.reduce(function (sum, inst) {
+      var v = parseFloat(inst.amount);
+      return sum + (isNaN(v) ? 0 : v);
+    }, 0);
+    var balance = amt - total;
+    balancePreview.textContent = balance.toFixed(2);
+    balancePreview.classList.toggle("negative", balance < 0);
+  }
+
+  function todayStr() {
+    var d = new Date();
+    var mm = String(d.getMonth() + 1).padStart(2, "0");
+    var dd = String(d.getDate()).padStart(2, "0");
+    return d.getFullYear() + "-" + mm + "-" + dd;
+  }
+
+  addInstBtn.addEventListener("click", function () {
+    currentInstallments.push({ date: dateField.value || todayStr(), amount: "" });
+    renderInstallments();
+  });
+  amountField.addEventListener("input", recalcBalance);
+  beatSelect.addEventListener("change", function () {
+    var opt = beatSelect.selectedOptions[0];
+    salesmanField.value = opt ? (opt.getAttribute("data-salesman") || "") : "";
+  });
+
+  function voucherCardHtml(v) {
+    var paid = (v.installments || []).reduce(function (sum, inst) {
+      var n = parseFloat(inst.amount);
+      return sum + (isNaN(n) ? 0 : n);
+    }, 0);
+    var amt = parseFloat(v.amount) || 0;
+    var bal = amt - paid;
+    return (
+      '<div class="vc-line">' +
+        '<div class="vc-id">' +
+          '<div class="vc-head"><span class="vc-bill vc-bill--plain">' + v.bill_no + '</span></div>' +
+          '<div class="vc-meta"><span>' + v.beat + '</span><span>' + v.salesman + '</span><span>' + v.date + '</span></div>' +
+        '</div>' +
+        '<div class="vc-figs">' +
+          '<small>Amt</small><b>' + amt.toFixed(2) + '</b>' +
+          '<small>Paid</small><b>' + paid.toFixed(2) + '</b>' +
+          '<small class="is-bal">Bal</small><b class="is-bal">' + bal.toFixed(2) + '</b>' +
+        '</div>' +
+      '</div>' +
+      '<div class="vc-actions"><button type="button" class="btn btn-sm btn-secondary vc-remove">Remove</button></div>'
+    );
+  }
+
+  function renderStrip() {
+    strip.innerHTML = "";
+    stripEmpty.hidden = state.vouchers.length > 0;
+    countEl.textContent = state.vouchers.length;
+    submitBtn.disabled = state.vouchers.length === 0;
+    state.vouchers.forEach(function (v, i) {
+      var card = document.createElement("article");
+      card.className = "vc vc--min";
+      card.innerHTML = '<div class="vc-body">' + voucherCardHtml(v) + '</div>';
+      card.querySelector(".vc-remove").addEventListener("click", function () {
+        existingBillNos.delete(state.vouchers[i].bill_no);
+        state.vouchers.splice(i, 1);
+        renderStrip();
+      });
+      strip.appendChild(card);
+    });
+  }
+
+  function resetEntryPanel() {
+    // Date/Beat/Salesman are common to the whole batch — leave them as the
+    // user set them so the next voucher inherits them. Only the per-voucher
+    // fields reset.
+    billNoField.value = "";
+    amountField.value = "";
+    currentInstallments = [];
+    renderInstallments();
+    recalcBalance();
+    billNoField.focus();
+  }
+
+  addVoucherBtn.addEventListener("click", function () {
+    var billNo = billNoField.value.trim().toUpperCase();
+    var beat = beatSelect.value;
+    var today = todayStr();
+    if (!billNo) { alert("Enter a Voucher."); return; }
+    if (existingBillNos.has(billNo)) { alert("Voucher '" + billNo + "' already exists."); return; }
+    if (!dateField.value) { alert("Enter a date."); return; }
+    if (dateField.value > today) { alert("Date '" + dateField.value + "' is in the future."); return; }
+    if (!amountField.value || isNaN(parseFloat(amountField.value))) { alert("Enter a valid amount."); return; }
+    if (!beat) { alert("Select a beat."); return; }
+    var instTotal = 0;
+    for (var j = 0; j < currentInstallments.length; j++) {
+      var inst = currentInstallments[j];
+      if (!inst.date) { alert("Installment " + (j + 1) + ": enter a date, or remove the row."); return; }
+      if (inst.date > today) {
+        alert("Installment " + (j + 1) + ": date '" + inst.date + "' is in the future.");
+        return;
+      }
+      if (!inst.amount || isNaN(parseFloat(inst.amount))) {
+        alert("Installment " + (j + 1) + ": enter a valid amount, or remove the row.");
+        return;
+      }
+      instTotal += parseFloat(inst.amount);
+    }
+    var voucherAmount = parseFloat(amountField.value);
+    if (instTotal > voucherAmount) {
+      alert("Total installments (" + instTotal.toFixed(2) + ") exceed amount (" +
+            voucherAmount.toFixed(2) + ").");
+      return;
+    }
+    existingBillNos.add(billNo);
+    state.vouchers.push({
+      bill_no: billNo,
+      date: dateField.value,
+      amount: amountField.value,
+      beat: beat,
+      salesman: salesmanField.value,
+      installments: currentInstallments.map(function (i) { return { date: i.date, amount: i.amount }; }),
+    });
+    renderStrip();
+    resetEntryPanel();
+  });
+
+  submitForm.addEventListener("submit", function () {
+    payloadField.value = JSON.stringify({ vouchers: state.vouchers });
+  });
+
+  renderInstallments();
+  recalcBalance();
+  renderStrip();
+})();
+</script>
+{% endblock %}

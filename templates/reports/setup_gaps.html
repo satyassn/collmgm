@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}Setup Gaps — CollMgm{% endblock %}
+{% block content %}
+{% set badge_label = {"no_salesman": "No salesman", "no_cadence": "No cadence", "no_vouchers": "No vouchers"} %}
+{% set badge_class = {"no_salesman": "badge-error", "no_cadence": "badge-error", "no_vouchers": "badge-warn"} %}
+<h2 class="page-heading">Setup Gaps</h2>
+<p class="report-meta">What's missing to run every beat end to end, as of {{ today.strftime('%d %b %Y') }}. Recalculated fresh each time you open this page.</p>
+
+{% if gaps.all_clear %}
+<p class="empty-state">No setup gaps found — the product is fully operational.</p>
+{% else %}
+
+<h3 class="page-heading" style="font-size:1.1rem;">Blocking setup</h3>
+{% set b = gaps.blocking %}
+{% if b.no_beats %}
+<p class="alert alert-warn">No beats created yet. <a href="/manage/beats">Manage Beats</a></p>
+{% endif %}
+{% if b.no_supervisor %}
+<p class="alert alert-warn">No supervisor account exists — approvals can't happen. <a href="/manage/users">Manage Users</a></p>
+{% endif %}
+{% if b.no_salesman_user %}
+<p class="alert alert-warn">No salesman account exists — collection lists can't be generated. <a href="/manage/users">Manage Users</a></p>
+{% endif %}
+{% if b.no_salesman_beats %}
+<p class="alert alert-warn">
+  {{ b.no_salesman_beats | length }} beat{{ '' if b.no_salesman_beats | length == 1 else 's' }} with no salesman assigned:
+  {{ b.no_salesman_beats | join(', ') }}. <a href="/manage/beats">Manage Beats</a>
+</p>
+{% endif %}
+{% if b.needs_cadence_beats %}
+<p class="alert alert-warn">
+  {{ b.needs_cadence_beats | length }} beat{{ '' if b.needs_cadence_beats | length == 1 else 's' }} with no cadence set:
+  {{ b.needs_cadence_beats | map(attribute='beat') | join(', ') }}. <a href="/reports/due">Beats Due</a>
+</p>
+{% endif %}
+{% if not (b.no_beats or b.no_supervisor or b.no_salesman_user or b.no_salesman_beats or b.needs_cadence_beats) %}
+<p class="empty-state">Nothing blocking — every beat has a salesman and a cadence.</p>
+{% endif %}
+
+<h3 class="page-heading" style="font-size:1.1rem;">Data-feed gaps</h3>
+{% set no_v = gaps.data_feed.no_voucher_beats %}
+{% if no_v %}
+<p class="alert alert-warn">
+  {{ no_v | length }} beat{{ '' if no_v | length == 1 else 's' }} with no vouchers fed in yet:
+  {{ no_v | join(', ') }}. <a href="/coll/import-vouchers">Import Vouchers</a> &middot; <a href="/coll/add-voucher">Add New Voucher</a>
+</p>
+{% else %}
+<p class="empty-state">Every beat has at least one voucher recorded or in progress.</p>
+{% endif %}
+
+<h3 class="page-heading" style="font-size:1.1rem;">Staged in-progress work</h3>
+{% set s = gaps.stale %}
+{% if s.collection_count or s.onboarding_count %}
+<p class="alert alert-warn">
+  {% if s.collection_count %}{{ s.collection_count }} collection list{{ '' if s.collection_count == 1 else 's' }} stuck more than 2 days. <a href="/reports/pipeline">Collection Pipeline</a>{% endif %}
+  {% if s.collection_count and s.onboarding_count %}&middot;{% endif %}
+  {% if s.onboarding_count %}{{ s.onboarding_count }} onboarding item{{ '' if s.onboarding_count == 1 else 's' }} stuck more than 2 days. <a href="/reports/onboarding-pipeline">Onboarding Pipeline</a>{% endif %}
+</p>
+{% else %}
+<p class="empty-state">Nothing stuck — all active work is moving.</p>
+{% endif %}
+
+<h3 class="page-heading" style="font-size:1.1rem;">Configuration check</h3>
+{% if gaps.config.at_default %}
+<p class="alert alert-warn">
+  Collection Health settings are still at factory defaults ({{ gaps.config.credit_period_days }}-day credit period, {{ gaps.config.visit_method }} method) — confirm this matches your business terms.
+  <a href="/manage/credit-period">Manage Credit Period</a>
+</p>
+{% else %}
+<p class="empty-state">Collection Health settings have been configured.</p>
+{% endif %}
+
+<h3 class="page-heading" style="font-size:1.1rem;">By beat <span class="report-meta">({{ gaps.by_beat | length }})</span></h3>
+{% if gaps.by_beat %}
+<div class="due-scroll">
+<table class="due-table">
+  <thead><tr><th>Beat</th><th>Salesman</th><th>Gaps</th></tr></thead>
+  <tbody>
+  {% for row in gaps.by_beat %}
+    <tr>
+      <td>{{ row.beat }}</td>
+      <td>{{ row.salesman or '—' }}</td>
+      <td>
+        {% for badge in row.badges %}
+        <span class="badge {{ badge_class[badge] }}">{{ badge_label[badge] }}</span>
+        {% endfor %}
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="empty-state">Every beat is fully set up.</p>
+{% endif %}
+
+{% endif %}
+
+<div class="action-row">
+  <a class="btn btn-secondary" href="/reports">Back to Reports</a>
+</div>
+{% endblock %}

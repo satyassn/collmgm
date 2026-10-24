@@ -1,6 +1,20 @@
 # collmgm Roadmap
 
+## Planned — maintenance backlog
+
+Small, deliberately-deferred items from a codebase audit (see history for the full findings) — not urgent, but worth tracking instead of losing.
+
+- **CI**: no automated test run exists anywhere — no `.github/workflows/`, no `test` target in the `Makefile`. Add a GitHub Actions workflow running `python -m unittest discover -s tests` on push/PR, and a matching `test` Makefile target for local use. Zero risk — pure addition, touches no app code.
+- **Template/JS duplication**: `templates/coll/correction_form.html`, `new_vouchers_approve_item.html`, and `new_vouchers_review_item.html` each reimplement the same "pick a correction kind → reveal matching fields" UI (own copy-pasted `<script>`, near-identical markup) with small field-name drift between copies (`requested_by/requested_at` vs `raised_by/raised_at/edited_by`). `static/voucher_card.js` and `static/voucher_detail.js` separately duplicate their click-guard, fetch/session-expiry handling, and hidden/`aria-expanded` toggling. Consolidating either is reasonable long-term but needs manual browser verification (no JS test runner in this repo) — do as its own dedicated pass, not bundled with anything else.
+- **Manual version bump**: `packaging/setup.iss`'s `MyAppVersion` is hand-edited per release (`packaging/BUILD_STEPS.md` step 3 of "To Update for the Next Release"). Worth scripting once the release process is touched again.
+
 ## Released
+
+### CLI deprecated
+
+The CLI (`collmenu.py`/`coll_cli.py`/`coll_workflow.py`) is deprecated: `packaging/setup.iss` no longer installs a shortcut for it, so new installs are web-app-only. Its code and tests remain in the repo and still work if launched directly (`run.bat`) — this is a hide, not a removal — but it gets no further feature work. See **CLI deprecation** in `CLAUDE.md`. The beta0.1/alpha entries below are kept as history.
+
+---
 
 ### iteration4 — Voucher Amendment (web)
 

@@ -16,17 +16,20 @@
   <script src="/static/voucher_card.js?v={{ asset_v }}" defer></script>
   <script src="/static/nav_dropdown.js?v={{ asset_v }}" defer></script>
   <script src="/static/password_toggle.js?v={{ asset_v }}" defer></script>
+  <script src="/static/beat_form.js?v={{ asset_v }}" defer></script>
 </head>
 <body>
   <header class="topbar">
     <a class="brand" href="/menu">CollMgm</a>
     {% if user is defined and user %}
-      {% if nav_perms is defined and ("manage_users" in nav_perms or "manage_beats" in nav_perms) %}
+      {% if nav_perms is defined and ("manage_users" in nav_perms or "manage_beats" in nav_perms or "import_vouchers" in nav_perms or "manage_credit_period" in nav_perms) %}
       <div class="nav-dropdown">
         <button type="button" class="nav-dropdown-toggle">Manage &#9662;</button>
         <div class="nav-dropdown-menu">
           {% if "manage_users" in nav_perms %}<a href="/manage/users">Users</a>{% endif %}
           {% if "manage_beats" in nav_perms %}<a href="/manage/beats">Beats</a>{% endif %}
+          {% if "import_vouchers" in nav_perms %}<a href="/coll/import-vouchers">Import Vouchers</a>{% endif %}
+          {% if "manage_credit_period" in nav_perms %}<a href="/manage/credit-period">Credit Period</a>{% endif %}
         </div>
       </div>
       {% endif %}
