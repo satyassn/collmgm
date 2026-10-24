@@ -68,6 +68,36 @@ class TestValidateSingleVoucher(unittest.TestCase):
         errors, _ = _validate(date_str="20260101")
         self.assertTrue(any("Invalid date" in e for e in errors))
 
+    def test_beat_salesman_map_rejects_mismatch(self):
+        # Other fields are independently valid, so (unlike a bad amount) this
+        # error doesn't null out `amount` — same contract as every other
+        # non-amount field error (see test_rejects_bill_no_bad_characters).
+        errors, amount = coll_data.validate_single_voucher(
+            "INV1", TODAY, "100.00", "beat1", "sm1",
+            frozenset(), VALID_BEATS, VALID_SALESMEN,
+            beat_salesman_map={"beat1": "sm2"})
+        self.assertTrue(any("does not match" in e for e in errors))
+        self.assertEqual(amount, Decimal("100.00"))
+
+    def test_beat_salesman_map_accepts_match(self):
+        errors, amount = coll_data.validate_single_voucher(
+            "INV1", TODAY, "100.00", "beat1", "sm1",
+            frozenset(), VALID_BEATS, VALID_SALESMEN,
+            beat_salesman_map={"beat1": "sm1"})
+        self.assertEqual(errors, [])
+        self.assertEqual(amount, Decimal("100.00"))
+
+    def test_beat_salesman_map_skips_unassigned_beat(self):
+        errors, _ = coll_data.validate_single_voucher(
+            "INV1", TODAY, "100.00", "beat1", "sm1",
+            frozenset(), VALID_BEATS, VALID_SALESMEN,
+            beat_salesman_map={"beat1": ""})
+        self.assertEqual(errors, [])
+
+    def test_no_map_means_no_mismatch_check(self):
+        errors, _ = _validate(salesman="sm1")  # default helper passes no map at all
+        self.assertEqual(errors, [])
+
 
 class TestValidateAddvBatch(unittest.TestCase):
     def _batch(self, voucher_rows, inst_rows):
@@ -101,6 +131,22 @@ class TestValidateAddvBatch(unittest.TestCase):
             [self._voucher_row()],
             [{"bill_no": "INV1", "date": TOMORROW, "amount": "10", "salesman": "sm1"}])
         self.assertTrue(any("in the future" in e for e in errors))
+
+    def test_beat_salesman_map_blocks_whole_import(self):
+        errors, vouchers, _ = coll_data.validate_addv_batch(
+            [self._voucher_row()], [], set(), VALID_BEATS, VALID_SALESMEN,
+            "tester", "2026-01-01T00:00:00",
+            beat_salesman_map={"beat1": "someone-else"})
+        self.assertTrue(any("does not match" in e for e in errors))
+        self.assertEqual(vouchers, [])
+
+    def test_bill_no_normalized_to_uppercase(self):
+        errors, vouchers, installments = self._batch(
+            [self._voucher_row(bill_no="g100")],
+            [{"bill_no": "g100", "date": TODAY, "amount": "40", "salesman": "sm1"}])
+        self.assertEqual(errors, [])
+        self.assertEqual(vouchers[0]["bill_no"], "G100")
+        self.assertEqual(installments[0]["bill_no"], "G100")
 
 
 class TestReportRow(unittest.TestCase):

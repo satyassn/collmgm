@@ -36,6 +36,7 @@ from coll_orchestrate import (
     set_start_verification, is_start_verification_complete,
     set_submit_verification, is_submit_verification_complete,
     apply_correction_request, _find_active_report_for_bill,
+    find_and_flag_salesman_mismatches,
     compute_payment_dates, record_submit_payments, validate_payment,
     validate_payment_type, payment_type_totals, parse_return_items,
     validate_staged_report, format_submit_validation_errors,
@@ -49,6 +50,9 @@ from coll_orchestrate import (
     addv_open_flags_awaiting_distributor,
     clear_addv_review, raise_addv_flag, resolve_addv_flag, reject_addv_batch,
     raise_addv_flag_as_approver, edit_addv_flag, withdraw_addv_flag,
+    build_collection_pipeline, build_onboarding_pipeline,
+    COLLECTION_PIPELINE_STAGES, ONBOARDING_PIPELINE_STAGES,
+    build_setup_gaps,
 )
 from coll_store import (
     STAGING_DIR,
@@ -81,6 +85,8 @@ from coll_store import (
     load_amendment_request,
     load_amendment_requests,
     load_beats_raw,
+    load_users_raw,
+    beats_with_vouchers,
     load_checks,
     check_summary_counts,
     load_correction,
@@ -101,7 +107,12 @@ from coll_store import (
     set_secret_question,
     sanitize_filename_component,
     save_report_json,
+    load_archived_coll_reports,
+    load_staged_coll_reports,
+    get_collection_health_settings,
+    update_beat_cadence,
     update_beat_salesman,
+    update_collection_health_settings,
     update_user_role,
     verify_user,
     write_new_installments,
@@ -113,9 +124,13 @@ from coll_data import (
     _load_confirmed_start_reports,
     _load_submit_confirmed_reports,
     _load_vouchers_by_criterion,
+    DUE_WINDOW_DEFAULT, DUE_WINDOW_MAX,
+    build_due_list, validate_cadence,
     load_active_beat_statuses,
     load_beats,
     load_beats_pending_summary,
+    build_collection_health, validate_collection_health_settings,
+    latest_list_dates, BILL_NO_RE,
     load_salesmen,
     load_voucher_amounts,
     query_pending_by_age,
@@ -332,10 +347,16 @@ def _flag_salesman_mismatches(vouchers, assigned_salesman):
     """Mark each voucher whose own `salesman` differs from the beat's
     assigned salesman — render-only, never persisted, mirrors the
     correction_open/correction_applied pattern used elsewhere. Purely
-    informational: nothing is gated or auto-raised here, a human reviews and
-    raises an Amendment Request themselves (via the voucher lookup screen) if
-    warranted. Always a no-op for a "beat_salesman" report, since every
-    voucher's salesman equals `assigned_salesman` there by construction."""
+    informational here, and used only on a list already past generation: a
+    fresh generation attempt is blocked and auto-raised to Amendment Requests
+    instead by find_and_flag_salesman_mismatches (coll_orchestrate), called
+    from _generate_collection_list_response before a list is ever created.
+    This later, render-only check exists because the beat/salesman mapping
+    can still drift after that point (e.g. the beat's assignment changes
+    mid-flow) — a human reviews and raises an Amendment Request themselves
+    (via the voucher lookup screen) if warranted. Always a no-op for a
+    "beat_salesman" report, since every voucher's salesman equals
+    `assigned_salesman` there by construction."""
     for v in vouchers:
         v["salesman_mismatch"] = v.get("salesman", "") != assigned_salesman
 
@@ -555,15 +576,18 @@ def menu(request: Request):
 # Generate Collection List  (coll-start)
 # ---------------------------------------------------------------------------
 
-def _render_start_beat_form(request, user, error=None, selected_beat=""):
+def _render_start_beat_form(request, user, error=None, selected_beat="", mismatch_count=0):
     """Render the Generate Collection List picker, optionally with an inline
     error and the user's prior beat choice preserved (used both for the
-    normal GET and for recoverable validation failures on generate)."""
+    normal GET and for recoverable validation failures on generate).
+    mismatch_count: set when generation was blocked by a beat/salesman
+    mismatch (see _generate_collection_list_response) — renders its own
+    banner linking to Amendment Requests, separate from `error`."""
     try:
         beats = load_beats(user)
         summary = load_beats_pending_summary(user)
         active = load_active_beat_statuses()
-        beats_map = {b["name"]: b["salesman"] for b in load_beats_raw()}
+        start_dates = latest_list_dates(load_staged_coll_reports())
     except Exception as e:
         return _tmpl("error.html", request, user=user, message=str(e))
     # Beats already locked by an in-flight report can't be generated again
@@ -571,8 +595,8 @@ def _render_start_beat_form(request, user, error=None, selected_beat=""):
     # in the template instead of listing them alongside selectable beats.
     beats = sorted(beats, key=lambda b: (b in active, b))
     return _tmpl("coll/start_beat.html", request, user=user,
-                 beats=beats, summary=summary, active=active, beats_map=beats_map,
-                 error=error, selected_beat=selected_beat)
+                 beats=beats, summary=summary, active=active, start_dates=start_dates,
+                 error=error, selected_beat=selected_beat, mismatch_count=mismatch_count)
 
 
 @app.get("/coll/start", response_class=HTMLResponse)
@@ -589,10 +613,13 @@ def _generate_collection_list_response(request, user, beat):
     Generates a beat-wide combined list — every pending voucher for the
     beat, regardless of which salesman is recorded on the individual
     voucher — since the web app no longer picks a salesman at generation
-    time. A voucher whose own salesman differs from the beat's assigned
-    salesman is not auto-corrected or auto-raised as an Amendment Request;
-    it's flagged (see _flag_salesman_mismatches) for a human to review and
-    raise one themselves if warranted.
+    time. Before generating, every pending voucher whose own salesman
+    differs from the beat's assigned salesman is auto-raised as an
+    Amendment Request (find_and_flag_salesman_mismatches) and generation is
+    blocked until they're fixed — see the mismatch_count branch below. A
+    list already in flight can still drift out of sync afterwards (e.g. the
+    beat's assignment changes mid-flow); that's only flagged for review at
+    each later stage (_flag_salesman_mismatches), not blocked.
     """
     selection_type = "beat"
     selection_values = [beat]
@@ -614,6 +641,11 @@ def _generate_collection_list_response(request, user, beat):
 
     beats_map = {b["name"]: b["salesman"] for b in load_beats_raw()}
     assigned_salesman = beats_map.get(beat, "")
+
+    mismatched = find_and_flag_salesman_mismatches(vouchers, assigned_salesman, user.name)
+    if mismatched:
+        return _render_start_beat_form(
+            request, user, selected_beat=beat, mismatch_count=len(mismatched))
 
     outcome = generate_collection_list(selection_type, selection_values, vouchers)
     if not outcome.ok:
@@ -1746,6 +1778,7 @@ async def coll_amend_submit(request: Request, bill_no: str):
     except Exception as e:
         return _tmpl("error.html", request, user=user, message=str(e))
 
+    v_bill_no_raw = (form.get("v_bill_no") or "").strip().upper()
     v_date_raw = (form.get("v_date") or "").strip()
     v_amount_raw = (form.get("v_amount") or "").strip()
     v_beat = (form.get("v_beat") or "").strip()
@@ -1766,12 +1799,21 @@ async def coll_amend_submit(request: Request, bill_no: str):
             "salesman": (form.get(f"inst_salesman_{k}") or "").strip(),
             "_deleted": bool(form.get(f"inst_delete_{k}")),
         })
-    submitted_voucher = {**voucher, "date": v_date_raw, "amount": v_amount_raw,
-                         "beat": v_beat, "salesman": v_salesman}
+    submitted_voucher = {**voucher, "bill_no": v_bill_no_raw or bill_no, "date": v_date_raw,
+                         "amount": v_amount_raw, "beat": v_beat, "salesman": v_salesman}
 
     def rerender(error):
         return _render_amend_form(request, user, bill_no, submitted_voucher,
                                   submitted_installments, snapshot, error=error)
+
+    new_bill_no = None
+    if v_bill_no_raw and v_bill_no_raw != bill_no.upper():
+        if not BILL_NO_RE.match(v_bill_no_raw):
+            return rerender(f"Voucher '{v_bill_no_raw}' contains invalid characters "
+                            "(allowed: letters, digits, . _ / - ; must start with a letter or digit).")
+        if v_bill_no_raw in load_all_existing_bill_nos():
+            return rerender(f"Voucher '{v_bill_no_raw}' already exists.")
+        new_bill_no = v_bill_no_raw
 
     v_date = _valid_past_date(v_date_raw)
     if v_date is None:
@@ -1804,7 +1846,8 @@ async def coll_amend_submit(request: Request, bill_no: str):
                 "installments": new_installments}
 
     try:
-        amendment = amend_voucher(bill_no, snapshot, new_state, user.name, note)
+        amendment = amend_voucher(bill_no, snapshot, new_state, user.name, note,
+                                  new_bill_no=new_bill_no)
     except AmendmentConflict:
         fresh = search_voucher(bill_no)
         if fresh is None or fresh[2]:
@@ -1821,7 +1864,10 @@ async def coll_amend_submit(request: Request, bill_no: str):
         return rerender(str(e))
 
     balance = amendment["new"]["voucher"]["balance"]
-    return _redirect_ok("/coll/amend", f"Amendment applied — new balance {balance}.")
+    msg = f"Amendment applied — new balance {balance}."
+    if new_bill_no:
+        msg = f"Amendment applied — voucher renamed to '{new_bill_no}', new balance {balance}."
+    return _redirect_ok("/coll/amend", msg)
 
 
 @app.get("/coll/amendments", response_class=HTMLResponse)
@@ -2113,6 +2159,43 @@ def _require_any(request: Request, permissions):
     return user, None
 
 
+def _stage_addv_batch(user, vouchers, installments, mode, now_str):
+    """Write one addv*.json staging file — shared tail for CSV import and
+    manual Add New Voucher entry, which differ only in how they build
+    `vouchers`/`installments` and what `mode` describes."""
+    ensure_staging_dir()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_user = sanitize_filename_component(user.name)
+    json_path = STAGING_DIR / f"addv{timestamp}-{safe_user}.json"
+    save_report_json(json_path, {
+        "type": "add_vouchers",
+        "mode": mode,
+        "created_by": user.name,
+        "created_at": now_str,
+        "stage": "added",
+        "stages": {"add": "done", "confirm": "", "post": ""},
+        "vouchers": vouchers,
+        "installments": installments,
+        "flags": [],
+    })
+    return json_path
+
+
+def _addv_error_with_bill_no(error, voucher_rows):
+    """validate_addv_batch reports voucher errors as "Voucher row N: ..." —
+    meaningful for a CSV (N is the spreadsheet row), meaningless on a page
+    with no rows. Swap in the voucher's own bill_no, which the user can
+    actually see in the list they built."""
+    m = re.match(r"^Voucher row (\d+): (.*)$", error)
+    if not m:
+        return error
+    idx = int(m.group(1)) - 2
+    if 0 <= idx < len(voucher_rows):
+        label = voucher_rows[idx].get("bill_no") or f"#{idx + 1}"
+        return f"Voucher {label}: {m.group(2)}"
+    return error
+
+
 @app.get("/coll/import-vouchers", response_class=HTMLResponse)
 def coll_import_vouchers_form(request: Request):
     user, err = _require(request, "import_vouchers")
@@ -2168,10 +2251,12 @@ async def coll_import_vouchers_submit(request: Request,
                           "then import.")
     existing_bill_nos = load_all_existing_bill_nos() | load_addv_staged_bill_nos()
     now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    beat_salesman_map = {b["name"]: b["salesman"] for b in load_beats_raw()}
 
     errors, vouchers, installments = validate_addv_batch(
         voucher_rows, inst_rows, existing_bill_nos,
         set(beats), set(salesmen), user.name, now_str,
+        beat_salesman_map=beat_salesman_map,
     )
     if errors:
         return form_error("; ".join(errors[:20]) + (" …" if len(errors) > 20 else ""))
@@ -2179,23 +2264,94 @@ async def coll_import_vouchers_submit(request: Request,
     for v in vouchers:
         v["review_status"] = "pending"
 
-    ensure_staging_dir()
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_user = sanitize_filename_component(user.name)
-    json_path = STAGING_DIR / f"addv{timestamp}-{safe_user}.json"
-    report_data = {
-        "type": "add_vouchers",
-        "mode": "batch",
-        "created_by": user.name,
-        "created_at": now_str,
-        "stage": "added",
-        "stages": {"add": "done", "confirm": "", "post": ""},
-        "vouchers": vouchers,
-        "installments": installments,
-        "flags": [],
-    }
-    save_report_json(json_path, report_data)
+    _stage_addv_batch(user, vouchers, installments, "batch", now_str)
     return _redirect_ok("/coll/new-vouchers", f"Imported {len(vouchers)} voucher(s) for review.")
+
+
+@app.get("/coll/add-voucher", response_class=HTMLResponse)
+def coll_add_voucher_form(request: Request):
+    user, err = _require(request, "add_vouchers")
+    if err:
+        return err
+    beats = load_beats_raw()
+    if user.role == "salesman":
+        beats = [b for b in beats if b.get("salesman") == user.name]
+    today = datetime.now().strftime("%Y-%m-%d")
+    existing_bill_nos = load_all_existing_bill_nos() | load_addv_staged_bill_nos()
+    return _tmpl("coll/add_voucher.html", request, user=user, beats=beats,
+                 error=None, payload_json=None, today=today,
+                 existing_bill_nos_json=json.dumps(sorted(existing_bill_nos)))
+
+
+@app.post("/coll/add-voucher", response_class=HTMLResponse)
+async def coll_add_voucher_submit(request: Request, payload: str = Form(...)):
+    user, err = _require(request, "add_vouchers")
+    if err:
+        return err
+
+    def form_error(msg):
+        beats = load_beats_raw()
+        if user.role == "salesman":
+            beats = [b for b in beats if b.get("salesman") == user.name]
+        today = datetime.now().strftime("%Y-%m-%d")
+        existing_bill_nos = load_all_existing_bill_nos() | load_addv_staged_bill_nos()
+        return _tmpl("coll/add_voucher.html", request, user=user, beats=beats,
+                     error=msg, payload_json=payload, today=today,
+                     existing_bill_nos_json=json.dumps(sorted(existing_bill_nos)))
+
+    try:
+        voucher_entries = json.loads(payload).get("vouchers", [])
+    except (ValueError, AttributeError):
+        return form_error("Could not read the submitted vouchers — please try again.")
+    if not voucher_entries:
+        return form_error("Add at least one voucher before submitting.")
+
+    try:
+        beats = load_beats(user)
+        salesmen = load_salesmen()
+    except ValueError as e:
+        return form_error(f"{e} Set up beats and salesmen first (Manage Beats / Manage Users).")
+    beat_salesman_map = {b["name"]: b["salesman"] for b in load_beats_raw()}
+
+    voucher_rows = []
+    inst_rows = []
+    for v in voucher_entries:
+        bill_no = str(v.get("bill_no", "")).strip()
+        beat = str(v.get("beat", "")).strip()
+        salesman = beat_salesman_map.get(beat, "")
+        voucher_rows.append({
+            "bill_no": bill_no,
+            "date": str(v.get("date", "")).strip(),
+            "amount": str(v.get("amount", "")).strip(),
+            "beat": beat,
+            "salesman": salesman,
+        })
+        for inst in v.get("installments") or []:
+            inst_rows.append({
+                "bill_no": bill_no,
+                "date": str(inst.get("date", "")).strip(),
+                "amount": str(inst.get("amount", "")).strip(),
+                "salesman": salesman,
+            })
+
+    existing_bill_nos = load_all_existing_bill_nos() | load_addv_staged_bill_nos()
+    now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    errors, vouchers, installments = validate_addv_batch(
+        voucher_rows, inst_rows, existing_bill_nos,
+        set(beats), set(salesmen), user.name, now_str,
+        beat_salesman_map=beat_salesman_map,
+    )
+    if errors:
+        errors = [_addv_error_with_bill_no(e, voucher_rows) for e in errors]
+        return form_error("; ".join(errors[:20]) + (" …" if len(errors) > 20 else ""))
+
+    review_status = "reviewed" if user.role == "salesman" else "pending"
+    for v in vouchers:
+        v["review_status"] = review_status
+
+    _stage_addv_batch(user, vouchers, installments, "inline", now_str)
+    return _redirect_ok("/coll/new-vouchers", f"Added {len(vouchers)} voucher(s) for review.")
 
 
 _ADDV_STAGE_BADGES = {
@@ -2887,18 +3043,41 @@ def manage_beats_new_form(request: Request):
                  salesmen=_salesmen_or_empty(), target=None, error=None)
 
 
+def _normalized_cadence(cadence, cadence_day, cadence_week, cadence_start):
+    """Cadence form values as they are stored: a collection day and an
+    optional start date apply to every cadence, a week-of-month only to
+    monthly beats."""
+    cadence = (cadence or "").strip().lower()
+    cadence_day = (cadence_day or "").strip().lower()
+    cadence_week = (cadence_week or "").strip() if cadence == "monthly" else ""
+    cadence_start = (cadence_start or "").strip()
+    return cadence, cadence_day, cadence_week, cadence_start
+
+
 @app.post("/manage/beats/new", response_class=HTMLResponse)
 def manage_beats_new_submit(request: Request,
                             name: str = Form(default=""),
-                            salesman: str = Form(default="")):
+                            salesman: str = Form(default=""),
+                            cadence: str = Form(default="weekly"),
+                            cadence_day: str = Form(default=""),
+                            cadence_week: str = Form(default=""),
+                            cadence_start: str = Form(default="")):
     user, err = _require(request, "manage_beats")
     if err:
         return err
+    cadence, cadence_day, cadence_week, cadence_start = _normalized_cadence(
+        cadence, cadence_day, cadence_week, cadence_start)
+    target = {"name": name, "salesman": salesman, "cadence": cadence,
+              "cadence_day": cadence_day, "cadence_week": cadence_week,
+              "cadence_start": cadence_start}
     try:
-        create_beat(name.strip(), salesman)
+        cadence_err = validate_cadence(cadence, cadence_day, cadence_week, cadence_start)
+        if cadence_err:
+            raise ValueError(cadence_err)
+        create_beat(name.strip(), salesman, cadence, cadence_day, cadence_week, cadence_start)
     except ValueError as e:
         return _tmpl("manage/beat_form.html", request, user=user, mode="create",
-                     salesmen=_salesmen_or_empty(), target={"name": name, "salesman": salesman}, error=str(e))
+                     salesmen=_salesmen_or_empty(), target=target, error=str(e))
     return _redirect_ok("/manage/beats", f"Beat '{name.strip()}' created.")
 
 
@@ -2915,14 +3094,38 @@ def manage_beats_edit_form(request: Request, name: str):
 
 
 @app.post("/manage/beats/{name}/edit", response_class=HTMLResponse)
-def manage_beats_edit_submit(request: Request, name: str, salesman: str = Form(default="")):
+def manage_beats_edit_submit(request: Request, name: str,
+                             salesman: str = Form(default=""),
+                             cadence: str | None = Form(default=None),
+                             cadence_day: str | None = Form(default=None),
+                             cadence_week: str | None = Form(default=None),
+                             cadence_start: str | None = Form(default=None)):
     user, err = _require(request, "manage_beats")
     if err:
         return err
+    cadence_posted = cadence is not None
+    if not cadence_posted:
+        # Salesman-only edit: leave the schedule as it is, unvalidated, so a beat
+        # that still needs a collection day can be reassigned.
+        current = next((b for b in load_beats_raw() if b["name"] == name), None)
+        if current is not None:
+            cadence, cadence_day, cadence_week, cadence_start = (
+                current["cadence"], current["cadence_day"], current["cadence_week"],
+                current["cadence_start"])
+    cadence, cadence_day, cadence_week, cadence_start = _normalized_cadence(
+        cadence, cadence_day, cadence_week, cadence_start)
     try:
+        if cadence_posted:
+            cadence_err = validate_cadence(cadence, cadence_day, cadence_week, cadence_start)
+            if cadence_err:
+                raise ValueError(cadence_err)
         update_beat_salesman(name, salesman)
+        if cadence_posted:
+            update_beat_cadence(name, cadence, cadence_day, cadence_week, cadence_start)
     except ValueError as e:
-        target = {"name": name, "salesman": salesman}
+        target = {"name": name, "salesman": salesman, "cadence": cadence,
+                  "cadence_day": cadence_day, "cadence_week": cadence_week,
+                  "cadence_start": cadence_start}
         return _tmpl("manage/beat_form.html", request, user=user, mode="edit",
                      salesmen=_salesmen_or_empty(), target=target, error=str(e))
     return _redirect_ok("/manage/beats", f"Beat '{name}' updated.")
@@ -2938,6 +3141,38 @@ def manage_beats_delete(request: Request, name: str):
     except ValueError as e:
         return _tmpl("error.html", request, user=user, message=str(e))
     return _redirect_ok("/manage/beats", f"Beat '{name}' deleted.")
+
+
+# ---------------------------------------------------------------------------
+# Manage Collection Health settings (web-only, distributor-only)
+# ---------------------------------------------------------------------------
+
+@app.get("/manage/credit-period", response_class=HTMLResponse)
+def manage_credit_period_form(request: Request):
+    user, err = _require(request, "manage_credit_period")
+    if err:
+        return err
+    return _tmpl("manage/credit_period_form.html", request, user=user,
+                 settings=get_collection_health_settings(), error=None)
+
+
+@app.post("/manage/credit-period", response_class=HTMLResponse)
+def manage_credit_period_submit(request: Request,
+                                credit_period_days: str = Form(default=""),
+                                visit_method: str = Form(default="accurate"),
+                                last_visit_color: str = Form(default="yellow")):
+    user, err = _require(request, "manage_credit_period")
+    if err:
+        return err
+    errors, parsed_days = validate_collection_health_settings(
+        credit_period_days, visit_method, last_visit_color)
+    if errors:
+        settings = {"credit_period_days": credit_period_days,
+                    "visit_method": visit_method, "last_visit_color": last_visit_color}
+        return _tmpl("manage/credit_period_form.html", request, user=user,
+                     settings=settings, error=" ".join(errors))
+    update_collection_health_settings(parsed_days, visit_method, last_visit_color)
+    return _redirect_ok("/manage/credit-period", "Collection Health settings updated.")
 
 
 # ---------------------------------------------------------------------------
@@ -3005,6 +3240,83 @@ def reports_index(request: Request):
     if err:
         return err
     return _tmpl("reports/index.html", request, user=user)
+
+
+@app.get("/reports/pipeline", response_class=HTMLResponse)
+def reports_pipeline(request: Request):
+    user, err = _require(request)
+    if err:
+        return err
+    today = datetime.now().date()
+    scope = user.name if user.role == "salesman" else None
+    pipeline = build_collection_pipeline(load_staged_coll_reports(), today, salesman=scope)
+    return _tmpl("reports/pipeline.html", request, user=user, pipeline=pipeline,
+                 collection_stages=COLLECTION_PIPELINE_STAGES, today=today)
+
+
+@app.get("/reports/onboarding-pipeline", response_class=HTMLResponse)
+def reports_onboarding_pipeline(request: Request):
+    user, err = _require(request)
+    if err:
+        return err
+    today = datetime.now().date()
+    scope = user.name if user.role == "salesman" else None
+    pipeline = build_onboarding_pipeline(load_addv_batches(), today, salesman=scope)
+    return _tmpl("reports/onboarding_pipeline.html", request, user=user, pipeline=pipeline,
+                 onboarding_stages=ONBOARDING_PIPELINE_STAGES, today=today)
+
+
+@app.get("/reports/due", response_class=HTMLResponse)
+def reports_due(request: Request, days: int = Query(default=DUE_WINDOW_DEFAULT)):
+    user, err = _require(request)
+    if err:
+        return err
+    window = min(max(days, 1), DUE_WINDOW_MAX)
+    today = datetime.now().date()
+    beats = load_beats_raw()
+    if user.role == "salesman":
+        beats = [b for b in beats if b["salesman"] == user.name]
+    due = build_due_list(beats, load_staged_coll_reports(), load_archived_coll_reports(),
+                         today, window)
+    return _tmpl("reports/due.html", request, user=user, due=due, window=window,
+                 max_window=DUE_WINDOW_MAX, today=today)
+
+
+@app.get("/reports/collection-health", response_class=HTMLResponse)
+def reports_collection_health(request: Request, beat: str = Query(default=""),
+                              bucket: str = Query(default="")):
+    user, err = _require(request)
+    if err:
+        return err
+    beats = load_beats_raw()
+    if user.role == "salesman":
+        beats = [b for b in beats if b["salesman"] == user.name]
+    settings = get_collection_health_settings()
+    today = datetime.now().date()
+    health = None
+    if beat:
+        beat_row = next((b for b in beats if b["name"] == beat), None)
+        if beat_row is None:
+            return _tmpl("error.html", request, user=user, message="Unknown beat.")
+        vouchers = [v for vs in query_pending_by_beat(beat).values() for v in vs]
+        health = build_collection_health(beat_row, vouchers, settings,
+                                         load_staged_coll_reports(), load_archived_coll_reports(),
+                                         today)
+    return _tmpl("reports/collection_health.html", request, user=user, beats=beats,
+                 beat=beat, bucket=bucket, settings=settings, health=health, today=today)
+
+
+@app.get("/reports/setup-gaps", response_class=HTMLResponse)
+def reports_setup_gaps(request: Request):
+    user, err = _require(request, "view_setup_gaps")
+    if err:
+        return err
+    today = datetime.now().date()
+    gaps = build_setup_gaps(
+        load_beats_raw(), load_users_raw(), beats_with_vouchers(), load_addv_batches(),
+        load_staged_coll_reports(), load_archived_coll_reports(),
+        get_collection_health_settings(), today)
+    return _tmpl("reports/setup_gaps.html", request, user=user, gaps=gaps, today=today)
 
 
 @app.get("/reports/salesman", response_class=HTMLResponse)

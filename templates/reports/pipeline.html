@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Collection Pipeline — CollMgm{% endblock %}
+{% block content %}
+{% from "reports/_pipeline_macros.html" import age_text, stage_list %}
+{% macro collection_card(it) -%}
+  <div class="pipe-card{% if it.stale %} stale{% endif %}">
+    <div class="pipe-card-top">
+      <span class="pipe-card-name">{{ it.beat }}</span>
+      <span class="pipe-age">{{ age_text(it.age_days) }}</span>
+    </div>
+    <div class="pipe-meta">
+      <span>{{ it.salesmen | join(', ') or 'No salesman' }}</span>
+      <span>{{ it.bills }} bills</span>
+      <span class="pipe-money">Bal {{ '{:,.2f}'.format(it.balance) }}</span>
+    </div>
+    {% if it.returned %}<span class="badge badge-warn">Returned to salesman</span>{% endif %}
+  </div>
+{%- endmacro %}
+
+<h2 class="page-heading">Collection Pipeline</h2>
+<p class="report-meta">As of {{ today.strftime('%d %b %Y') }}. Each stage is a step a collection list passes through, in order — the same names as the main menu. Tap a stage to see what is waiting there. Amber cards have waited more than 2 days.</p>
+
+{% set ns = namespace(lists=0, approval=0, posting=0) %}
+{% for key, label in collection_stages %}
+  {% set n = pipeline[key] | length %}
+  {% set ns.lists = ns.lists + n %}
+  {% if key in ('waiting_start', 'waiting_submit') %}{% set ns.approval = ns.approval + n %}{% endif %}
+  {% if key == 'waiting_post' %}{% set ns.posting = ns.posting + n %}{% endif %}
+{% endfor %}
+<div class="card pipe-summary">
+  <div><strong>{{ ns.lists }}</strong> <span class="report-meta">lists in progress</span></div>
+  <div><strong>{{ ns.approval }}</strong> <span class="report-meta">waiting approval</span></div>
+  <div><strong>{{ ns.posting }}</strong> <span class="report-meta">waiting posting</span></div>
+</div>
+
+{{ stage_list(collection_stages, pipeline, collection_card) }}
+
+<div class="action-row">
+  <a class="btn btn-secondary" href="/reports">Back to Reports</a>
+  <a class="btn btn-secondary" href="/reports/onboarding-pipeline">Onboarding Pipeline</a>
+  <a class="btn btn-secondary" href="/reports/due">Beats Due</a>
+</div>
+{% endblock %}

@@ -408,6 +408,9 @@ input:focus, select:focus, textarea:focus {
 .correction-form .kind-choice legend { font-weight: 600; padding: 0 4px; }
 .kind-option { display: block; margin: 4px 0; cursor: pointer; }
 .field-label { display: block; margin: 0.75rem 0 0.25rem; font-weight: 600; }
+.field-label[hidden] { display: none; }
+.field-row { display: flex; flex-wrap: wrap; gap: 1rem; }
+.field-row .field-label { flex: 1 1 160px; margin-top: 0; }
 .field-label input, .field-label textarea {
   display: block;
   width: 100%;
@@ -711,6 +714,18 @@ a.vc-bill[data-vc-toggle][aria-expanded="true"]::after { content: " \25B4"; }
   .vc-ext { padding-inline: 1.25rem; }
 }
 
+/* Horizontal strip of .vc--min cards (Add New Voucher's "entered so far"
+   list) — same card look, laid out as a scrolling row instead of a column. */
+.vc-strip {
+  display: flex;
+  gap: 0.75rem;
+  overflow-x: auto;
+  padding-bottom: 0.4rem;
+  margin-bottom: 1rem;
+}
+.vc-strip .vc { flex: 0 0 15rem; margin-bottom: 0; }
+.vc-strip-empty { color: var(--gray-600); font-size: 0.9rem; margin-bottom: 1rem; }
+
 /* ---- Misc ---- */
 .step-label { font-size: 0.875rem; color: var(--gray-600); margin-bottom: 1rem; }
 .meta-line  { font-size: 0.875rem; color: var(--gray-600); margin-bottom: 1rem; }
@@ -950,4 +965,66 @@ a.vc-bill[data-vc-toggle][aria-expanded="true"]::after { content: " \25B4"; }
     color: var(--gray-600);
   }
   .card-table input, .card-table select { max-width: 60%; }
+}
+
+.due-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; margin-bottom: 1.5rem; }
+.due-table th, .due-table td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--gray-200); }
+.due-table th { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--gray-600); }
+.due-table .num { font-variant-numeric: tabular-nums; }
+.due-scroll { overflow-x: auto; max-width: 100%; }
+.due-window { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 1rem; }
+.due-window select { padding: 0.35rem 0.5rem; border-radius: var(--radius); border: 1px solid var(--gray-200); }
+
+/* Collection Health: a 3-slice conic-gradient pie (green/yellow/red), computed
+   server-side from bucket percentages — no chart library in this app. */
+.health-pie {
+  width: 180px; height: 180px; border-radius: 50%;
+  margin: 1rem 0; border: 1px solid var(--gray-200);
+}
+.health-legend { display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem; }
+.health-legend-item {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  padding: 0.35rem 0.6rem; border-radius: var(--radius);
+  border: 1px solid var(--gray-200); color: var(--gray-800); text-decoration: none;
+}
+.health-legend-item.active { border-color: var(--blue); box-shadow: 0 0 0 2px rgba(26,86,219,.18); }
+.health-swatch { width: 0.8rem; height: 0.8rem; border-radius: 50%; display: inline-block; }
+.health-swatch-green  { background: var(--green); }
+.health-swatch-yellow { background: var(--amber); }
+.health-swatch-red    { background: var(--red); }
+
+/* Pipeline report: one vertical list per section, every stage in sequence.
+   Stages with cards are <details> rows; empty stages are static rows showing 0. */
+.pipe-stages { border-top: 1px solid var(--gray-200); margin-bottom: 1.5rem; }
+.pipe-stage { border-bottom: 1px solid var(--gray-200); }
+.pipe-stage > summary,
+.pipe-stage-row { display: flex; align-items: center; gap: 0.75rem; min-height: 52px; padding: 0.6rem 0; }
+.pipe-stage > summary { cursor: pointer; list-style: none; }
+.pipe-stage > summary::-webkit-details-marker { display: none; }
+.pipe-stage > summary:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; border-radius: 4px; }
+.pipe-stage-name { flex: 1; min-width: 0; font-weight: 600; }
+.pipe-stage-count { font-family: var(--font-mono); font-variant-numeric: tabular-nums; min-width: 2ch; text-align: right; }
+.pipe-stage-count.zero { color: var(--gray-400); }
+.pipe-chevron {
+  width: 12px; height: 12px; flex: 0 0 12px;
+  border-right: 2px solid var(--gray-600); border-bottom: 2px solid var(--gray-600);
+  transform: rotate(45deg) translate(-2px, -2px); transition: transform 0.15s ease;
+}
+.pipe-stage[open] > summary .pipe-chevron { transform: rotate(225deg) translate(-2px, -2px); }
+.pipe-cards { display: grid; gap: 0.5rem; padding: 0 0 0.75rem; }
+.pipe-card { background: #fff; border: 1px solid var(--gray-200); border-left: 3px solid var(--gray-200); border-radius: var(--radius); padding: 0.6rem 0.75rem; min-width: 0; }
+.pipe-card.stale { border-left-color: var(--amber); }
+.pipe-card-top { display: flex; justify-content: space-between; gap: 0.5rem; align-items: baseline; }
+.pipe-card-name { font-weight: 600; overflow-wrap: anywhere; min-width: 0; }
+.pipe-age { font-size: 0.8rem; color: var(--gray-600); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.pipe-card.stale .pipe-age { color: var(--amber); font-weight: 600; }
+.pipe-meta { display: flex; flex-wrap: wrap; gap: 0.15rem 0.75rem; font-size: 0.85rem; color: var(--gray-600); margin-top: 0.3rem; }
+.pipe-money { font-family: var(--font-mono); color: var(--gray-800); }
+.pipe-summary { display: flex; flex-wrap: wrap; gap: 0.75rem 2rem; margin-bottom: 1.5rem; }
+
+/* Narrow phones: the topbar (brand, Manage, account) needs ~490px on one row,
+   so let it wrap with the brand on its own line instead of widening the page. */
+@media (max-width: 480px) {
+  .topbar { flex-wrap: wrap; height: auto; padding: 0.5rem 0.75rem; row-gap: 0.4rem; }
+  .brand { flex: 1 0 100%; }
 }

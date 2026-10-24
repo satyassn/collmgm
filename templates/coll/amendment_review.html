@@ -12,6 +12,9 @@
 <table class="data-table">
   <thead><tr><th></th><th>Before</th><th>After</th></tr></thead>
   <tbody>
+    {% if amendment.old.voucher.bill_no and amendment.old.voucher.bill_no != amendment.new.voucher.bill_no %}
+    <tr><td>Voucher #</td><td>{{ amendment.old.voucher.bill_no }}</td><td>{{ amendment.new.voucher.bill_no }}</td></tr>
+    {% endif %}
     <tr><td>Date</td><td>{{ amendment.old.voucher.date }}</td><td>{{ amendment.new.voucher.date }}</td></tr>
     <tr><td>Amount</td><td class="num mono">{{ amendment.old.voucher.amount }}</td><td class="num mono">{{ amendment.new.voucher.amount }}</td></tr>
     <tr><td>Balance</td><td class="num mono">{{ amendment.old.voucher.balance }}</td><td class="num mono">{{ amendment.new.voucher.balance }}</td></tr>

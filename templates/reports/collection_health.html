@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}Collection Health — CollMgm{% endblock %}
+{% block content %}
+{% from "_vcard.html" import vcard %}
+<h2 class="page-heading">Collection Health</h2>
+
+<form method="get" action="/reports/collection-health" class="due-window">
+  <label for="beat">Beat</label>
+  <select id="beat" name="beat" onchange="this.form.submit()">
+    <option value="" {% if not beat %}selected{% endif %}>Select a beat</option>
+    {% for b in beats %}
+    <option value="{{ b.name }}" {% if beat == b.name %}selected{% endif %}>{{ b.name }}</option>
+    {% endfor %}
+  </select>
+  <noscript><button type="submit" class="btn btn-sm btn-secondary">Go</button></noscript>
+</form>
+
+{% if not beat %}
+<p class="empty-state">Pick a beat to see its collection health.</p>
+{% else %}
+  {% set c = health.counts %}
+  {% set total_colored = c.green + c.yellow + c.red %}
+  {% set total_all = total_colored + c.unknown %}
+
+  <p class="report-meta">
+    Credit period: {{ settings.credit_period_days }} day{{ '' if settings.credit_period_days == 1 else 's' }}
+    &middot; {{ 'Accurate schedule simulation' if settings.visit_method == 'accurate' else 'Simple fixed-interval approximation' }}
+    &middot; <a href="/manage/credit-period">change</a>
+  </p>
+
+  {% if total_all == 0 %}
+  <p class="empty-state">No open vouchers for this beat.</p>
+  {% else %}
+
+    {% if total_colored %}
+    {% set pct_green = (c.green / total_colored * 100) %}
+    {% set pct_yellow = (c.yellow / total_colored * 100) %}
+    <div class="health-pie" style="background: conic-gradient(
+        var(--green) 0% {{ pct_green }}%,
+        var(--amber) {{ pct_green }}% {{ pct_green + pct_yellow }}%,
+        var(--red) {{ pct_green + pct_yellow }}% 100%);"></div>
+    {% endif %}
+
+    <div class="health-legend">
+      {% for key, label, total_key in [('green','Green','green'), ('yellow','Yellow','yellow'), ('red','Red','red')] %}
+      <a class="health-legend-item health-legend-{{ key }}{{ ' active' if bucket == key else '' }}"
+         href="/reports/collection-health?beat={{ beat | urlencode }}&bucket={{ key }}">
+        <span class="health-swatch health-swatch-{{ key }}"></span>
+        {{ label }} ({{ c[key] }}) &mdash; {{ health.totals[key] }}
+      </a>
+      {% endfor %}
+    </div>
+
+    {% if c.unknown > 0 %}
+    <p class="alert alert-warn">
+      {{ c.unknown }} voucher{{ '' if c.unknown == 1 else 's' }} on this beat can't be classified yet
+      &mdash; its cadence needs setup in <a href="/manage/beats">Manage Beats</a>.
+      <a href="/reports/collection-health?beat={{ beat | urlencode }}&bucket=unknown">View</a>
+    </p>
+    {% endif %}
+
+    {% if bucket and bucket in health.buckets %}
+    <h3 class="group-heading">{{ bucket | capitalize }} ({{ c[bucket] }})</h3>
+    {% if health.buckets[bucket] %}
+    <div class="vc-list">
+      {% for v in health.buckets[bucket] %}
+        {{ vcard(v.bill_no, "min", date=v.date, amount=v.amount, paid=v.paid, balance=v.balance,
+                 salesman=v.salesman, href="/voucher/" ~ (v.bill_no | urlencode)) }}
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="empty-state">No vouchers in this category.</p>
+    {% endif %}
+    {% endif %}
+
+  {% endif %}
+{% endif %}
+
+<a class="btn btn-secondary" href="/reports">Back to Reports</a>
+{% endblock %}

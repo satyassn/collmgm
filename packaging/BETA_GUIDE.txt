@@ -1,102 +1,91 @@
 ================================================================================
-  CollMgm Beta v0.1 - Quick Start Guide
+  CollMgm - Quick Start Guide
 ================================================================================
 
 INSTALLATION
 ------------
-1. Double-click  CollMgm-Beta-Setup.exe
+1. Double-click  CollMgm-<version>-Setup.exe
 2. Click  Next > Next > Finish
-3. A "CollMgm" shortcut appears on your desktop
+   (if asked, keep "Create a desktop shortcut" checked)
+3. Setup installs CollMgm as a Windows service and opens it in your browser
+   automatically. A "CollMgm" shortcut also appears in the Start Menu and,
+   if you kept that checkbox, on your desktop.
 
 
 LAUNCHING THE APP
------------------
-Double-click the "CollMgm" icon on your desktop.
-A black terminal window opens showing the main menu:
-
-  ==================================================
-  COLLECTION MANAGEMENT MENU
-  ==================================================
-  1. coll-start    - Generate list of vouchers to start collection
-  2. coll-submit   - Submit today's collections
-  3. coll-finalize - Review and finalize collections
-  4. Reports
-  5. Exit
-  ==================================================
-
-Type a number and press Enter to select an option.
-
-
-TEST DATA INCLUDED
 ------------------
-The app comes pre-loaded with sample data covering 2 checkpoints
-(cp1 and cp2), each with 5 beats and 2 salesmen.
+CollMgm runs as a background service, so it's always available at:
 
-  Users / logins available:
-    dist           (distributor role)
-    cp1salesman1   (salesman - handles cp1beat1, cp1beat3, cp1beat5)
-    cp1salesman2   (salesman - handles cp1beat2, cp1beat4)
-    cp2salesman1   (salesman - handles cp2beat1, cp2beat3, cp2beat5)
-    cp2salesman2   (salesman - handles cp2beat2, cp2beat4)
+    http://localhost:8100
 
-  Note: There are no passwords in this beta — just enter the username
-  when the app asks "Enter your name."
+Double-click the "CollMgm" shortcut (Start Menu or desktop) to open that
+address in your browser, or type it into any browser's address bar — on
+other devices on the same network, use this PC's name or IP address instead
+of "localhost".
 
 
-SUGGESTED WORKFLOW TO VALIDATE
--------------------------------
-Follow these steps in order to run through the full collection cycle:
-
-STEP 1 - Start a collection (as distributor)
-  a. Choose option  1  (coll-start)
-  b. Enter name:  dist
-  c. Select a beat, e.g.  cp1beat1
-  d. The app generates a pending voucher list and a .txt report
-  e. Choose option  1  again for another beat if you like
-
-STEP 2 - Submit collections (as salesman)
-  a. Choose option  2  (coll-submit)
-  b. Enter name:  cp1salesman1
-  c. The app shows the vouchers for that salesman's active beats
-  d. Enter payment amounts collected against each voucher
-  e. Confirm submission when prompted
-
-STEP 3 - Finalize (as distributor)
-  a. Choose option  3  (coll-finalize)
-  b. Enter name:  dist
-  c. Review the submitted collections for each beat
-  d. Confirm to archive and close the collection cycle
-
-STEP 4 - Check Reports
-  a. Choose option  4
-  b. Try all 4 sub-reports:
-       4.1  Salesman - pending collections
-       4.2  Beat     - pending collections
-       4.3  Collections by age
-       4.4  Collections by amount
+FIRST-TIME SETUP
+-----------------
+The very first time anyone opens CollMgm, the login screen offers
+"First-time setup? Register the distributor account". That creates the one
+distributor login (username, password, and a security question used later
+for password recovery). Every other user — supervisors and salesmen — is
+then created by the distributor from Manage Users, after signing in.
 
 
-CLOSING THE APP
----------------
-Choose option  5  (Exit) from the main menu.
-Then close the terminal window.
+LOGGING IN
+----------
+Enter your username and password and click "Sign in". What you see next
+depends on your role:
+
+  Distributor  - full access: approves, posts, manages users/beats, and
+                 resolves issues other roles raise.
+  Supervisor   - approves collection lists and submitted collections.
+  Salesman     - generates collection lists for their own beats and
+                 submits the payments they collect.
 
 
-KNOWN BETA LIMITATIONS
------------------------
-- No password protection (RBAC coming in a future release)
-- Data is stored as CSV files in the install folder — not a database
-- No undo / rollback once a collection is finalized
+MAIN MENU
+---------
+The menu only shows what your role can do. The core workflow, in order:
+
+  1. Generate Collection List  - salesman creates today's voucher list
+  2. Approve Collection List   - supervisor signs off before it goes out
+  3. Submit Collections        - salesman records payments collected
+  4. Approve Collections       - supervisor reviews the submitted payments
+  5. Post Collections          - distributor writes them into the records
+
+Alongside that: Print Collection List, Correction Requests, Amend Voucher,
+Amendment Requests, Checks (payments by check), Import Vouchers / New
+Voucher Batches (bringing in a customer's existing vouchers), and Reports.
+
+
+REPORTS
+-------
+  - Pending by Salesman / Pending by Beat - what's still outstanding
+  - Collection Pipeline    - every collection list, grouped by the stage
+                              it's waiting in
+  - Onboarding Pipeline    - imported voucher batches, grouped the same way
+  - Beats Due              - which beats need a list started today,
+                              tomorrow, or are overdue, based on each
+                              beat's collection cadence (set in Manage Beats)
+  - Oldest Vouchers / Highest Balance / Voucher Search
+
+
+KNOWN LIMITATIONS
+------------------
+- Data is stored in a local SQLite database in the install folder
+- No undo / rollback once a collection is posted
 - Dates default to today's system date
 
 
 SUPPORT / FEEDBACK
-------------------
+-------------------
 Please report any issues or feedback to:  satyassn@gmail.com
 
 Include a description of:
   - What you were trying to do
-  - What menu option you chose
-  - What the screen showed (a photo of the terminal window is fine)
+  - What screen you were on
+  - What happened (a screenshot is fine)
 
 ================================================================================

@@ -119,6 +119,38 @@ TL;DR: Define a proof-of-concept data schema, validation rules, and operational 
     permission, so the distributor can see requests without holding
     `raise_amendment_request`.
 
+- `settings` (SQLite only, no CSV counterpart — added with Collection Health;
+  same "deliberately not in the v1 constraint-rebuild table set" rationale as
+  `corrections`/`amendments`/`amendment_requests`, since it's a purely
+  additive table)
+  - columns: `credit_period_days` (INTEGER, default `30`), `visit_method`
+    (`accurate | approximate`, default `accurate`), `zero_visit_bucket`
+    (`red | yellow`, default `yellow`) — the physical column name is
+    unchanged from when it only governed the zero-visit edge case, but
+    `coll_store.get_collection_health_settings()` aliases it to
+    `last_visit_color` in every dict it returns, since every Python-facing
+    name (`coll_data.LAST_VISIT_COLORS`, `classify_voucher_health`'s
+    `last_visit_color` parameter, the `/manage/credit-period` form field) now
+    uses that clearer name. Don't be surprised by the mismatch if inspecting
+    the DB directly.
+  - Purpose: single global row (no PK; `coll_store._backfill_settings_row`
+    guarantees exactly one row exists) backing the Collection Health report.
+    `credit_period_days` is how many days a voucher is allowed before it's
+    overdue. `visit_method` picks how remaining beat visits before that
+    deadline are counted: `accurate` walks each beat's real cadence schedule
+    (`coll_data.next_due_date`), `approximate` divides the days left by a
+    flat 7/14/30-day interval per cadence type. `last_visit_color` decides how
+    to color the ONE visit that is the last realistic chance to pay within
+    the credit period, and shifts the whole green/yellow boundary to match:
+    `yellow` (default) keeps today's behavior — 2+ visits remaining is green,
+    1 (or 0) is yellow, only turning red once the credit period has actually
+    expired; `red` shifts the boundary out by one visit — 3+ is green,
+    exactly 2 is yellow, 1 (or 0) turns red immediately instead of waiting
+    for the deadline to pass.
+  - Lifecycle management (web-only, distributor-only, via
+    `manage_credit_period` permission): view/update all three fields
+    together at `/manage/credit-period`.
+
 - CSV conventions (applies to all files):
   - Delimiter: comma `,`.
   - Header row required; UTF-8 encoded.
@@ -162,6 +194,7 @@ TL;DR: Define a proof-of-concept data schema, validation rules, and operational 
     .
     beat10
     ```
+  - Collection cadence (SQLite columns added with the cadence migration; not in the CSV headers above): `cadence` = `weekly` (default) | `biweekly` | `monthly` (`biweekly` was named `fortnightly` before an additive migration renamed existing rows — same weekday-every-other-week behavior, clearer word); `cadence_day` = `mon`..`sun`, required by every cadence (weekly/biweekly recur on this weekday; monthly recurs on this weekday in a specific week — blank otherwise); `cadence_week` = `1`..`4`, which week of the month a monthly beat's collection day falls on (blank otherwise; monthly-only); `cadence_start` = `YYYY-MM-DD`, an *optional* explicit first due date for any cadence, used only while there's no collection history yet — left blank, the next due date is auto-computed from `cadence_day`/`cadence_week` relative to today instead. When given, it's validated against the rest of the cadence: it must fall on `cadence_day` (weekly/biweekly), or be the exact `cadence_week`'th occurrence of `cadence_day` in its month (monthly) — rejected with a specific message otherwise. Existing beats migrate to `weekly` with no day, so the due list shows them under "Needs setup" until set — a beat already on `monthly` before `cadence_week` existed, or on `biweekly` (nee `fortnightly`) before it required a day, is likewise left blank (not auto-guessed) and falls into "Needs setup" until the distributor picks one.
   - Lifecycle management (web-only, distributor-only, via `manage_beats` permission): create/edit-salesman/delete at `/manage/beats*`. `name` is the immutable primary key — "edit" reassigns the `salesman` column only. Delete is a hard delete, blocked when the beat is referenced in `vouchers.beat` or `completed_vouchers.beat` (current or historical — this single check also covers a beat with an active staging report, since its vouchers still live in the `vouchers` table).
 
 - `vouchers.csv` (staging & data)

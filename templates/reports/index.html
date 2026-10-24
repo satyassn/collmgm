@@ -11,6 +11,22 @@
     <span class="menu-icon">&#128205;</span>
     <span>Pending by Beat</span>
   </a>
+  <a class="menu-card" href="/reports/pipeline">
+    <span class="menu-icon">&#128203;</span>
+    <span>Collection Pipeline</span>
+  </a>
+  <a class="menu-card" href="/reports/onboarding-pipeline">
+    <span class="menu-icon">&#128229;</span>
+    <span>Onboarding Pipeline</span>
+  </a>
+  <a class="menu-card" href="/reports/due">
+    <span class="menu-icon">&#128197;</span>
+    <span>Beats Due</span>
+  </a>
+  <a class="menu-card" href="/reports/collection-health">
+    <span class="menu-icon">&#129657;</span>
+    <span>Collection Health</span>
+  </a>
   <a class="menu-card" href="/reports/age">
     <span class="menu-icon">&#128336;</span>
     <span>Oldest Vouchers</span>
@@ -23,6 +39,12 @@
     <span class="menu-icon">&#128269;</span>
     <span>Voucher Search</span>
   </a>
+  {% if user.role == "distributor" %}
+  <a class="menu-card" href="/reports/setup-gaps">
+    <span class="menu-icon">&#129513;</span>
+    <span>Setup Gaps</span>
+  </a>
+  {% endif %}
 </nav>
 <a class="btn btn-secondary" href="/menu">Back to Menu</a>
 {% endblock %}

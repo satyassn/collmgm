@@ -36,7 +36,7 @@ PrivilegesRequired=admin
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "Create a &desktop shortcut for the CLI launcher"
+Name: "desktopicon"; Description: "Create a &desktop shortcut"
 
 ; ---------------------------------------------------------------------------
 ; Files
@@ -92,11 +92,21 @@ Name: "{app}\config"
 ; Shortcuts
 ; ---------------------------------------------------------------------------
 
+; The CLI (run.bat) is deprecated and intentionally has no shortcut here —
+; see CLAUDE.md. Its files are still installed below, so it still runs if
+; launched directly from the install folder; it's hidden, not removed.
 [Icons]
-Name: "{group}\CollMgm (CLI)";       Filename: "{sys}\cmd.exe"; Parameters: "/k ""{app}\run.bat""";        WorkingDir: "{app}"; IconFilename: "{sys}\cmd.exe"
-Name: "{group}\CollMgm Web Server";  Filename: "{sys}\cmd.exe"; Parameters: "/k ""{app}\run_server.bat"""; WorkingDir: "{app}"; IconFilename: "{sys}\cmd.exe"
-Name: "{group}\Uninstall CollMgm";   Filename: "{uninstallexe}"
-Name: "{commondesktop}\CollMgm (CLI)"; Filename: "{sys}\cmd.exe"; Parameters: "/k ""{app}\run.bat"""; WorkingDir: "{app}"; IconFilename: "{sys}\cmd.exe"; Tasks: desktopicon
+Name: "{group}\CollMgm";           Filename: "{sys}\cmd.exe"; Parameters: "/k ""{app}\run_server.bat"""; WorkingDir: "{app}"; IconFilename: "{sys}\cmd.exe"
+Name: "{group}\Uninstall CollMgm"; Filename: "{uninstallexe}"
+Name: "{commondesktop}\CollMgm";   Filename: "{sys}\cmd.exe"; Parameters: "/k ""{app}\run_server.bat"""; WorkingDir: "{app}"; IconFilename: "{sys}\cmd.exe"; Tasks: desktopicon
+
+; Older builds shipped a separate "CollMgm (CLI)" shortcut (Start Menu + desktop)
+; pointing at run.bat. Inno Setup doesn't remove shortcuts that disappear from
+; [Icons] on an in-place upgrade, so delete them explicitly to avoid customers on
+; those builds relaunching the deprecated CLI from a stale icon after this update.
+[InstallDelete]
+Type: files; Name: "{group}\CollMgm (CLI).lnk"
+Type: files; Name: "{commondesktop}\CollMgm (CLI).lnk"
 
 ; ---------------------------------------------------------------------------
 ; Post-install: set up Windows Service and firewall rule

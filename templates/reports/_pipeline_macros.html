@@ -1,0 +1,35 @@
+{# Shared by reports/pipeline.html (Collection Pipeline) and
+   reports/onboarding_pipeline.html (Onboarding Pipeline): the vertical,
+   mobile-first stage list — every stage listed in sequence, stages with
+   cards expand/collapse, empty stages show 0 and can't be opened. #}
+
+{% macro age_text(days) -%}
+  {%- if days is none %}date unknown{% else %}{{ days }} day{{ '' if days == 1 else 's' }}{% endif -%}
+{%- endmacro %}
+
+{% macro stage_list(stages, groups, card) -%}
+  <div class="pipe-stages">
+  {% for key, label in stages %}
+    {% set items = groups[key] %}
+    {% if items %}
+    <details class="pipe-stage" open>
+      <summary>
+        <span class="pipe-stage-name">{{ loop.index }}. {{ label }}</span>
+        <span class="pipe-stage-count">{{ items | length }}</span>
+        <span class="pipe-chevron" aria-hidden="true"></span>
+      </summary>
+      <div class="pipe-cards">
+        {% for it in items %}{{ card(it) }}{% endfor %}
+      </div>
+    </details>
+    {% else %}
+    <div class="pipe-stage">
+      <div class="pipe-stage-row">
+        <span class="pipe-stage-name">{{ loop.index }}. {{ label }}</span>
+        <span class="pipe-stage-count zero">0</span>
+      </div>
+    </div>
+    {% endif %}
+  {% endfor %}
+  </div>
+{%- endmacro %}

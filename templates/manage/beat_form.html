@@ -29,6 +29,40 @@
     </select>
   </label>
 
+  {% set cad = target.cadence if target and target.cadence else 'weekly' %}
+  {% set cday = target.cadence_day if target and target.cadence_day else '' %}
+  {% set cweek = target.cadence_week if target and target.cadence_week else '' %}
+  {% set cstart = target.cadence_start if target and target.cadence_start else '' %}
+  <label class="field-label">Collection cadence
+    <select name="cadence" id="cadence-select" required>
+      {% for c, label in [('weekly', 'Weekly'), ('biweekly', 'Biweekly'), ('monthly', 'Monthly')] %}
+      <option value="{{ c }}" {% if cad == c %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <label class="field-label">Collection day
+    <select name="cadence_day">
+      <option value="">Select a day</option>
+      {% for code, label in [('mon','Monday'),('tue','Tuesday'),('wed','Wednesday'),('thu','Thursday'),('fri','Friday'),('sat','Saturday'),('sun','Sunday')] %}
+      <option value="{{ code }}" {% if cday == code %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <label class="field-label" data-cadence-field="week">Week of the month <span class="report-meta">(monthly beats)</span>
+    <select name="cadence_week">
+      <option value="">Select a week</option>
+      {% for code, label in [('1','1st'),('2','2nd'),('3','3rd'),('4','4th')] %}
+      <option value="{{ code }}" {% if cweek == code %}selected{% endif %}>{{ label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <label class="field-label">First collection date <span class="report-meta">(optional — leave blank to use the next matching day)</span>
+    <input type="date" name="cadence_start" value="{{ cstart }}">
+  </label>
+
   <div class="action-row">
     <button type="submit" class="btn btn-primary" {% if not salesmen %}disabled{% endif %}>{{ 'Create Beat' if mode == 'create' else 'Save' }}</button>
     <a class="btn btn-secondary" href="/manage/beats">Cancel</a>

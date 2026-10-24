@@ -7,12 +7,12 @@ Imports only from coll_store. current_user parameter is reserved for future RBAC
 
 import json
 import re
-from datetime import datetime
+from collections import namedtuple
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 from coll_store import (
     DATA_DIR, STAGING_DIR, load_vouchers_raw, bill_no_sort_key,
-    _load_pending_start_reports, _load_pending_submit_reports,
     load_beats_raw, load_users_raw,
     load_installments_for_bill, load_completed_voucher,
 )
@@ -348,7 +348,7 @@ def search_voucher(bill_no):
 
     Returns (voucher_dict, [installment_dicts], is_completed) or None if not found.
     """
-    bill_no = bill_no.strip()
+    bill_no = bill_no.strip().upper()
 
     for row in load_vouchers_raw():
         if row.get("bill_no", "").strip() == bill_no:
@@ -425,22 +425,33 @@ def load_addv_pending_confirm_by_beat():
 
 # First char alphanumeric blocks spreadsheet formula injection (=+-@);
 # the allowlist excludes commas/quotes/whitespace that break CSV exports.
-_BILL_NO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+# Public (not _-prefixed): also used by coll_api.py to pre-validate a
+# voucher-number change in Voucher Amendment before calling into coll_orchestrate.
+BILL_NO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 
 
 def validate_single_voucher(bill_no, date_str, amount_str, beat, salesman,
-                             existing_bill_nos, valid_beats, valid_salesmen):
-    """Validate one voucher's fields. Returns (errors: list[str], amount: Decimal or None)."""
+                             existing_bill_nos, valid_beats, valid_salesmen,
+                             beat_salesman_map=None):
+    """Validate one voucher's fields. Returns (errors: list[str], amount: Decimal or None).
+
+    beat_salesman_map: optional {beat_name: assigned_salesman}. When given and
+    the beat has an assigned salesman on file, a voucher whose own salesman
+    differs is rejected here — importing a mismatch is blocked outright,
+    rather than left to surface later as a blocked Generate Collection List.
+    A beat with no assignment yet is not checked; there is nothing to compare
+    against.
+    """
     errors = []
     amount = None
 
     if not bill_no:
-        errors.append("Bill No is required.")
-    elif not _BILL_NO_RE.match(bill_no):
-        errors.append(f"Bill No '{bill_no}' contains invalid characters "
+        errors.append("Voucher is required.")
+    elif not BILL_NO_RE.match(bill_no):
+        errors.append(f"Voucher '{bill_no}' contains invalid characters "
                       "(allowed: letters, digits, . _ / - ; must start with a letter or digit).")
     elif bill_no in existing_bill_nos:
-        errors.append(f"Bill No '{bill_no}' already exists in the system.")
+        errors.append(f"Voucher '{bill_no}' already exists in the system.")
 
     if not date_str:
         errors.append("Date is required.")
@@ -472,35 +483,45 @@ def validate_single_voucher(bill_no, date_str, amount_str, beat, salesman,
         errors.append("Salesman is required.")
     elif salesman not in valid_salesmen:
         errors.append(f"Salesman '{salesman}' not found in users.csv.")
+    elif beat_salesman_map is not None:
+        assigned = beat_salesman_map.get(beat, "")
+        if assigned and salesman != assigned:
+            errors.append(
+                f"Salesman '{salesman}' does not match the assigned salesman "
+                f"'{assigned}' for beat '{beat}'.")
 
     return errors, amount
 
 
 def validate_addv_batch(voucher_rows, inst_rows, existing_bill_nos,
-                        valid_beats, valid_salesmen, created_by, now_str):
+                        valid_beats, valid_salesmen, created_by, now_str,
+                        beat_salesman_map=None):
     """Validate batch CSV data. Returns (errors, vouchers, installments).
 
     Errors block the entire import. Vouchers/installments are enriched with metadata
-    and balance is calculated from installment sums.
+    and balance is calculated from installment sums. beat_salesman_map: see
+    validate_single_voucher — blocks a row whose salesman doesn't match its
+    beat's assigned salesman.
     """
     errors = []
     vouchers = []
     seen_bill_nos = set()
 
     for i, row in enumerate(voucher_rows, start=2):
-        bill_no = row.get("bill_no", "").strip()
+        bill_no = row.get("bill_no", "").strip().upper()
         date_str = row.get("date", "").strip()
         amount_str = row.get("amount", "").strip()
         beat = row.get("beat", "").strip()
         salesman = row.get("salesman", "").strip()
 
         if bill_no and bill_no in seen_bill_nos:
-            errors.append(f"Voucher row {i}: duplicate bill_no '{bill_no}' in import file.")
+            errors.append(f"Voucher row {i}: duplicate voucher '{bill_no}' in import file.")
             continue
 
         row_errors, amount = validate_single_voucher(
             bill_no, date_str, amount_str, beat, salesman,
             existing_bill_nos, valid_beats, valid_salesmen,
+            beat_salesman_map=beat_salesman_map,
         )
         if row_errors:
             for e in row_errors:
@@ -523,16 +544,16 @@ def validate_addv_batch(voucher_rows, inst_rows, existing_bill_nos,
     inst_sums = {}
 
     for i, row in enumerate(inst_rows, start=2):
-        bill_no = row.get("bill_no", "").strip()
+        bill_no = row.get("bill_no", "").strip().upper()
         date_str = row.get("date", "").strip()
         amount_str = row.get("amount", "").strip()
         salesman = row.get("salesman", "").strip()
 
         if not bill_no:
-            errors.append(f"Installment row {i}: bill_no is empty.")
+            errors.append(f"Installment row {i}: voucher is empty.")
             continue
         if bill_no not in seen_bill_nos:
-            errors.append(f"Installment row {i}: bill_no '{bill_no}' not in vouchers being imported.")
+            errors.append(f"Installment row {i}: voucher '{bill_no}' not in vouchers being imported.")
             continue
         if not date_str:
             errors.append(f"Installment row {i} ({bill_no}): date is empty.")
@@ -585,3 +606,350 @@ def validate_addv_batch(voucher_rows, inst_rows, existing_bill_nos,
             v["balance"] = str((v_amount - inst_sum).quantize(Decimal("0.01")))
 
     return errors, vouchers, installments
+
+
+# --- Beat cadence and due dates (pure) ---
+
+CADENCE_DAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+CADENCE_WEEKS = ("1", "2", "3", "4")
+DUE_WINDOW_DEFAULT = 3
+DUE_WINDOW_MAX = 14
+_LIST_STAMP_RE = re.compile(r"^coll(\d{4})(\d{2})(\d{2})")
+
+
+def _parse_iso_date(text):
+    """YYYY-MM-DD -> date, or None for blank/invalid input."""
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def report_date(path, data):
+    """Date a collection list was generated: its `date` field, else the
+    YYYYMMDD stamp in its filename (older lists predate the field)."""
+    parsed = _parse_iso_date(data.get("date", ""))
+    if parsed:
+        return parsed
+    m = _LIST_STAMP_RE.match(path.name)
+    if m:
+        try:
+            return date(int(m[1]), int(m[2]), int(m[3]))
+        except ValueError:
+            return None
+    return None
+
+
+def next_weekday_on_or_after(d, weekday):
+    """First date on or after `d` that falls on `weekday` (0 = Monday)."""
+    return d + timedelta(days=(weekday - d.weekday()) % 7)
+
+
+def nth_weekday_of_month(year, month, weekday, n):
+    """The n-th (1-4) occurrence of `weekday` (0=Mon) in the given month.
+    Always valid for n<=4 — every month has at least four of each weekday."""
+    first = date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return date(year, month, 1 + offset + (n - 1) * 7)
+
+
+def _next_due_weekly(cadence_day, cadence_week, cadence_start, anchor, today):
+    if cadence_day not in CADENCE_DAYS:
+        return None
+    weekday = CADENCE_DAYS[cadence_day]
+    if anchor is not None:
+        return next_weekday_on_or_after(anchor + timedelta(days=7), weekday)
+    if cadence_start is not None:
+        return cadence_start
+    return next_weekday_on_or_after(today, weekday)
+
+
+def _next_due_biweekly(cadence_day, cadence_week, cadence_start, anchor, today):
+    if cadence_day not in CADENCE_DAYS:
+        return None
+    weekday = CADENCE_DAYS[cadence_day]
+    if anchor is not None:
+        return anchor + timedelta(days=14)  # +14 days preserves whatever weekday the anchor fell on
+    if cadence_start is not None:
+        return cadence_start
+    return next_weekday_on_or_after(today, weekday)
+
+
+def _next_due_monthly(cadence_day, cadence_week, cadence_start, anchor, today):
+    if cadence_day not in CADENCE_DAYS or cadence_week not in CADENCE_WEEKS:
+        return None
+    weekday, n = CADENCE_DAYS[cadence_day], int(cadence_week)
+    if anchor is not None:
+        year, month = anchor.year, anchor.month + 1
+        if month > 12:
+            month, year = 1, year + 1
+        return nth_weekday_of_month(year, month, weekday, n)
+    if cadence_start is not None:
+        return cadence_start
+    year, month = today.year, today.month
+    due = nth_weekday_of_month(year, month, weekday, n)
+    if due < today:
+        # This month's slot already passed; next month's is unconditionally
+        # on/after today (any date in month+1 is after any date in month,
+        # and today is still within `month`) — never needs a second check.
+        month += 1
+        if month > 12:
+            month, year = 1, year + 1
+        due = nth_weekday_of_month(year, month, weekday, n)
+    return due
+
+
+_WEEKDAY_FULL = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+CADENCE_WEEK_LABELS = {"1": "1st", "2": "2nd", "3": "3rd", "4": "4th"}
+
+
+def _validate_start_weekday(cadence_day, cadence_week, start):
+    """Shared by weekly and biweekly: an explicit first collection date must
+    actually fall on the chosen collection day."""
+    if start.weekday() != CADENCE_DAYS[cadence_day]:
+        return (f"First collection date {start.isoformat()} is a {_WEEKDAY_FULL[start.weekday()]}, "
+                f"but the collection day is set to {_WEEKDAY_FULL[CADENCE_DAYS[cadence_day]]}.")
+    return None
+
+
+def _validate_start_monthly(cadence_day, cadence_week, start):
+    """An explicit first collection date must be the exact chosen
+    week-of-month occurrence of the chosen collection day."""
+    weekday, n = CADENCE_DAYS[cadence_day], int(cadence_week)
+    if nth_weekday_of_month(start.year, start.month, weekday, n) != start:
+        return (f"First collection date {start.isoformat()} ({_WEEKDAY_FULL[start.weekday()]}) is not "
+                f"the {CADENCE_WEEK_LABELS[cadence_week]} {_WEEKDAY_FULL[weekday]} of its month.")
+    return None
+
+
+CadenceSpec = namedtuple("CadenceSpec", ["required_fields", "next_due", "approx_days", "validate_start"])
+
+# Adding a cadence means one new _next_due_* function + one entry here —
+# next_due_date/validate_cadence/count_remaining_visits all dispatch off this,
+# none of them hardcode a per-cadence branch. validate_start may be None for a
+# cadence with no explicit-start-date cross-check to make.
+CADENCE_REGISTRY = {
+    "weekly":   CadenceSpec(frozenset({"day"}), _next_due_weekly, 7, _validate_start_weekday),
+    "biweekly": CadenceSpec(frozenset({"day"}), _next_due_biweekly, 14, _validate_start_weekday),
+    "monthly":  CadenceSpec(frozenset({"day", "week"}), _next_due_monthly, 30, _validate_start_monthly),
+}
+CADENCES = tuple(CADENCE_REGISTRY)
+
+
+def validate_cadence(cadence, cadence_day, cadence_week, cadence_start):
+    """Error message for an invalid cadence setting, or None.
+
+    A weekly, biweekly or monthly beat all need a collection day; a monthly
+    beat also needs which week of the month (1st-4th). cadence_start may be
+    blank for any cadence — left blank, the next due date is auto-computed
+    from today instead (a blank weekly/monthly beat already worked this way;
+    this now applies to biweekly too). When cadence_start IS given, it must
+    actually fall on the right day (and week, for monthly) for the cadence
+    — otherwise it's rejected with a specific message, not silently accepted.
+    """
+    spec = CADENCE_REGISTRY.get(cadence)
+    if spec is None:
+        return f"Cadence must be one of: {', '.join(CADENCES)}."
+    if "day" in spec.required_fields and cadence_day not in CADENCE_DAYS:
+        return f"A {cadence} beat needs a collection day (Mon to Sun)."
+    if "week" in spec.required_fields and cadence_week not in CADENCE_WEEKS:
+        return f"A {cadence} beat needs a week of the month (1st to 4th)."
+    if cadence_start:
+        start = _parse_iso_date(cadence_start)
+        if start is None:
+            return f"Invalid start date '{cadence_start}'; expected YYYY-MM-DD."
+        if spec.validate_start is not None:
+            start_err = spec.validate_start(cadence_day, cadence_week, start)
+            if start_err:
+                return start_err
+    return None
+
+
+def next_due_date(cadence, cadence_day, cadence_week, cadence_start, anchor, today):
+    """Next date a beat is due, or None when it cannot be worked out.
+
+    anchor: the date of the beat's active collection list if it has one, else
+    the date of its last posted list, else None (no history).
+    cadence_start: an optional explicit first due date, used only when there's
+    no anchor yet — otherwise every cadence auto-computes from cadence_day
+    (and cadence_week, for monthly) relative to today.
+    """
+    spec = CADENCE_REGISTRY.get(cadence)
+    if spec is None:
+        return None
+    return spec.next_due(cadence_day, cadence_week, cadence_start, anchor, today)
+
+
+def latest_list_dates(reports):
+    """beat -> newest list date, from (path, data) collection-list pairs.
+
+    Public (not _-prefixed): also used by coll_api.py's Generate Collection
+    List picker to show each beat's active list's start date.
+    """
+    latest = {}
+    for path, data in reports:
+        sel = data.get("selection") or []
+        d = report_date(path, data)
+        if not sel or d is None:
+            continue
+        if sel[0] not in latest or d > latest[sel[0]]:
+            latest[sel[0]] = d
+    return latest
+
+
+def build_due_list(beats, staged, archived, today, window_days):
+    """Split beats into overdue / due today / upcoming within `window_days`,
+    plus beats that cannot be scheduled yet.
+
+    beats: rows with name, salesman, cadence, cadence_day, cadence_week, cadence_start.
+    staged / archived: (path, data) collection-list pairs. The anchor is the
+    newest staged list for the beat if one is active, else its newest archived list.
+    """
+    active = latest_list_dates(staged)
+    posted = latest_list_dates(archived)
+    horizon = today + timedelta(days=window_days)
+    result = {"overdue": [], "due_today": [], "upcoming": [], "needs_setup": []}
+    for b in beats:
+        name = b["name"]
+        anchor = active.get(name) or posted.get(name)
+        due = next_due_date(b.get("cadence", ""), b.get("cadence_day", ""),
+                            b.get("cadence_week", ""), _parse_iso_date(b.get("cadence_start", "")),
+                            anchor, today)
+        row = {
+            "beat": name,
+            "salesman": b.get("salesman", ""),
+            "cadence": b.get("cadence", ""),
+            "cadence_day": b.get("cadence_day", ""),
+            "cadence_week": b.get("cadence_week", ""),
+            "next_due": due,
+            "anchor": anchor,
+            "in_progress": name in active,
+        }
+        if due is None:
+            result["needs_setup"].append(row)
+        elif due < today:
+            result["overdue"].append(row)
+        elif due == today:
+            result["due_today"].append(row)
+        elif due <= horizon:
+            result["upcoming"].append(row)
+    for key in ("overdue", "due_today", "upcoming"):
+        result[key].sort(key=lambda r: (r["next_due"], r["beat"]))
+    result["needs_setup"].sort(key=lambda r: r["beat"])
+    return result
+
+
+# --- Collection Health (pure) ---
+
+VISIT_METHODS = ("accurate", "approximate")
+LAST_VISIT_COLORS = ("yellow", "red")
+
+
+def validate_collection_health_settings(credit_period_days_str, visit_method, last_visit_color):
+    """Error messages (if any) for the Collection Health settings form, plus
+    the parsed credit period. Returns (errors: list[str], credit_period_days: int or None)."""
+    errors = []
+    credit_period_days = None
+    try:
+        credit_period_days = int(credit_period_days_str)
+        if credit_period_days <= 0:
+            errors.append("Credit period must be a positive number of days.")
+            credit_period_days = None
+    except (TypeError, ValueError):
+        errors.append(f"Invalid credit period {credit_period_days_str!r}; expected a whole number of days.")
+    if visit_method not in VISIT_METHODS:
+        errors.append("Invalid visit counting method.")
+    if last_visit_color not in LAST_VISIT_COLORS:
+        errors.append("Invalid choice for the last-chance visit color.")
+    return errors, credit_period_days
+
+
+def count_remaining_visits(cadence, cadence_day, cadence_week, cadence_start, anchor, today,
+                            deadline, method="accurate", max_iterations=120):
+    """Number of scheduled beat visits on/after `today` and on/before
+    `deadline`. None if the beat's cadence can't be scheduled (needs setup).
+
+    method="approximate" ignores cadence_day/cadence_week/cadence_start/anchor
+    entirely — it only needs the cadence type to pick a flat day interval.
+    """
+    if method == "approximate":
+        spec = CADENCE_REGISTRY.get(cadence)
+        if spec is None:
+            return None
+        days_left = (deadline - today).days
+        return max(days_left, 0) // spec.approx_days
+
+    current_anchor = anchor
+    visits = 0
+    for _ in range(max_iterations):
+        due = next_due_date(cadence, cadence_day, cadence_week, cadence_start, current_anchor, today)
+        if due is None:
+            return None
+        if due < today:
+            current_anchor = due  # stale anchor chain catching up to today; don't count
+            continue
+        if due > deadline:
+            break
+        visits += 1
+        current_anchor = due
+    return visits
+
+
+def classify_voucher_health(voucher_date, credit_period_days, cadence, cadence_day, cadence_week,
+                             cadence_start, anchor, today, visit_method="accurate",
+                             last_visit_color="yellow"):
+    """'red' | 'yellow' | 'green' | 'unknown' for one open voucher.
+
+    'unknown' means the beat's cadence can't be scheduled yet (needs setup,
+    same condition as Beats Due) — only possible under visit_method="accurate".
+
+    last_visit_color decides how the ONE visit that is the last realistic
+    chance to pay within the credit period is colored, and shifts the whole
+    green/yellow boundary to match it:
+    "yellow" (default): >=2 visits remaining is green, 1 is yellow, and 0 is
+    also yellow (never shown as calmer than "exactly one left").
+    "red": >=3 is green, 2 is yellow (one visit before the last chance), and
+    1 or 0 is red (the last-chance visit itself, marked red right away
+    instead of waiting for the credit period to actually expire).
+    """
+    age = (today - voucher_date).days
+    if age > credit_period_days:
+        return "red"
+    deadline = voucher_date + timedelta(days=credit_period_days)
+    visits = count_remaining_visits(cadence, cadence_day, cadence_week, cadence_start, anchor,
+                                     today, deadline, method=visit_method)
+    if visits is None:
+        return "unknown"
+    last_chance = 1 if last_visit_color == "yellow" else 2
+    if visits > last_chance:
+        return "green"
+    if visits == last_chance:
+        return "yellow"
+    return last_visit_color
+
+
+def build_collection_health(beat_row, vouchers, settings, staged, archived, today):
+    """Classify a beat's open vouchers into green/yellow/red/unknown.
+
+    vouchers: flat list of voucher dicts for this beat, already filtered to
+    balance > 0 (pass query_pending_by_beat(beat_row["name"]).values() flattened).
+    settings: the dict from coll_store.get_collection_health_settings().
+    staged / archived: (path, data) collection-list pairs, same shape build_due_list takes.
+    """
+    anchor = (latest_list_dates(staged).get(beat_row["name"])
+              or latest_list_dates(archived).get(beat_row["name"]))
+    buckets = {"green": [], "yellow": [], "red": [], "unknown": []}
+    for v in vouchers:
+        vd = _parse_iso_date(v["date"])
+        bucket = classify_voucher_health(
+            vd, settings["credit_period_days"], beat_row.get("cadence", ""),
+            beat_row.get("cadence_day", ""), beat_row.get("cadence_week", ""),
+            _parse_iso_date(beat_row.get("cadence_start", "")),
+            anchor, today, visit_method=settings["visit_method"],
+            last_visit_color=settings["last_visit_color"])
+        buckets[bucket].append(v)
+    counts = {k: len(v) for k, v in buckets.items()}
+    totals = {k: sum((Decimal(x["balance"]) for x in v), Decimal("0")) for k, v in buckets.items()}
+    return {"buckets": buckets, "counts": counts, "totals": totals, "anchor": anchor}

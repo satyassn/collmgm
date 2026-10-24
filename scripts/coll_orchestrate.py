@@ -15,7 +15,10 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Literal, NamedTuple, Optional
 
-from coll_data import _find_any_active_beat_report, search_voucher
+from coll_data import (
+    _find_any_active_beat_report, search_voucher, report_date, _parse_iso_date,
+    build_due_list, DUE_WINDOW_DEFAULT,
+)
 from coll_store import (
     STAGING_DIR,
     parse_decimal, load_vouchers_by_bill_nos, load_beats_raw,
@@ -32,7 +35,7 @@ from coll_store import (
     mark_correction_applied, open_corrections_for_bills,
     CorrectionConflict, load_correction,
     apply_voucher_amendment,
-    insert_amendment_request, load_amendment_request,
+    insert_amendment_request, load_amendment_requests,
     resolve_amendment_request as _store_resolve_amendment_request,
     auto_resolve_amendment_requests,
     mark_check_encashed, mark_check_bounced,
@@ -802,7 +805,7 @@ def return_post_stage(report_path, report_data):
 # Correction requests
 # ---------------------------------------------------------------------------
 
-def _refresh_staged_voucher_fields(bill_no):
+def _refresh_staged_voucher_fields(bill_no, new_bill_no=None):
     """After a correction or amendment changed master data, refresh the
     staged display fields for `bill_no` in every active staging report (and
     regenerate the TXT sidecar to match): `balance`, `voucher_date`, and
@@ -816,8 +819,15 @@ def _refresh_staged_voucher_fields(bill_no):
     the next generated list, not retroactively to reports already in flight.
     Also NOT `payment`/`payment_date` — those are the salesman's own staged
     entry for this cycle, untouched by a master-data change.
+
+    new_bill_no: set when the amendment also renamed the voucher. Master data
+    now exists only under the new number, but the staged JSON still has the
+    old one, so the voucher is looked up by new_bill_no and matched in the
+    report by the old one — and `bill_no` itself is refreshed alongside the
+    other display fields, or this voucher would silently vanish from master
+    data's point of view the next time the report is validated or posted.
     """
-    row = load_vouchers_by_bill_nos([bill_no]).get(bill_no)
+    row = load_vouchers_by_bill_nos([new_bill_no or bill_no]).get(new_bill_no or bill_no)
     if row is None:
         return  # settled/archived by the correction path is impossible; be safe
     for path in list_staging_reports():
@@ -829,6 +839,8 @@ def _refresh_staged_voucher_fields(bill_no):
         hit = False
         for v in vouchers:
             if isinstance(v, dict) and v.get("bill_no") == bill_no:
+                if new_bill_no:
+                    v["bill_no"] = new_bill_no
                 v["balance"] = row["balance"]
                 v["voucher_date"] = row["date"]
                 v["salesman"] = row["salesman"]
@@ -1003,7 +1015,7 @@ def apply_correction_request(corr_id, action, resolved_by, resolution_note=None)
     raise ValueError(f"unknown correction action {action!r}")
 
 
-def amend_voucher(bill_no, snapshot, new_state, amended_by, note=""):
+def amend_voucher(bill_no, snapshot, new_state, amended_by, note="", new_bill_no=None):
     """Apply a distributor raw edit of one voucher + its installments, then
     refresh the staged display fields everywhere it's currently in flight.
 
@@ -1016,13 +1028,20 @@ def amend_voucher(bill_no, snapshot, new_state, amended_by, note=""):
     amendment that invalidates a staged payment is caught there and remedied
     by the existing Return flow.
 
+    new_bill_no: optional voucher-number change (coll_store does the actual
+    rename, across master data and every audit table). The amendment dict it
+    returns already carries the NEW number as its own `bill_no` — used below
+    instead of the original parameter so the staged-report refresh and the
+    amendment-request auto-resolve both operate under the corrected number.
+
     Returns the new amendment dict. Raises ValueError (missing voucher, bad
     field, negative balance) or coll_store.AmendmentConflict (load-time
     snapshot went stale).
     """
-    amendment = apply_voucher_amendment(bill_no, snapshot, new_state, amended_by, note or "")
-    _refresh_staged_voucher_fields(bill_no)
-    auto_resolve_amendment_requests(bill_no, amended_by, amendment["id"])
+    amendment = apply_voucher_amendment(bill_no, snapshot, new_state, amended_by, note or "",
+                                        new_bill_no=new_bill_no)
+    _refresh_staged_voucher_fields(bill_no, new_bill_no=new_bill_no)
+    auto_resolve_amendment_requests(amendment["bill_no"], amended_by, amendment["id"])
     return amendment
 
 
@@ -1046,6 +1065,38 @@ def raise_amendment_request(bill_no, requested_by, note):
         raise ValueError(f"voucher {bill_no} is completed — cannot request an amendment")
     now = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
     return insert_amendment_request(bill_no, note or "", requested_by, now)
+
+
+def find_and_flag_salesman_mismatches(vouchers, assigned_salesman, raised_by):
+    """Among `vouchers` about to go into a beat-wide Generate Collection List
+    (each already carrying its own `bill_no`/`beat`/`salesman`), find every
+    one whose own salesman differs from the beat's assigned salesman
+    (`beats.salesman` — see coll_store.load_beats_raw).
+
+    Every mismatched bill_no gets an open Amendment Request raised against it
+    (skipped if one is already open, so retrying doesn't pile up duplicates),
+    so the distributor has a single place — Amendment Requests — to fix it
+    via Voucher Amendment. Returns the list of mismatched bill_nos; an empty
+    list means the beat is clean. A voucher that goes completed/archived
+    between being loaded and here is skipped rather than failing the whole
+    check — it will no longer be pending next time either.
+    """
+    mismatched = [v for v in vouchers if v.get("salesman", "") != assigned_salesman]
+    if not mismatched:
+        return []
+    already_open = {r["bill_no"] for r in load_amendment_requests(statuses=["open"])}
+    for v in mismatched:
+        bill_no = v.get("bill_no", "")
+        if bill_no in already_open:
+            continue
+        note = (f"Beat/salesman mismatch: voucher is on beat '{v.get('beat', '')}' "
+                f"(assigned salesman '{assigned_salesman}') but its own salesman is "
+                f"recorded as '{v.get('salesman', '')}'. Fix via Voucher Amendment.")
+        try:
+            raise_amendment_request(bill_no, raised_by, note)
+        except ValueError:
+            continue
+    return [v.get("bill_no", "") for v in mismatched]
 
 
 def resolve_amendment_request(req_id, action, resolved_by, resolution_note=None):
@@ -1259,6 +1310,216 @@ def addv_open_flags_awaiting_distributor(batch_data):
                 if v.get("approved_at") and not v.get("posted_at")}
     return [f for f in batch_data.get("flags", [])
             if f.get("status") == "open" and f.get("bill_no") in approved]
+
+
+# Stage names match the Collection Workflow menu labels exactly (see
+# templates/menu.html / CLAUDE.md UI naming conventions), so the pipeline
+# report and the menu always describe the same step the same way. "Generate
+# Collection List" itself isn't a pipeline stage — a list only appears here
+# once it exists — so the stages start from the step after it.
+COLLECTION_PIPELINE_STAGES = (
+    ("waiting_start", "Approve Collection List"),
+    ("submit", "Submit Collections"),
+    ("waiting_submit", "Approve Collections"),
+    ("waiting_post", "Post Collections"),
+)
+ONBOARDING_PIPELINE_STAGES = (
+    ("pending_review", "Pending review"),
+    ("awaiting_approval", "Awaiting approval"),
+    ("awaiting_resolution", "Awaiting resolution"),
+    ("ready_to_post", "Ready to post"),
+)
+PIPELINE_STALE_AFTER_DAYS = 2
+
+
+def collection_stage(stages):
+    """Pipeline column for one collection list, from its stages dict. The
+    "Submit Collections" stage covers not-yet-started, in-progress and
+    returned lists alike — all three are waiting on that one menu step;
+    `returned` on the item itself tells them apart."""
+    if stages.get("start") != "confirmed":
+        return "waiting_start"
+    submit = stages.get("submit", "")
+    if submit == "confirmed":
+        return "waiting_post"
+    if submit == "submitted":
+        return "waiting_submit"
+    return "submit"
+
+
+def _sum_balances(vouchers):
+    total = Decimal("0")
+    for v in vouchers:
+        try:
+            total += Decimal(v.get("balance") or "0")
+        except InvalidOperation:
+            continue
+    return total
+
+
+def build_collection_pipeline(staged_reports, today, salesman=None):
+    """Group every active collection list by the stage it is waiting in.
+    Derived at render time, never stored.
+
+    staged_reports: (path, data) pairs from coll_store.load_staged_coll_reports.
+    salesman: when given, only that salesman's vouchers count, and a list with
+    none of their vouchers is left out.
+    """
+    collection = {key: [] for key, _ in COLLECTION_PIPELINE_STAGES}
+    for path, data in staged_reports:
+        vouchers = data.get("vouchers", [])
+        if salesman is not None:
+            vouchers = [v for v in vouchers if v.get("salesman") == salesman]
+            if not vouchers:
+                continue
+        stages = data.get("stages", {})
+        sel = data.get("selection") or [""]
+        d = report_date(path, data)
+        age = (today - d).days if d else None
+        collection[collection_stage(stages)].append({
+            "beat": sel[0],
+            "salesmen": sorted({v.get("salesman", "") for v in vouchers} - {""}),
+            "bills": len(vouchers),
+            "balance": _sum_balances(vouchers),
+            "date": d,
+            "age_days": age,
+            "stale": age is not None and age > PIPELINE_STALE_AFTER_DAYS,
+            "returned": stages.get("submit") == "returned",
+        })
+    return collection
+
+
+def build_onboarding_pipeline(addv_batches, today, salesman=None):
+    """Group every active onboarding batch by the stage each of its vouchers
+    is waiting in — one voucher-onboarding stage per card, not one per batch,
+    since vouchers in the same batch move independently. Derived at render
+    time, never stored.
+
+    addv_batches: (path, data) pairs from coll_store.load_addv_batches.
+    salesman: when given, only that salesman's vouchers count.
+    """
+    onboarding = {key: [] for key, _ in ONBOARDING_PIPELINE_STAGES}
+    for path, data in addv_batches:
+        flags = data.get("flags", [])
+        by_stage = {}
+        for v in data.get("vouchers", []):
+            if salesman is not None and v.get("salesman") != salesman:
+                continue
+            stage = addv_voucher_stage(v, flags)
+            if stage in onboarding:
+                by_stage.setdefault(stage, []).append(v)
+        created_text = data.get("created_at", "")
+        created = _parse_iso_date(created_text[:10])
+        age = (today - created).days if created else None
+        for stage_key, _ in ONBOARDING_PIPELINE_STAGES:
+            vs = by_stage.get(stage_key)
+            if not vs:
+                continue
+            bills = {v["bill_no"] for v in vs}
+            onboarding[stage_key].append({
+                "batch": f"{data.get('created_by', '')} · {created_text[:10]}",
+                "salesmen": sorted({v.get("salesman", "") for v in vs} - {""}),
+                "bills": len(vs),
+                "balance": _sum_balances(vs),
+                "age_days": age,
+                "stale": age is not None and age > PIPELINE_STALE_AFTER_DAYS,
+                "open_flags": sum(1 for f in flags
+                                  if f.get("status") == "open" and f.get("bill_no") in bills),
+            })
+    return onboarding
+
+
+# --- Setup Gaps (pure) ---
+
+# Must match the column defaults in coll_store._SETTINGS_BODY — there's no
+# separate "configured" flag, so a settings row equal to these values is the
+# only available signal that Collection Health settings haven't been touched.
+_SETTINGS_FACTORY_DEFAULT = {
+    "credit_period_days": 30, "visit_method": "accurate", "last_visit_color": "yellow",
+}
+
+
+def build_setup_gaps(beats, users, vouchers_with_data, addv_batches, staged, archived,
+                      settings, today):
+    """One-time setup / data-feed completeness check for the distributor,
+    cutting across beats, users, master-data vouchers and onboarding batches.
+    Derived at render time, never stored — same approach as build_due_list
+    and build_collection_health.
+
+    beats: rows with name, salesman, cadence, cadence_day, cadence_start.
+    users: rows with name, role.
+    vouchers_with_data: set of beat names with at least one voucher in master
+        data, current or historical (coll_store.beats_with_vouchers()).
+    addv_batches: (path, data) pairs from coll_store.load_addv_batches.
+    staged / archived: (path, data) collection-list pairs, same shape
+        build_due_list/build_collection_pipeline take.
+    settings: the dict from coll_store.get_collection_health_settings().
+    """
+    no_beats = not beats
+    no_supervisor = not any(u.get("role") == "supervisor" for u in users)
+    no_salesman_user = not any(u.get("role") == "salesman" for u in users)
+    no_salesman_beats = sorted(b["name"] for b in beats if not (b.get("salesman") or "").strip())
+
+    needs_cadence_beats = build_due_list(beats, staged, archived, today,
+                                        DUE_WINDOW_DEFAULT)["needs_setup"]
+
+    # A beat currently mid-onboarding (an unposted addv voucher) isn't
+    # "missing" — it's in progress. Once every voucher in a batch posts, the
+    # beat shows up in vouchers_with_data instead, so this set only needs the
+    # not-yet-posted ones.
+    addv_active_beats = {
+        v.get("beat")
+        for _, data in addv_batches
+        for v in data.get("vouchers", [])
+        if addv_voucher_stage(v, data.get("flags", [])) != "posted"
+    }
+    no_voucher_beats = sorted(
+        b["name"] for b in beats
+        if b["name"] not in vouchers_with_data and b["name"] not in addv_active_beats)
+
+    collection_pipeline = build_collection_pipeline(staged, today)
+    onboarding_pipeline = build_onboarding_pipeline(addv_batches, today)
+    stale_collection_count = sum(
+        1 for items in collection_pipeline.values() for it in items if it["stale"])
+    stale_onboarding_count = sum(
+        1 for items in onboarding_pipeline.values() for it in items if it["stale"])
+
+    config_at_default = all(settings.get(k) == v for k, v in _SETTINGS_FACTORY_DEFAULT.items())
+
+    salesman_by_beat = {b["name"]: b.get("salesman", "") for b in beats}
+    badges_by_beat = {}
+    for name in no_salesman_beats:
+        badges_by_beat.setdefault(name, []).append("no_salesman")
+    for row in needs_cadence_beats:
+        badges_by_beat.setdefault(row["beat"], []).append("no_cadence")
+    for name in no_voucher_beats:
+        badges_by_beat.setdefault(name, []).append("no_vouchers")
+    by_beat = sorted(
+        ({"beat": name, "salesman": salesman_by_beat.get(name, ""), "badges": badges}
+         for name, badges in badges_by_beat.items()),
+        key=lambda r: (-len(r["badges"]), r["beat"]))
+
+    all_clear = (
+        not no_beats and not no_supervisor and not no_salesman_user and not badges_by_beat
+        and not stale_collection_count and not stale_onboarding_count)
+
+    return {
+        "blocking": {
+            "no_beats": no_beats,
+            "no_supervisor": no_supervisor,
+            "no_salesman_user": no_salesman_user,
+            "no_salesman_beats": no_salesman_beats,
+            "needs_cadence_beats": needs_cadence_beats,
+        },
+        "data_feed": {"no_voucher_beats": no_voucher_beats},
+        "stale": {
+            "collection_count": stale_collection_count,
+            "onboarding_count": stale_onboarding_count,
+        },
+        "config": {**settings, "at_default": config_at_default},
+        "by_beat": by_beat,
+        "all_clear": all_clear,
+    }
 
 
 def raise_addv_flag(batch_data, bill_no, kind, note, raised_by, now_str, target=None, new=None):

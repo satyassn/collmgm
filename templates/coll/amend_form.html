@@ -24,6 +24,10 @@
 
   <fieldset>
     <legend class="group-heading">Voucher</legend>
+    <label class="field-label">Voucher #
+      <input type="text" name="v_bill_no" id="v-bill-no" value="{{ voucher.bill_no }}"
+             autocomplete="off" required>
+    </label>
     <label class="field-label">Date
       <input type="date" name="v_date" value="{{ voucher.date }}" required>
     </label>
@@ -119,8 +123,7 @@
   </label>
 
   <div class="action-row">
-    <button type="submit" class="btn btn-primary" id="amend-submit-btn"
-            onclick="return confirm('Apply this amendment?')">Apply Amendment</button>
+    <button type="submit" class="btn btn-primary" id="amend-submit-btn">Apply Amendment</button>
     <a class="btn btn-secondary" href="/coll/amend">Cancel</a>
   </div>
 </form>
@@ -140,13 +143,24 @@
 
 <script>
 (function () {
+  var form = document.getElementById("amend-form");
   var table = document.getElementById("inst-table");
   var tbody = table.tBodies[0];
   var template = document.getElementById("inst-row-template");
   var addBtn = document.getElementById("add-inst-btn");
   var amountInput = document.getElementById("v-amount");
+  var billNoInput = document.getElementById("v-bill-no");
+  var originalBillNo = billNoInput.value;
   var preview = document.getElementById("balance-preview");
   var submitBtn = document.getElementById("amend-submit-btn");
+
+  form.addEventListener("submit", function (e) {
+    var msg = (billNoInput.value.trim() !== originalBillNo)
+      ? "Rename this voucher from '" + originalBillNo + "' to '" + billNoInput.value.trim() +
+        "' and apply this amendment?"
+      : "Apply this amendment?";
+    if (!confirm(msg)) e.preventDefault();
+  });
   // Seed past any tokens already on the page (an error re-render preserves
   // rows the user added before the failed submit) so a freshly-added row
   // can never collide with one of those preserved "newN" field names.

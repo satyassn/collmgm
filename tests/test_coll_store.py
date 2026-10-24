@@ -1190,7 +1190,9 @@ class TestAmendments(StoreTestCase):
                                "balance": "130.00", "beat": "b2", "salesman": "s2"})
         self.assertEqual((amd["bill_no"], amd["amended_by"], amd["note"]),
                          ("1", "dist", "fix"))
-        self.assertEqual(amd["old"], snap)
+        # old/new snapshots carry bill_no too (unlike `snap` itself) purely so a
+        # voucher-number rename is visible in this amendment's own history.
+        self.assertEqual(amd["old"], {**snap, "voucher": {**snap["voucher"], "bill_no": "1"}})
         self.assertEqual(amd["new"]["voucher"]["balance"], "130.00")
 
     def test_edit_installment(self):
